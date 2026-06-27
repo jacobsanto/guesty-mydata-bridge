@@ -5,13 +5,13 @@ const crypto = require('crypto');
 const router = express.Router();
 
 const {
-  getTenantByListingId,
   findInvoiceByReservationId,
   createInvoiceRecord,
   updateInvoiceRecord,
-  incrementInvoiceCounter,
 } = require('./database');
-const { generateMyDataXML } = require('./mydata-xml');
+const { incrementCompanyInvoiceCounter } = require('./repositories/companies');
+const { getCompanyAndListingByGuestyListingId } = require('./repositories/listings');
+const { generateMyDataXML, calculateClimateFeePerNight } = require('./mydata-xml');
 const { sendToMyData } = require('./mydata-client');
 
 // -------------------------------------------------------------------
@@ -94,22 +94,28 @@ router.post('/webhook/guesty-reservation', async (req, res) => {
     });
   }
 
-  // 5. Εύρεση tenant βάσει listing_id
-  const tenant = await getTenantByListingId(reservation.listingId);
-  if (!tenant) {
-    console.error(`💥 Δεν βρέθηκε tenant για listing: ${reservation.listingId}`);
+  // 5. Εύρεση company + listing βάσει Guesty listing_id
+  const companyListing = await getCompanyAndListingByGuestyListingId(reservation.listingId);
+  if (!companyListing) {
+    console.error(`💥 Δεν βρέθηκε company/listing mapping για listing: ${reservation.listingId}`);
     return res.status(404).json({
-      error: `No tenant configured for listingId: ${reservation.listingId}`,
+      error: `No company/listing mapping configured for listingId: ${reservation.listingId}`,
     });
   }
 
-  // 6. Αύξηση invoice counter (αύξων αριθμός παραστατικού)
-  const invoiceAA = await incrementInvoiceCounter(tenant.id);
+  if (!companyListing.company_active || !companyListing.listing_active) {
+    return res.status(409).json({
+      error: `Inactive mapping for listingId: ${reservation.listingId}`,
+    });
+  }
+
+  // 6. Αύξηση invoice counter στο company επίπεδο
+  const invoiceAA = await incrementCompanyInvoiceCounter(companyListing.company_id);
 
   // 7. Δημιουργία XML
   let xmlPayload;
   try {
-    xmlPayload = generateMyDataXML(reservation, tenant, invoiceAA);
+    xmlPayload = generateMyDataXML(reservation, companyListing, invoiceAA);
   } catch (err) {
     console.error('❌ Αποτυχία δημιουργίας XML:', err.message);
     return res.status(422).json({ error: 'XML generation failed: ' + err.message });
@@ -119,14 +125,16 @@ router.post('/webhook/guesty-reservation', async (req, res) => {
   const netValue = parseFloat(reservation.financials?.totalGross || 0);
   const nights = reservation.nights || 0;
   const climateFee = parseFloat(
-    require('./mydata-xml').calculateClimateFeePerNight(reservation.checkIn, tenant.property_type) * nights
+    calculateClimateFeePerNight(reservation.checkIn, companyListing.property_type) * nights
   );
 
   const invoiceId = await createInvoiceRecord({
+    company_id: companyListing.company_id,
+    listing_id: companyListing.listing_id,
     reservation_id: reservation.reservationId,
     listing_id_guesty: reservation.listingId,
-    vat_number: tenant.vat_number,
-    invoice_series: tenant.invoice_series,
+    vat_number: companyListing.vat_number,
+    invoice_series: companyListing.invoice_series,
     invoice_aa: invoiceAA,
     net_value: netValue,
     climate_fee: climateFee,
@@ -137,7 +145,7 @@ router.post('/webhook/guesty-reservation', async (req, res) => {
 
   // 9. Αποστολή στην ΑΑΔΕ
   try {
-    const myDataResponse = await sendToMyData(xmlPayload, tenant);
+    const myDataResponse = await sendToMyData(xmlPayload, companyListing);
 
     await updateInvoiceRecord(invoiceId, {
       status: 'sent',
@@ -146,13 +154,15 @@ router.post('/webhook/guesty-reservation', async (req, res) => {
       sent_at: new Date().toISOString(),
     });
 
-    console.log(`✅ ΑΦΜ: ${tenant.vat_number} | Κράτηση: ${reservation.reservationId} | MARK: ${myDataResponse.mark}`);
+    console.log(`✅ ΑΦΜ: ${companyListing.vat_number} | Κράτηση: ${reservation.reservationId} | MARK: ${myDataResponse.mark}`);
 
     return res.status(200).json({
       message: 'Invoice processed successfully',
       mark: myDataResponse.mark,
       invoice_aa: invoiceAA,
-      series: tenant.invoice_series,
+      series: companyListing.invoice_series,
+      company_id: companyListing.company_id,
+      listing_id: companyListing.listing_id,
     });
 
   } catch (err) {

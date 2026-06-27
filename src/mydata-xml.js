@@ -22,8 +22,9 @@ function calculateClimateFeePerNight(checkInDate, propertyType) {
 // -------------------------------------------------------------------
 // Κύρια συνάρτηση — παράγει myDATA-compliant XML (v1.0.9)
 // invoiceType 11.1 = Απόδειξη Λιανικής Βραχυχρόνιας Μίσθωσης
+// billingContext = joined company + listing object
 // -------------------------------------------------------------------
-function generateMyDataXML(reservation, tenant, invoiceAA) {
+function generateMyDataXML(reservation, billingContext, invoiceAA) {
   const {
     reservationId,
     checkIn,
@@ -36,7 +37,7 @@ function generateMyDataXML(reservation, tenant, invoiceAA) {
   if (!financials?.totalGross) throw new Error('financials.totalGross είναι απαραίτητο');
 
   const netValue = parseFloat(financials.totalGross);
-  const feePerNight = calculateClimateFeePerNight(checkIn, tenant.property_type);
+  const feePerNight = calculateClimateFeePerNight(checkIn, billingContext.property_type);
   const totalNights = parseInt(nights || 1);
   const climateFee = parseFloat((feePerNight * totalNights).toFixed(2));
   const totalGross = parseFloat((netValue + climateFee).toFixed(2));
@@ -57,14 +58,14 @@ function generateMyDataXML(reservation, tenant, invoiceAA) {
 
       // ── Issuer ────────────────────────────────────────────────────
       .ele('issuer')
-        .ele('vatNumber').txt(tenant.vat_number).up()
+        .ele('vatNumber').txt(billingContext.vat_number).up()
         .ele('country').txt('GR').up()
         .ele('branch').txt('0').up()       // 0 = έδρα
       .up()
 
       // ── Invoice Header ────────────────────────────────────────────
       .ele('invoiceHeader')
-        .ele('series').txt(tenant.invoice_series || 'A').up()
+        .ele('series').txt(billingContext.invoice_series || 'A').up()
         .ele('aa').txt(String(invoiceAA)).up()
         .ele('issueDate').txt(invoiceDate).up()
         .ele('invoiceType').txt('11.1').up()  // Απόδειξη Λιανικής

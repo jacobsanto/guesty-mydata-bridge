@@ -21,15 +21,15 @@ function getEndpoint() {
 }
 
 // -------------------------------------------------------------------
-// Αποστολή XML στην ΑΑΔΕ με per-tenant credentials
+// Αποστολή XML στην ΑΑΔΕ με company credentials
 // -------------------------------------------------------------------
-async function sendToMyData(xmlPayload, tenant) {
+async function sendToMyData(xmlPayload, companyContext) {
   const url = getEndpoint();
 
   const config = {
     headers: {
-      'aade-user-id': tenant.aade_user_id,
-      'ocp-apim-subscription-key': tenant.aade_subscription_key,
+      'aade-user-id': companyContext.aade_user_id,
+      'ocp-apim-subscription-key': companyContext.aade_subscription_key,
       'Content-Type': 'text/xml;charset=UTF-8',
       'Accept': 'application/xml',
     },
@@ -90,7 +90,7 @@ async function sendToMyData(xmlPayload, tenant) {
     throw new Error(`Δεν επιστράφηκε MARK από ΑΑΔΕ. Response: ${JSON.stringify(responseDoc)}`);
   }
 
-  console.log(`📨 myDATA OK | ΑΦΜ: ${tenant.vat_number} | MARK: ${mark} | UID: ${uid || 'N/A'}`);
+  console.log(`📨 myDATA OK | ΑΦΜ: ${companyContext.vat_number} | MARK: ${mark} | UID: ${uid || 'N/A'}`);
 
   return { success: true, mark: String(mark), uid: uid ? String(uid) : null };
 }
