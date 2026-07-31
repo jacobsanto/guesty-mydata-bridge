@@ -157,8 +157,7 @@ async function listBlockedDueDocuments(companyId, businessDate, maxAttempts = 5)
     .where({ 'd.company_id': companyId })
     .where('d.issue_date', '<=', businessDate)
     .where((blocked) => blocked
-      .where({ 'd.status': 'transmitting' })
-      .orWhere((failed) => failed.where({ 'd.status': 'failed' }).andWhere((reason) => reason
+      .where((failed) => failed.where({ 'd.status': 'failed' }).andWhere((reason) => reason
         .where({ 'd.retryable': false })
         .orWhere({ 'd.transmission_uncertain': true })
         .orWhere('d.attempt_count', '>=', maxAttempts)))
@@ -166,6 +165,14 @@ async function listBlockedDueDocuments(companyId, businessDate, maxAttempts = 5)
         .select(db.raw('1')).whereRaw('review.reservation_id = d.reservation_id').where({ 'review.requires_review': true })))
     .select('d.*')
     .orderBy('d.issue_date').orderBy('d.id');
+}
+
+async function listInFlightDocuments(companyId, businessDate) {
+  return db('fiscal_documents')
+    .where({ company_id: companyId, status: 'transmitting' })
+    .where('issue_date', '<=', businessDate)
+    .orderBy('issue_date', 'asc')
+    .orderBy('id', 'asc');
 }
 
 async function markDocumentSent(id, response) {
@@ -334,6 +341,7 @@ module.exports = {
   getDocumentById,
   listTransmittableDocuments,
   listBlockedDueDocuments,
+  listInFlightDocuments,
   claimDocument,
   markDocumentSent,
   markDocumentFailed,

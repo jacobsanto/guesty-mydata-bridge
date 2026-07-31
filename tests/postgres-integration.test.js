@@ -19,7 +19,7 @@ if (process.env.POSTGRES_INTEGRATION_TEST !== 'true') {
   const { db, initSchema } = require('../src/database');
   const { createDocumentOnce } = require('../src/repositories/fiscal-documents');
   const { prepareReservationDocuments } = require('../src/services/document-service');
-  const { beginRun, heartbeatRun, recordRunItem, finishRun } = require('../src/repositories/daily-close');
+  const { beginRun, heartbeatRun, recordRunItem, recordVerificationResult, finishRun } = require('../src/repositories/daily-close');
 
   let company;
   let listing;
@@ -214,13 +214,21 @@ if (process.env.POSTGRES_INTEGRATION_TEST !== 'true') {
     await finishRun(winners[0].value.id, { total: 0, sent: 0, failed: 0 }, winners[0].value.lease_token);
 
     const crashed = await beginRun(company.id, '2026-07-30', { leaseSeconds: 30 });
+    const document = await db('fiscal_documents').orderBy('id', 'asc').first();
+    await recordRunItem(crashed.id, document.id, 'failed', 'crashed attempt', crashed.lease_token);
     await db('daily_close_runs').where({ id: crashed.id }).update({ lease_expires_at_ms: Date.now() - 1 });
+    await assert.rejects(
+      recordRunItem(crashed.id, document.id, 'failed', 'expired worker', crashed.lease_token),
+      (error) => error.status === 409,
+    );
     const recovered = await beginRun(company.id, '2026-07-30', { leaseSeconds: 30 });
     assert.notEqual(recovered.lease_token, crashed.lease_token);
+    assert.equal(Number((await db('daily_close_items').where({ run_id: recovered.id }).count({ count: '*' }).first()).count), 0);
     await assert.rejects(heartbeatRun(crashed.id, crashed.lease_token, 30), (error) => error.status === 409);
     await assert.rejects(finishRun(crashed.id, { total: 0, sent: 0, failed: 0 }, crashed.lease_token), (error) => error.status === 409);
-    const document = await db('fiscal_documents').orderBy('id', 'asc').first();
-    await recordRunItem(recovered.id, document.id, 'verified', 'current worker', recovered.lease_token);
+    await Promise.all(Array.from({ length: 12 }, () => (
+      recordRunItem(recovered.id, document.id, 'verified', 'current worker', recovered.lease_token)
+    )));
     await assert.rejects(
       recordRunItem(crashed.id, document.id, 'failed', 'stale worker', crashed.lease_token),
       (error) => error.status === 409,
@@ -228,6 +236,17 @@ if (process.env.POSTGRES_INTEGRATION_TEST !== 'true') {
     const auditItem = await db('daily_close_items').where({ run_id: recovered.id, document_id: document.id }).first();
     assert.equal(auditItem.result, 'verified');
     assert.equal(auditItem.message, 'current worker');
+
+    await db('fiscal_documents').where({ id: document.id }).update({
+      status: 'sent', mydata_mark: 'PG-LEASE-MARK', verification_status: 'pending', verified_at: null,
+    });
+    await assert.rejects(
+      recordVerificationResult(crashed.id, document.id, 'PG-LEASE-MARK', { verified: true }, crashed.lease_token),
+      (error) => error.status === 409,
+    );
+    assert.equal((await db('fiscal_documents').where({ id: document.id }).first()).verification_status, 'pending');
+    await recordVerificationResult(recovered.id, document.id, 'PG-LEASE-MARK', { verified: true }, recovered.lease_token);
+    assert.equal((await db('fiscal_documents').where({ id: document.id }).first()).verification_status, 'verified');
     const finished = await finishRun(recovered.id, { total: 0, sent: 0, failed: 0 }, recovered.lease_token);
     assert.equal(finished.status, 'completed');
   });
