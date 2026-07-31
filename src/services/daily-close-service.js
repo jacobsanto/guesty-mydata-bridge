@@ -35,13 +35,16 @@ async function verifyOne(document, companyContext, verifier, run, counts) {
       throw new Error(`Verification result did not confirm MARK ${document.mydata_mark}`);
     }
     await markDocumentVerified(document.id);
-    await recordRunItem(run.id, document.id, 'verified', document.mydata_mark);
-    counts.sent += 1;
   } catch (error) {
     await markVerificationFailed(document.id, error.message);
-    await recordRunItem(run.id, document.id, 'verification_failed', error.message);
+    await recordRunItem(run.id, document.id, 'verification_failed', error.message, run.lease_token);
     counts.failed += 1;
+    return;
   }
+  // Keep lease/audit failures outside the verification catch: a stale worker
+  // must never downgrade an already verified fiscal document.
+  await recordRunItem(run.id, document.id, 'verified', document.mydata_mark, run.lease_token);
+  counts.sent += 1;
 }
 
 async function executeDailyClose({ companyId, businessDate, sender = sendToMyData, verifier = verifyTransmittedDocument, materializer = materializeDueReservations, maxAttempts = 5 }) {
@@ -87,7 +90,7 @@ async function executeDailyClose({ companyId, businessDate, sender = sendToMyDat
 
     for (const document of blockedDocuments) {
       await ensureLease();
-      await recordRunItem(run.id, document.id, 'blocked', document.error_message || 'Document requires operator review');
+      await recordRunItem(run.id, document.id, 'blocked', document.error_message || 'Document requires operator review', run.lease_token);
     }
 
     for (const document of awaitingVerification) {
@@ -105,11 +108,12 @@ async function executeDailyClose({ companyId, businessDate, sender = sendToMyDat
         await markDocumentSent(document.id, response);
         await verifyOne({ ...document, mydata_mark: response.mark, mydata_uid: response.uid || null }, companyContext, verifier, run, counts);
       } catch (error) {
+        if (error.status === 409) throw error;
         await markDocumentFailed(document.id, error.message, {
           retryable: error.retryable === true,
           transmissionUncertain: error.transmissionUncertain === true,
         });
-        await recordRunItem(run.id, document.id, 'failed', error.message);
+        await recordRunItem(run.id, document.id, 'failed', error.message, run.lease_token);
         counts.failed += 1;
       }
     }

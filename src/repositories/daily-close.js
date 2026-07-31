@@ -80,13 +80,26 @@ async function listRunItems(runId) {
     .orderBy('i.id', 'asc');
 }
 
-async function recordRunItem(runId, documentId, result, message = null) {
-  const existing = await db('daily_close_items').where({ run_id: runId, document_id: documentId }).first();
-  if (existing) {
-    await db('daily_close_items').where({ id: existing.id }).update({ result, message, updated_at: db.fn.now() });
-    return;
-  }
-  await db('daily_close_items').insert({ run_id: runId, document_id: documentId, result, message });
+async function recordRunItem(runId, documentId, result, message = null, leaseToken) {
+  if (!leaseToken) throw new Error('Daily close lease token is required to record a run item');
+  return db.transaction(async (trx) => {
+    // Locking the run row fences an expired worker from changing the audit trail
+    // after another worker has recovered the same company/day run.
+    const run = await trx('daily_close_runs')
+      .where({ id: runId, status: 'running', lease_token: leaseToken })
+      .forUpdate()
+      .first();
+    if (!run) {
+      const error = new Error('Daily close lease was lost before recording a run item');
+      error.status = 409;
+      throw error;
+    }
+
+    await trx('daily_close_items')
+      .insert({ run_id: runId, document_id: documentId, result, message })
+      .onConflict(['run_id', 'document_id'])
+      .merge({ result, message, updated_at: trx.fn.now() });
+  });
 }
 
 async function finishRun(runId, counts, leaseToken) {

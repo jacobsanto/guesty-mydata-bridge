@@ -19,7 +19,7 @@ if (process.env.POSTGRES_INTEGRATION_TEST !== 'true') {
   const { db, initSchema } = require('../src/database');
   const { createDocumentOnce } = require('../src/repositories/fiscal-documents');
   const { prepareReservationDocuments } = require('../src/services/document-service');
-  const { beginRun, heartbeatRun, finishRun } = require('../src/repositories/daily-close');
+  const { beginRun, heartbeatRun, recordRunItem, finishRun } = require('../src/repositories/daily-close');
 
   let company;
   let listing;
@@ -185,7 +185,7 @@ if (process.env.POSTGRES_INTEGRATION_TEST !== 'true') {
     const failedReservation = reservation('pg-atomic-rollback');
     await assert.rejects(
       prepareReservationDocuments(failedReservation, billingContext({ climate_fee_high_category: 999 })),
-      /climate_fee_high_category/,
+      /requires AADE climate categories/,
     );
     assert.equal(Number((await db('fiscal_documents').where({ reservation_id: failedReservation.reservationId }).count({ count: '*' }).first()).count), 0);
     assert.equal(Number((await db('document_sequences').whereIn('series', ['PG-ATOMIC', 'PG-ATOMIC-TAKK']).count({ count: '*' }).first()).count), 0);
@@ -219,6 +219,15 @@ if (process.env.POSTGRES_INTEGRATION_TEST !== 'true') {
     assert.notEqual(recovered.lease_token, crashed.lease_token);
     await assert.rejects(heartbeatRun(crashed.id, crashed.lease_token, 30), (error) => error.status === 409);
     await assert.rejects(finishRun(crashed.id, { total: 0, sent: 0, failed: 0 }, crashed.lease_token), (error) => error.status === 409);
+    const document = await db('fiscal_documents').orderBy('id', 'asc').first();
+    await recordRunItem(recovered.id, document.id, 'verified', 'current worker', recovered.lease_token);
+    await assert.rejects(
+      recordRunItem(crashed.id, document.id, 'failed', 'stale worker', crashed.lease_token),
+      (error) => error.status === 409,
+    );
+    const auditItem = await db('daily_close_items').where({ run_id: recovered.id, document_id: document.id }).first();
+    assert.equal(auditItem.result, 'verified');
+    assert.equal(auditItem.message, 'current worker');
     const finished = await finishRun(recovered.id, { total: 0, sent: 0, failed: 0 }, recovered.lease_token);
     assert.equal(finished.status, 'completed');
   });
