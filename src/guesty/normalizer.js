@@ -218,10 +218,17 @@ function normalizeGuestyReservation(payload) {
     .map((item) => item.stayIndex).filter((value) => value !== null).map(Number))];
   const allLinesAllocated = financials.invoiceItems.every((item) => item.listingId
     && Number.isInteger(item.stayIndex));
-  const singleStayConfirmed = allLinesAllocated
+  const noLinesAllocated = financials.invoiceItems.every((item) => !item.listingId
+    && item.stayIndex === null);
+  const explicitLineAllocationConfirmed = allLinesAllocated
     && lineListingIds.length === 1
     && lineListingIds[0] === String(listingId)
     && stayIndexes.length === 1;
+  // The current Guest Folio endpoint can omit listingId/stayIndex on every
+  // line. In that exact all-or-none case, the v3 stay[] contract is the
+  // authoritative allocation evidence. Partial allocation remains blocked.
+  const v3SingleStayConfirmed = noLinesAllocated && raw.authoritativeSingleStay === true;
+  const singleStayConfirmed = explicitLineAllocationConfirmed || v3SingleStayConfirmed;
   const derivedNights = nightsBetween(checkIn, checkOut);
   if (raw.nights !== undefined && raw.nights !== null && Number(raw.nights) !== derivedNights) {
     throw new Error('Guesty nights do not match localized check-in/check-out dates');
@@ -249,6 +256,8 @@ function normalizeGuestyReservation(payload) {
       lineListingIds,
       stayIndexes,
       allLinesAllocated,
+      noLinesAllocated,
+      allocationSource: explicitLineAllocationConfirmed ? 'invoice_items' : (v3SingleStayConfirmed ? 'reservation_v3_stay' : null),
       singleStayConfirmed,
     },
     folioOverview: {

@@ -164,10 +164,77 @@ async function withGuestyAuthentication(operation) {
 
 async function fetchReservationWithToken(reservationId, token) {
   const config = { headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' }, timeout: 20000 };
-  return fetchConsistentReservationSnapshot(reservationId, {
+  const snapshot = await fetchConsistentReservationSnapshot(reservationId, {
     get: (url, requestConfig) => axios.get(url, requestConfig),
     config,
   });
+  // Reservations v3 deliberately returns guest references only. Fetch the
+  // smallest legacy reservation projection needed for the PDF display name,
+  // and use it as an independent cross-check of the fiscal stay identity.
+  const detailsResponse = await axios.get(`${API_URL}/reservations/${encodeURIComponent(reservationId)}`, {
+    ...config,
+    params: {
+      fields: '_id listingId checkInDateLocalized checkOutDateLocalized guest.fullName status lastUpdatedAt',
+    },
+  });
+  return mergeReservationDetails(snapshot, detailsResponse.data, reservationId);
+}
+
+function externalListingId(value) {
+  if (value && typeof value === 'object') return value._id || value.id || null;
+  return value || null;
+}
+
+function normalizeV3ReservationCore(row, reservationId) {
+  if (!row || typeof row !== 'object') return row;
+  // Live reservations-v3 responses represent the stay as an array. A fiscal
+  // document must never guess how to allocate a split or relocated stay.
+  if (Array.isArray(row.stay)) {
+    if (row.stay.length !== 1) {
+      throw new Error(`Guesty reservation ${reservationId} contains ${row.stay.length} stays and requires manual allocation`);
+    }
+    const stay = row.stay[0] || {};
+    const listingId = externalListingId(stay.unitTypeId || stay.listingId || stay.unitId);
+    const checkInDateLocalized = stay.checkInDateLocalized || stay.checkInDate || stay.checkIn;
+    const checkOutDateLocalized = stay.checkOutDateLocalized || stay.checkOutDate || stay.checkOut;
+    if (!listingId || !checkInDateLocalized || !checkOutDateLocalized) {
+      throw new Error(`Guesty reservation ${reservationId} has an incomplete authoritative stay`);
+    }
+    return {
+      ...row,
+      listingId: String(listingId),
+      checkInDateLocalized,
+      checkOutDateLocalized,
+      authoritativeSingleStay: true,
+    };
+  }
+  return row;
+}
+
+function mergeReservationDetails(snapshot, details, reservationId) {
+  if (!details || typeof details !== 'object') {
+    throw new Error(`Guesty reservation ${reservationId} detail response is malformed`);
+  }
+  const detailsId = details._id || details.id || details.reservationId;
+  const detailsListingId = externalListingId(details.listingId || details.listing);
+  const snapshotId = snapshot._id || snapshot.id || snapshot.reservationId;
+  const comparisons = [
+    [String(detailsId || ''), String(snapshotId || ''), 'reservation id'],
+    [String(detailsListingId || ''), String(snapshot.listingId || ''), 'listing id'],
+    [String(details.checkInDateLocalized || ''), String(snapshot.checkInDateLocalized || ''), 'check-in date'],
+    [String(details.checkOutDateLocalized || ''), String(snapshot.checkOutDateLocalized || ''), 'check-out date'],
+    [String(details.status || '').toLowerCase(), String(snapshot.status || '').toLowerCase(), 'status'],
+  ];
+  for (const [actual, expected, label] of comparisons) {
+    if (!actual || actual !== expected) {
+      throw new Error(`Guesty reservation ${reservationId} ${label} differs between v3 and reservation detail`);
+    }
+  }
+  return {
+    ...snapshot,
+    guest: details.guest ? { fullName: details.guest.fullName || null } : null,
+    lastUpdatedAt: details.lastUpdatedAt || snapshot.lastUpdatedAt || null,
+  };
 }
 
 function stableValue(value) {
@@ -183,7 +250,7 @@ function fiscalVersion(value) {
 function reservationRow(payload, reservationId) {
   const rows = Array.isArray(payload) ? payload : payload?.results;
   if (!Array.isArray(rows) || !rows[0]) throw new Error(`Guesty reservation ${reservationId} was not found`);
-  return rows[0];
+  return normalizeV3ReservationCore(rows[0], reservationId);
 }
 
 function isCancelledReservation(reservation) {
@@ -195,7 +262,13 @@ async function fetchConsistentReservationSnapshot(reservationId, { get, config =
   if (!Number.isInteger(maxAttempts) || maxAttempts < 1 || maxAttempts > 5) throw new Error('Guesty snapshot maxAttempts must be 1-5');
   const reservationRequest = () => get(`${API_URL}/reservations-v3`, {
     ...config,
-    params: { reservationIds: reservationId, mergeInclusiveTaxes: false },
+    // Guesty's live v3 endpoint validates this as an array and expects Axios'
+    // bracket serialization (`reservationIds[]=...`) even for a single ID.
+    // Passing a scalar currently returns HTTP 400 and blocks every fiscal
+    // refresh/calibration. Keep price components itemized so the explicit
+    // financial profile, rather than Guesty-side merging, decides what enters
+    // the taxable gross.
+    params: { reservationIds: [reservationId], mergeAccommodationFarePriceComponents: false },
   });
   const overviewRequest = () => get(`${API_URL}/guest-folio/overview`, {
     ...config,
@@ -286,4 +359,6 @@ module.exports = {
   FOLIO_INVOICE_ITEM_FIELDS,
   FOLIO_OVERVIEW_FIELDS,
   fetchConsistentReservationSnapshot,
+  normalizeV3ReservationCore,
+  mergeReservationDetails,
 };
