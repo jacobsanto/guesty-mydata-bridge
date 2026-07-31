@@ -1,26 +1,46 @@
 'use strict';
 
 const { getCompanyById } = require('../repositories/companies');
-const { decryptCompanySecret } = require('../security/credentials');
 const { testMyDataConnection } = require('../mydata-client');
 const { testGuestyConnection } = require('../guesty/client');
 const { recordIntegrationCheck } = require('../repositories/integration-checks');
+const { db } = require('../database');
+const {
+  assertConfiguredAadeCredentials, assertVerifiedAadeCredentials,
+} = require('../security/aade-credential-guard');
 
 async function testCompanyMyDataConnection(companyId, tester = testMyDataConnection) {
   const company = await getCompanyById(companyId);
   if (!company) throw Object.assign(new Error('Company not found'), { status: 404 });
+  const environment = process.env.MYDATA_ENV || 'sandbox';
   try {
-    const environment = process.env.MYDATA_ENV || 'sandbox';
-    const result = await tester({
-      ...company,
-      aade_user_id: decryptCompanySecret(company, 'aade_user_id'),
-      aade_subscription_key: decryptCompanySecret(company, 'aade_subscription_key'),
+    const context = environment === 'production'
+      ? assertVerifiedAadeCredentials(company)
+      : assertConfiguredAadeCredentials(company);
+    const result = await tester(context);
+    if (result?.success !== true) throw new Error('myDATA connection test did not confirm success');
+    await db.transaction(async (trx) => {
+      await recordIntegrationCheck(`mydata:${company.id}:${environment}`, 'success', result.environment || environment, null, trx);
+      if (environment === 'sandbox') {
+        await trx('companies').where({ id: company.id }).update({
+          aade_credential_status: 'verified',
+          aade_credentials_verified_at: trx.fn.now(),
+          updated_at: trx.fn.now(),
+        });
+      }
     });
-    await recordIntegrationCheck(`mydata:${company.id}:${environment}`, 'success', result.environment || environment);
     return result;
   } catch (error) {
-    const environment = process.env.MYDATA_ENV || 'sandbox';
-    await recordIntegrationCheck(`mydata:${company.id}:${environment}`, 'failed', environment, error.message);
+    await db.transaction(async (trx) => {
+      await recordIntegrationCheck(`mydata:${company.id}:${environment}`, 'failed', environment, error.message, trx);
+      if (environment === 'sandbox' && company.aade_credential_status !== 'pending') {
+        await trx('companies').where({ id: company.id }).update({
+          aade_credential_status: 'configured',
+          aade_credentials_verified_at: null,
+          updated_at: trx.fn.now(),
+        });
+      }
+    });
     throw error;
   }
 }

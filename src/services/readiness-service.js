@@ -110,8 +110,16 @@ async function getReadiness({ companyId = null } = {}) {
     if (vatError) issues.push(issue('issuer_vat', `${company.company_name}: ${vatError}`, scope));
     const seriesError = validationError(() => normalizeSeries(company.invoice_series, { required: true }));
     if (seriesError) issues.push(issue('invoice_series', `${company.company_name}: ${seriesError}`, scope));
-    if (!isEncrypted(company.aade_user_id) || !isEncrypted(company.aade_subscription_key)) issues.push(issue('encrypted_credentials', `${company.company_name}: τα credentials ΑΑΔΕ δεν είναι κρυπτογραφημένα`, scope));
-    if (!isContextBound(company.aade_user_id) || !isContextBound(company.aade_subscription_key)) issues.push(issue('context_bound_credentials', `${company.company_name}: τα credentials ΑΑΔΕ δεν έχουν ακόμη μεταφερθεί σε tenant-bound encryption v2`, scope));
+    const credentialsConfigured = Boolean(company.aade_user_id && company.aade_subscription_key);
+    if (!credentialsConfigured || company.aade_credential_status === 'pending') {
+      issues.push(issue('aade_credentials_pending', `${company.company_name}: εκκρεμεί η ασφαλής καταχώρηση credentials ΑΑΔΕ`, scope));
+    } else {
+      if (!isEncrypted(company.aade_user_id) || !isEncrypted(company.aade_subscription_key)) issues.push(issue('encrypted_credentials', `${company.company_name}: τα credentials ΑΑΔΕ δεν είναι κρυπτογραφημένα`, scope));
+      if (!isContextBound(company.aade_user_id) || !isContextBound(company.aade_subscription_key)) issues.push(issue('context_bound_credentials', `${company.company_name}: τα credentials ΑΑΔΕ δεν έχουν ακόμη μεταφερθεί σε tenant-bound encryption v2`, scope));
+      if (company.aade_credential_status !== 'verified' || !company.aade_credentials_verified_at) {
+        issues.push(issue('aade_credentials_unverified', `${company.company_name}: τα credentials ΑΑΔΕ δεν έχουν επαληθευτεί επιτυχώς στο myDATA sandbox`, scope));
+      }
+    }
     if (!company.pdf_address || !company.pdf_tax_office) issues.push(issue('pdf_issuer_profile', `${company.company_name}: λείπει διεύθυνση ή ΔΟΥ για το PDF`, scope));
     const check = checks.find((row) => row.check_key === `mydata:${company.id}:sandbox` && row.environment === 'sandbox');
     if (!isFreshSuccess(check)) issues.push(issue('mydata_sandbox_check', `${company.company_name}: λείπει πρόσφατη (24ωρο) επιτυχής σύνδεση myDATA sandbox`, scope));

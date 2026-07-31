@@ -8,7 +8,7 @@ const {
   cancelUnsentDocument, markDocumentCancelled, markCancellationVerified,
   getCancellationResolutionEvent, resolveDefinitiveCancellationFailure,
 } = require('../repositories/fiscal-documents');
-const { decryptCompanySecret } = require('../security/credentials');
+const { assertVerifiedAadeCredentials } = require('../security/aade-credential-guard');
 const { cancelMyDataInvoice, verifyCancelledInvoice } = require('../mydata-client');
 const { assertProductionTransmissionEnabled } = require('../security/production-guard');
 
@@ -56,25 +56,21 @@ async function cancelFiscalDocument({ documentId, canceller = cancelMyDataInvoic
   }
 
   await assertProductionTransmissionEnabled('cancellations');
+  const company = await getCompanyById(document.company_id);
+  if (!company) {
+    const error = new Error('Company not found');
+    error.status = 404;
+    throw error;
+  }
+  const companyContext = assertVerifiedAadeCredentials(company);
   const attemptToken = await claimDocumentCancellation(document.id, currentEnvironment);
   if (!attemptToken) {
     const current = await getDocumentById(document.id);
     if (current?.status === 'cancelled') return current;
     const error = new Error('Document cancellation is already in progress'); error.status = 409; throw error;
   }
-  const company = await getCompanyById(document.company_id);
-  if (!company) {
-    await markCancellationFailed(document.id, 'Company not found', { attemptToken });
-    const error = new Error('Company not found');
-    error.status = 404;
-    throw error;
-  }
   try {
-    const result = await canceller(document.mydata_mark, {
-      ...company,
-      aade_user_id: decryptCompanySecret(company, 'aade_user_id'),
-      aade_subscription_key: decryptCompanySecret(company, 'aade_subscription_key'),
-    });
+    const result = await canceller(document.mydata_mark, companyContext);
     return markDocumentCancelled(document.id, result.cancellationMark, { attemptToken, response: result.raw || result });
   } catch (error) {
     await markCancellationFailed(document.id, error.message, {
@@ -105,11 +101,7 @@ async function reconcileFiscalDocumentCancellation({ documentId, verifier = veri
   }
   const company = await getCompanyById(document.company_id);
   if (!company) throw Object.assign(new Error('Company not found'), { status: 404 });
-  const result = await verifier(document.mydata_mark, {
-    ...company,
-    aade_user_id: decryptCompanySecret(company, 'aade_user_id'),
-    aade_subscription_key: decryptCompanySecret(company, 'aade_subscription_key'),
-  }, {
+  const result = await verifier(document.mydata_mark, assertVerifiedAadeCredentials(company), {
     cancellationMark: document.cancellation_mark || undefined,
   });
   if (!result?.verified || String(result.invoiceMark) !== String(document.mydata_mark) || !result.cancellationMark) {
@@ -170,11 +162,7 @@ async function resolveCancellationFailure({
   }
   const company = await getCompanyById(document.company_id);
   if (!company) throw Object.assign(new Error('Company not found'), { status: 404 });
-  const check = await verifier(document.mydata_mark, {
-    ...company,
-    aade_user_id: decryptCompanySecret(company, 'aade_user_id'),
-    aade_subscription_key: decryptCompanySecret(company, 'aade_subscription_key'),
-  }, {
+  const check = await verifier(document.mydata_mark, assertVerifiedAadeCredentials(company), {
     cancellationMark: document.cancellation_mark || undefined,
   });
   const foundCancellation = check?.verified && check.cancellationMark ? {

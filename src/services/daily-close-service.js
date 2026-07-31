@@ -15,7 +15,7 @@ const {
   listAutomaticCancellationWork,
 } = require('../repositories/fiscal-documents');
 const { beginRun, heartbeatRun, recordRunItem, recordVerificationResult, finishRun } = require('../repositories/daily-close');
-const { decryptCompanySecret } = require('../security/credentials');
+const { assertVerifiedAadeCredentials } = require('../security/aade-credential-guard');
 const { sendToMyData, verifyTransmittedDocument, verifyCancelledInvoice, cancelMyDataInvoice } = require('../mydata-client');
 const { materializeDueReservations } = require('./reservation-service');
 const { assertProductionTransmissionEnabled } = require('../security/production-guard');
@@ -74,6 +74,7 @@ async function executeDailyClose({
     error.status = 404;
     throw error;
   }
+  const companyContext = assertVerifiedAadeCredentials(company);
 
   // Cancellation verification is read-only and must be allowed to heal the
   // lifecycle before the production submission gate evaluates readiness. If
@@ -104,11 +105,6 @@ async function executeDailyClose({
   }
   await assertProductionTransmissionEnabled('submissions', company.id);
 
-  const companyContext = {
-    ...company,
-    aade_user_id: decryptCompanySecret(company, 'aade_user_id'),
-    aade_subscription_key: decryptCompanySecret(company, 'aade_subscription_key'),
-  };
   const leaseSeconds = Math.min(Math.max(Number(process.env.DAILY_CLOSE_LEASE_SECONDS || 300), 30), 3600);
   const run = await beginRun(company.id, businessDate, { leaseSeconds });
   let leaseFailure = null;

@@ -5,6 +5,8 @@ const { getCompanyAndListingByGuestyListingId } = require('../repositories/listi
 const { generateCreditXML } = require('../mydata-xml');
 const { db } = require('../database');
 const { normalizeSeries } = require('../validation/fiscal-fields');
+const { getCompanyById } = require('../repositories/companies');
+const { assertVerifiedAadeCredentials } = require('../security/aade-credential-guard');
 
 function validDate(value) {
   const text = String(value || '');
@@ -18,6 +20,8 @@ async function createCreditDocument({ documentId, grossValue, issueDate, referen
   if (!original) {
     const error = new Error('Original fiscal document not found'); error.status = 404; throw error;
   }
+  const company = await getCompanyById(original.company_id);
+  assertVerifiedAadeCredentials(company);
   if (original.status !== 'sent' || !original.mydata_mark || original.verification_status !== 'verified'
       || !['none', null].includes(original.cancellation_status)) {
     const error = new Error('Only a verified sent document with no cancellation in progress can receive a credit'); error.status = 409; throw error;

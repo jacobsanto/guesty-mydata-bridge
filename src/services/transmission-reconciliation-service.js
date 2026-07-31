@@ -5,7 +5,7 @@ const { getCompanyById } = require('../repositories/companies');
 const {
   getDocumentById, markDocumentSent, markDocumentVerified,
 } = require('../repositories/fiscal-documents');
-const { decryptCompanySecret } = require('../security/credentials');
+const { assertVerifiedAadeCredentials } = require('../security/aade-credential-guard');
 const { verifyTransmittedDocument } = require('../mydata-client');
 const { assertSameFiscalIdentity } = require('../validation/mydata-identity');
 const { prepareFiscalDocumentPdfArtifact } = require('./pdf-service');
@@ -26,11 +26,7 @@ async function reconcileUncertainTransmission({ documentId, mark, verifier = ver
   if (duplicateMark) throw conflict('This MARK is already assigned to another local document');
   const company = await getCompanyById(document.company_id);
   if (!company) throw Object.assign(new Error('Company not found'), { status: 404 });
-  const result = await verifier(numericMark, {
-    ...company,
-    aade_user_id: decryptCompanySecret(company, 'aade_user_id'),
-    aade_subscription_key: decryptCompanySecret(company, 'aade_subscription_key'),
-  });
+  const result = await verifier(numericMark, assertVerifiedAadeCredentials(company));
   if (!result?.verified || String(result.mark) !== numericMark || !result.raw) {
     throw conflict('RequestTransmittedDocs did not verify the supplied MARK');
   }

@@ -103,11 +103,14 @@ if (process.env.POSTGRES_INTEGRATION_TEST !== 'true') {
     await Promise.all([runMigrationProcess(), runMigrationProcess()]);
     await initSchema();
 
+    const primaryIdentity = { vat_number: '044800455' };
     [company] = await db('companies').insert({
       company_name: 'PostgreSQL Integration Test',
-      vat_number: '044800455',
-      aade_user_id: 'pg-test-user',
-      aade_subscription_key: 'pg-test-key',
+      vat_number: primaryIdentity.vat_number,
+      aade_user_id: encryptSecret('pg-test-user', companySecretContext(primaryIdentity, 'aade_user_id')),
+      aade_subscription_key: encryptSecret('pg-test-key', companySecretContext(primaryIdentity, 'aade_subscription_key')),
+      aade_credential_status: 'verified',
+      aade_credentials_verified_at: new Date().toISOString(),
       invoice_series: 'PG-APY',
       active: true,
     }).returning('*');
@@ -158,6 +161,8 @@ if (process.env.POSTGRES_INTEGRATION_TEST !== 'true') {
         vat_number: readyVat,
         aade_user_id: encryptSecret('pg-ready-user', companySecretContext(readyIdentity, 'aade_user_id')),
         aade_subscription_key: encryptSecret('pg-ready-key', companySecretContext(readyIdentity, 'aade_subscription_key')),
+        aade_credential_status: 'verified',
+        aade_credentials_verified_at: new Date().toISOString(),
         invoice_series: 'PG-READY',
         pdf_address: 'Θήρα 84700',
         pdf_tax_office: 'Θήρας',
@@ -181,6 +186,7 @@ if (process.env.POSTGRES_INTEGRATION_TEST !== 'true') {
         vat_number: '094524053',
         aade_user_id: 'plaintext-user',
         aade_subscription_key: 'plaintext-key',
+        aade_credential_status: 'configured',
         invoice_series: '',
         active: true,
       }).returning('*');
@@ -452,6 +458,8 @@ if (process.env.POSTGRES_INTEGRATION_TEST !== 'true') {
       vat_number: vatNumber,
       aade_user_id: encryptSecret('pg-auto-user', companySecretContext(identity, 'aade_user_id')),
       aade_subscription_key: encryptSecret('pg-auto-key', companySecretContext(identity, 'aade_subscription_key')),
+      aade_credential_status: 'verified',
+      aade_credentials_verified_at: new Date().toISOString(),
       invoice_series: 'PG-AUTO-CANCEL',
       active: true,
     }).returning('*');

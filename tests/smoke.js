@@ -234,6 +234,36 @@ async function run() {
     aade_subscription_key: 'secured_key',
     invoice_series: 'B',
   });
+  const pendingCompany = await handleCreateCompany({
+    company_name: 'Guesty Calibration Pending Μ.Ι.Κ.Ε.',
+    vat_number: '094524053',
+    invoice_series: 'PENDING',
+    active: true,
+  });
+  const pendingRow = await db('companies').where({ id: pendingCompany.id }).first();
+  assert(!pendingRow.aade_user_id && !pendingRow.aade_subscription_key
+    && pendingCompany.aade_credential_status === 'pending',
+  'Guesty-only onboarding δημιουργεί εταιρεία χωρίς AADE secrets σε pending κατάσταση');
+  let pendingConnectionBlocked = false;
+  try { await testCompanyMyDataConnection(pendingCompany.id, async () => ({ success: true })); } catch (error) {
+    pendingConnectionBlocked = error.code === 'AADE_CREDENTIALS_NOT_READY';
+  }
+  assert(pendingConnectionBlocked, 'myDATA connection test μπλοκάρει fail-closed όταν τα credentials εκκρεμούν');
+  let pendingIssuanceBlocked = false;
+  try { await executeDailyClose({ companyId: pendingCompany.id, businessDate: '2025-07-15' }); } catch (error) {
+    pendingIssuanceBlocked = error.code === 'AADE_CREDENTIALS_NOT_READY';
+  }
+  assert(pendingIssuanceBlocked, 'η fiscal/myDATA έκδοση μπλοκάρει πριν από materialization όταν τα credentials δεν είναι verified');
+  const configuredPendingCompany = await handleUpdateCompany(pendingCompany.id, {
+    aade_user_id: 'pending-now-configured-user',
+    aade_subscription_key: 'pending-now-configured-key',
+    active: false,
+  });
+  const configuredPendingRow = await db('companies').where({ id: pendingCompany.id }).first();
+  assert(configuredPendingCompany.aade_credential_status === 'configured'
+    && configuredPendingRow.aade_user_id.startsWith('enc:v2:')
+    && !configuredPendingRow.aade_credentials_verified_at,
+  'η μεταγενέστερη ασφαλής καταχώρηση και των δύο credentials μεταφέρει την εταιρεία σε configured');
   const securedRow = await db('companies').where({ id: securedCompany.id }).first();
   assert(securedRow.aade_subscription_key.startsWith('enc:v2:'), 'admin company key δεν μένει plaintext και δεσμεύεται στο ΑΦΜ/πεδίο');
   assert(decryptCompanySecret(securedRow, 'aade_subscription_key') === 'secured_key', 'το company-bound credential αποκρυπτογραφείται μόνο στο σωστό tenant context');
@@ -243,6 +273,10 @@ async function run() {
   let crossTenantSwapBlocked = false;
   try { decryptCompanySecret({ ...securedRow, vat_number: MOCK_TENANT.vat_number }, 'aade_subscription_key'); } catch { crossTenantSwapBlocked = true; }
   assert(crossTenantSwapBlocked, 'αντιγραφή ciphertext σε διαφορετικό ΑΦΜ απορρίπτεται');
+  await testCompanyMyDataConnection(securedCompany.id, async () => ({ success: true, environment: 'sandbox' }));
+  const verifiedSecuredRow = await db('companies').where({ id: securedCompany.id }).first();
+  assert(verifiedSecuredRow.aade_credential_status === 'verified' && verifiedSecuredRow.aade_credentials_verified_at,
+    'επιτυχής sandbox connection test μετατρέπει τα configured credentials σε verified');
 
   // ── Test 7: Listing mapping guard ────────────────────────────────────────
   console.log('\n🏠 Test 7: Listing mapping guard');
@@ -872,7 +906,13 @@ async function run() {
   assert(!readiness.productionReady && readiness.productionIssues.some((item) => item.code === 'sandbox_capability'), 'το production preflight μπλοκάρει χωρίς πλήρες sandbox capability evidence');
   await handleUpdateCompany(securedCompany.id, { aade_subscription_key: 'rotated_secured_key' });
   const readinessAfterRotation = await getReadiness();
-  assert(!readinessAfterRotation.checks.some((check) => check.key === `mydata:${securedCompany.id}:sandbox`), 'η περιστροφή credentials ακυρώνει αυτόματα το παλιό myDATA connection evidence');
+  const rotatedCompany = await db('companies').where({ id: securedCompany.id }).first();
+  assert(rotatedCompany.aade_credential_status === 'configured' && !rotatedCompany.aade_credentials_verified_at
+    && !readinessAfterRotation.checks.some((check) => check.key === `mydata:${securedCompany.id}:sandbox`),
+  'η περιστροφή credentials ακυρώνει αυτόματα verification και παλιό myDATA connection evidence');
+  await testCompanyMyDataConnection(securedCompany.id, async (context) => ({
+    success: context.aade_subscription_key === 'rotated_secured_key', environment: 'sandbox',
+  }));
   await initSchema();
   const encryptedLegacyTenant = await db('tenants').where({ listing_id_guesty: 'lst_TEST001' }).first();
   assert(encryptedLegacyTenant.aade_subscription_key.startsWith('enc:v1:'), 'legacy tenant credentials κρυπτογραφούνται αυτόματα στη migration');

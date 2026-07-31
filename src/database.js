@@ -113,6 +113,7 @@ async function initializeSchemaObjects() {
   await ensureDocumentSequencesTable();
   await ensureDailyCloseTables();
   await ensureIntegrationChecksTable();
+  await ensureAadeCredentialState();
   await ensureIntegrationTokensTable();
   await ensureSandboxSignoffsTable();
   await ensureSandboxAcceptanceTables();
@@ -473,8 +474,10 @@ async function ensureCompaniesTable() {
       t.increments('id').primary();
       t.string('company_name').notNullable();
       t.string('vat_number', 9).notNullable().unique();
-      t.string('aade_user_id').notNullable();
-      t.string('aade_subscription_key').notNullable();
+      t.string('aade_user_id').nullable();
+      t.string('aade_subscription_key').nullable();
+      t.string('aade_credential_status', 20).notNullable().defaultTo('pending').index();
+      t.timestamp('aade_credentials_verified_at').nullable();
       t.string('invoice_series').notNullable().defaultTo('A');
       t.integer('invoice_counter').notNullable().defaultTo(0);
       t.string('pdf_brand_name', 200).nullable();
@@ -496,6 +499,52 @@ async function ensureCompaniesTable() {
   await ensureColumn('companies', 'pdf_tax_office', (t) => t.string('pdf_tax_office', 100).nullable());
   await ensureColumn('companies', 'pdf_phone', (t) => t.string('pdf_phone', 50).nullable());
   await ensureColumn('companies', 'pdf_email', (t) => t.string('pdf_email', 200).nullable());
+  await ensureColumn('companies', 'aade_credential_status', (t) => t.string('aade_credential_status', 20).notNullable().defaultTo('pending').index());
+  await ensureColumn('companies', 'aade_credentials_verified_at', (t) => t.timestamp('aade_credentials_verified_at').nullable());
+  // Guesty-only onboarding must be able to persist a company before AADE
+  // credentials are available. Knex rebuilds the SQLite table as needed and
+  // emits ALTER COLUMN for PostgreSQL.
+  const companyColumns = await db('companies').columnInfo();
+  if (companyColumns.aade_user_id?.nullable === false
+      || companyColumns.aade_subscription_key?.nullable === false) {
+    await db.schema.alterTable('companies', (t) => {
+      t.string('aade_user_id').nullable().alter();
+      t.string('aade_subscription_key').nullable().alter();
+    });
+  }
+}
+
+async function ensureAadeCredentialState() {
+  if (!await db.schema.hasTable('companies')) return;
+  const companies = await db('companies').select(
+    'id', 'aade_user_id', 'aade_subscription_key',
+    'aade_credential_status', 'aade_credentials_verified_at',
+  );
+  for (const company of companies) {
+    const configured = Boolean(company.aade_user_id && company.aade_subscription_key);
+    if (!configured) {
+      if (company.aade_credential_status !== 'pending' || company.aade_credentials_verified_at) {
+        await db('companies').where({ id: company.id }).update({
+          aade_credential_status: 'pending',
+          aade_credentials_verified_at: null,
+        });
+      }
+      continue;
+    }
+    if (company.aade_credential_status === 'verified') continue;
+    const sandboxCheck = await db('integration_checks').where({
+      check_key: `mydata:${company.id}:sandbox`,
+      status: 'success',
+      environment: 'sandbox',
+    }).first('checked_at');
+    await db('companies').where({ id: company.id }).update(sandboxCheck ? {
+      aade_credential_status: 'verified',
+      aade_credentials_verified_at: sandboxCheck.checked_at,
+    } : {
+      aade_credential_status: 'configured',
+      aade_credentials_verified_at: null,
+    });
+  }
 }
 
 async function ensureListingsTable() {

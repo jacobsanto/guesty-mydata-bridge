@@ -90,6 +90,8 @@ test('SQLite readiness and production submission guard isolate one broken compan
     company_name: 'Ready Tenant',
     vat_number: readyVat,
     ...companyCredentials(readyVat, 'ready-user', 'ready-key'),
+    aade_credential_status: 'verified',
+    aade_credentials_verified_at: new Date().toISOString(),
     invoice_series: 'READY',
     pdf_address: 'Θήρα 84700',
     pdf_tax_office: 'Θήρας',
@@ -116,6 +118,7 @@ test('SQLite readiness and production submission guard isolate one broken compan
     vat_number: '044800455',
     aade_user_id: 'plaintext-user',
     aade_subscription_key: 'plaintext-key',
+    aade_credential_status: 'configured',
     invoice_series: '',
     active: true,
   });
