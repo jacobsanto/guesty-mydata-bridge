@@ -14,6 +14,8 @@ Never put them in Git, a ticket, chat, image, log, or database backup note.
 - `GUESTY_CLIENT_ID`, `GUESTY_CLIENT_SECRET`, and
   `GUESTY_WEBHOOK_SECRET` from Guesty.
 - PostgreSQL host, port, database, user, and a unique password.
+- `DB_POOL_MAX` at least `2` (`10` is the deployment default), because schema
+  initialization holds a dedicated PostgreSQL advisory-lock connection.
 - Per-company AADE user ID and subscription key. Enter these through the admin
   UI after deployment; do not place them in global environment variables.
 

@@ -108,9 +108,17 @@ DB_PORT=5432
 DB_NAME=guesty_mydata
 DB_USER=postgres
 DB_PASSWORD=your_password
+DB_POOL_MAX=10
 ```
 
-Το schema δημιουργείται αυτόματα κατά την εκκίνηση.
+Το schema δημιουργείται αυτόματα κατά την εκκίνηση. Το PostgreSQL pool πρέπει
+να έχει τουλάχιστον δύο connections, επειδή η migration κρατά dedicated
+advisory-lock connection. Σε upgrade γίνεται επίσης reconciliation των sequence
+rows με το μεγαλύτερο ήδη εκδομένο ΑΑ, ώστε να μη γίνει επαναχρησιμοποίηση.
+
+Το πραγματικό PostgreSQL contract ελέγχεται στο CI με PostgreSQL 16 μέσω
+`npm run test:postgres`· η εντολή επιτρέπεται να καθαρίσει μόνο τη dedicated
+βάση με όνομα `guesty_mydata_test`.
 
 ---
 

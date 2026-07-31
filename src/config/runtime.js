@@ -45,16 +45,20 @@ function databaseConfig(env = process.env) {
           database: env.DB_NAME || 'guesty_mydata',
           user: env.DB_USER,
           password: env.DB_PASSWORD,
-        };
+    };
     const ssl = postgresSsl(env);
     if (ssl) connection.ssl = ssl;
+    const poolMax = positiveInteger(env.DB_POOL_MAX, 10, 'DB_POOL_MAX');
+    if (poolMax < 2) {
+      throw new Error('DB_POOL_MAX must be at least 2 for PostgreSQL schema migration locking');
+    }
     return {
       client,
       connection,
       acquireConnectionTimeout,
       pool: {
         min: nonNegativeInteger(env.DB_POOL_MIN, 0, 'DB_POOL_MIN'),
-        max: positiveInteger(env.DB_POOL_MAX, 10, 'DB_POOL_MAX'),
+        max: poolMax,
         acquireTimeoutMillis: acquireConnectionTimeout,
         createTimeoutMillis: positiveInteger(env.DB_CONNECT_TIMEOUT_MS, 10000, 'DB_CONNECT_TIMEOUT_MS'),
         idleTimeoutMillis: positiveInteger(env.DB_IDLE_TIMEOUT_MS, 30000, 'DB_IDLE_TIMEOUT_MS'),

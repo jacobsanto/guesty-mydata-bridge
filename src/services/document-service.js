@@ -115,6 +115,14 @@ async function prepareReservationDocuments(reservation, billingContext) {
   // insert fails, the transaction rolls back both documents and both sequence
   // increments, preventing a half-created stay from reaching daily close.
   return db.transaction(async (trx) => {
+    if (trx.client.config.client === 'pg') {
+      // Serialize every fiscal revision of one reservation across all app
+      // instances. This turns concurrent webhook/backfill materialization into
+      // an idempotent read-after-first-write instead of duplicate-key failures.
+      await trx.raw('SELECT pg_advisory_xact_lock(hashtextextended(?, 0))', [
+        `fiscal-materialization:${base.companyId}:${base.reservationId}:${revisionSuffix || 'r0'}`,
+      ]);
+    }
     const primary = await createDocumentOnce({
       transaction: trx,
       ...base,

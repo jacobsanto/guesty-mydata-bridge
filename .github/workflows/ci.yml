@@ -30,3 +30,34 @@ jobs:
       - uses: actions/checkout@v4
       - name: Build production image
         run: docker build -t guesty-mydata-bridge:ci .
+
+  postgres:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: bridge
+          POSTGRES_PASSWORD: bridge-test-password
+          POSTGRES_DB: guesty_mydata_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U bridge -d guesty_mydata_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      POSTGRES_INTEGRATION_TEST: "true"
+      DB_CLIENT: pg
+      DATABASE_URL: postgresql://bridge:bridge-test-password@127.0.0.1:5432/guesty_mydata_test
+      DB_SSL: "false"
+      DATA_ENCRYPTION_KEY: BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run test:postgres

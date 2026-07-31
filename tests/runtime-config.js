@@ -23,6 +23,10 @@ assert.strictEqual(pg.connection.connectionString, 'postgres://user:pass@db/app'
 assert.strictEqual(pg.connection.ssl.rejectUnauthorized, true);
 assert.strictEqual(pg.pool.max, 4);
 assert.strictEqual(pg.acquireConnectionTimeout, 7000);
+assert.throws(
+  () => databaseConfig({ DB_CLIENT: 'pg', DATABASE_URL: 'postgres://user:pass@db/app', DB_POOL_MAX: '1' }),
+  /at least 2/,
+);
 
 assert.throws(() => validateRuntimeConfig({ NODE_ENV: 'production', DB_CLIENT: 'better-sqlite3' }), /DB_CLIENT=pg is required/);
 assert.throws(() => validateRuntimeConfig({

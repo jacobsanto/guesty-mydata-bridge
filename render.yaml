@@ -38,6 +38,8 @@ services:
           property: password
       - key: DB_SSL
         value: "true"
+      - key: DB_POOL_MAX
+        value: "10"
       - key: MYDATA_ENV
         value: sandbox
       - key: MYDATA_PRODUCTION_ENABLED

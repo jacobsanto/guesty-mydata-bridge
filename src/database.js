@@ -27,6 +27,45 @@ async function ensureColumn(tableName, columnName, builder) {
   }
 }
 
+async function ensureUniqueIndex(tableName, indexName, columns) {
+  const identifiers = [tableName, indexName, ...columns];
+  if (!identifiers.every((value) => /^[a-z0-9_]+$/.test(value))) {
+    throw new Error('Unsafe database identifier while ensuring a unique index');
+  }
+  const duplicate = await db(tableName)
+    .select(columns)
+    .count({ duplicate_count: '*' })
+    .groupBy(columns)
+    .havingRaw('COUNT(*) > 1')
+    .first();
+  if (duplicate) {
+    throw new Error(`Cannot create ${indexName}: duplicate fiscal identity rows must be resolved first`);
+  }
+  const quotedColumns = columns.map((column) => `"${column}"`).join(', ');
+  await db.raw(`CREATE UNIQUE INDEX IF NOT EXISTS "${indexName}" ON "${tableName}" (${quotedColumns})`);
+}
+
+async function reconcileDocumentSequences() {
+  const maxima = await db('fiscal_documents')
+    .select('company_id', 'document_type', 'series')
+    .max({ last_number: 'aa' })
+    .groupBy('company_id', 'document_type', 'series');
+  for (const row of maxima) {
+    const identity = {
+      company_id: row.company_id,
+      document_type: row.document_type,
+      series: row.series,
+    };
+    const lastNumber = Number(row.last_number);
+    await db('document_sequences').insert({ ...identity, last_number: lastNumber })
+      .onConflict(['company_id', 'document_type', 'series']).ignore();
+    await db('document_sequences').where(identity).where('last_number', '<', lastNumber).update({
+      last_number: lastNumber,
+      updated_at: db.fn.now(),
+    });
+  }
+}
+
 // -------------------------------------------------------------------
 // Schema — normalized model
 // companies: 1 row per legal entity / ΑΦΜ
@@ -74,6 +113,25 @@ async function initializeSchemaObjects() {
   await ensureIntegrationTokensTable();
   await ensureSandboxSignoffsTable();
   await ensureSyncCursorsTable();
+  await ensureUniqueIndex(
+    'fiscal_documents',
+    'fiscal_documents_company_type_series_aa_uq',
+    ['company_id', 'document_type', 'series', 'aa'],
+  );
+  await ensureUniqueIndex(
+    'document_sequences',
+    'document_sequences_company_type_series_uq',
+    ['company_id', 'document_type', 'series'],
+  );
+  await ensureUniqueIndex(
+    'daily_close_runs',
+    'daily_close_runs_company_date_uq',
+    ['company_id', 'business_date'],
+  );
+  // An upgraded database can already contain documents while its sequence
+  // table is absent or behind. Reconcile to the highest issued AA before any
+  // worker is allowed to materialize another fiscal document.
+  await reconcileDocumentSequences();
   await migrateLegacyTenantsToNormalizedModel();
   await migrateCredentialsToEncryptedStorage();
 }
@@ -476,7 +534,7 @@ async function ensureFiscalDocumentsTable() {
     t.timestamp('last_attempt_at').nullable();
     t.timestamp('sent_at').nullable();
     t.timestamps(true, true);
-    t.unique(['company_id', 'document_type', 'series', 'aa']);
+    t.unique(['company_id', 'document_type', 'series', 'aa'], 'fiscal_documents_company_type_series_aa_uq');
     t.foreign('company_id').references('companies.id').onDelete('RESTRICT');
     t.foreign('listing_id').references('listings.id').onDelete('RESTRICT');
     t.foreign('related_document_id').references('fiscal_documents.id').onDelete('RESTRICT');
@@ -495,7 +553,7 @@ async function ensureDocumentSequencesTable() {
     t.string('series', 50).notNullable();
     t.integer('last_number').notNullable().defaultTo(0);
     t.timestamps(true, true);
-    t.unique(['company_id', 'document_type', 'series']);
+    t.unique(['company_id', 'document_type', 'series'], 'document_sequences_company_type_series_uq');
     t.foreign('company_id').references('companies.id').onDelete('CASCADE');
   });
   console.log('✅ Δημιουργήθηκε πίνακας: document_sequences');
@@ -517,7 +575,7 @@ async function ensureDailyCloseTables() {
       t.timestamp('lease_expires_at').nullable();
       t.bigInteger('lease_expires_at_ms').nullable();
       t.timestamps(true, true);
-      t.unique(['company_id', 'business_date']);
+      t.unique(['company_id', 'business_date'], 'daily_close_runs_company_date_uq');
       t.foreign('company_id').references('companies.id').onDelete('RESTRICT');
     });
     console.log('✅ Δημιουργήθηκε πίνακας: daily_close_runs');
