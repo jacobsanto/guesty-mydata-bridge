@@ -445,7 +445,7 @@ if (process.env.POSTGRES_INTEGRATION_TEST !== 'true') {
   });
 
   test('authoritative Guesty cancellation durably queues and automatically verifies APY and TAKK cancellation work', async () => {
-    const vatNumber = '111111111';
+    const vatNumber = '109262634';
     const identity = { vat_number: vatNumber };
     const [autoCompany] = await db('companies').insert({
       company_name: 'PG Automatic Cancellation Tenant',
@@ -690,7 +690,12 @@ if (process.env.POSTGRES_INTEGRATION_TEST !== 'true') {
     await finishRun(winners[0].value.id, { total: 0, sent: 0, failed: 0 }, winners[0].value.lease_token);
 
     const crashed = await beginRun(company.id, '2026-07-30', { leaseSeconds: 30 });
-    const document = await db('fiscal_documents').orderBy('id', 'asc').first();
+    const document = await insertFiscalDocument({
+      key: 'pg-daily-close-lease-document',
+      reservationId: 'pg-daily-close-lease-reservation',
+      series: 'PG-LEASE',
+      aa: 1,
+    });
     await recordRunItem(crashed.id, document.id, 'failed', 'crashed attempt', crashed.lease_token);
     await db('daily_close_runs').where({ id: crashed.id }).update({ lease_expires_at_ms: Date.now() - 1 });
     await assert.rejects(
