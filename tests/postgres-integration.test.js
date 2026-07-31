@@ -445,7 +445,7 @@ if (process.env.POSTGRES_INTEGRATION_TEST !== 'true') {
   });
 
   test('authoritative Guesty cancellation durably queues and automatically verifies APY and TAKK cancellation work', async () => {
-    const vatNumber = '109262634';
+    const vatNumber = '123456783';
     const identity = { vat_number: vatNumber };
     const [autoCompany] = await db('companies').insert({
       company_name: 'PG Automatic Cancellation Tenant',
@@ -682,19 +682,43 @@ if (process.env.POSTGRES_INTEGRATION_TEST !== 'true') {
   });
 
   test('daily-close lease is exclusive and a stale worker cannot heartbeat or finish', async () => {
-    const attempts = await Promise.allSettled(Array.from({ length: 12 }, () => beginRun(company.id, '2026-07-31')));
+    const leaseVat = '876543210';
+    const [leaseCompany] = await db('companies').insert({
+      company_name: 'PostgreSQL Lease Isolation Test',
+      vat_number: leaseVat,
+      aade_user_id: 'pg-lease-user',
+      aade_subscription_key: 'pg-lease-key',
+      invoice_series: 'PG-LEASE',
+      active: true,
+    }).returning('*');
+    const [leaseListing] = await db('listings').insert({
+      company_id: leaseCompany.id,
+      listing_id_guesty: 'pg-lease-listing',
+      property_type: 'apartment',
+      default_invoice_type: '11.2',
+      climate_fee_high: 10,
+      climate_fee_low: 1.5,
+      climate_fee_high_category: 24,
+      climate_fee_low_category: 10,
+      climate_fee_series: 'PG-LEASE-TAKK',
+      payment_method_type: 1,
+      active: true,
+    }).returning('*');
+    const attempts = await Promise.allSettled(Array.from({ length: 12 }, () => beginRun(leaseCompany.id, '2026-07-31')));
     const winners = attempts.filter((result) => result.status === 'fulfilled');
     const losers = attempts.filter((result) => result.status === 'rejected');
     assert.equal(winners.length, 1);
     assert(losers.every((result) => result.reason.status === 409));
     await finishRun(winners[0].value.id, { total: 0, sent: 0, failed: 0 }, winners[0].value.lease_token);
 
-    const crashed = await beginRun(company.id, '2026-07-30', { leaseSeconds: 30 });
+    const crashed = await beginRun(leaseCompany.id, '2026-07-30', { leaseSeconds: 30 });
     const document = await insertFiscalDocument({
       key: 'pg-daily-close-lease-document',
       reservationId: 'pg-daily-close-lease-reservation',
       series: 'PG-LEASE',
       aa: 1,
+      companyId: leaseCompany.id,
+      listingId: leaseListing.id,
     });
     await recordRunItem(crashed.id, document.id, 'failed', 'crashed attempt', crashed.lease_token);
     await db('daily_close_runs').where({ id: crashed.id }).update({ lease_expires_at_ms: Date.now() - 1 });
@@ -702,7 +726,7 @@ if (process.env.POSTGRES_INTEGRATION_TEST !== 'true') {
       recordRunItem(crashed.id, document.id, 'failed', 'expired worker', crashed.lease_token),
       (error) => error.status === 409,
     );
-    const recovered = await beginRun(company.id, '2026-07-30', { leaseSeconds: 30 });
+    const recovered = await beginRun(leaseCompany.id, '2026-07-30', { leaseSeconds: 30 });
     assert.notEqual(recovered.lease_token, crashed.lease_token);
     assert.equal(Number((await db('daily_close_items').where({ run_id: recovered.id }).count({ count: '*' }).first()).count), 0);
     await assert.rejects(heartbeatRun(crashed.id, crashed.lease_token, 30), (error) => error.status === 409);
@@ -752,12 +776,13 @@ if (process.env.POSTGRES_INTEGRATION_TEST !== 'true') {
     const lateDocument = await insertFiscalDocument({
       key: 'pg-late-mark-after-crash', reservationId: 'pg-late-mark-after-crash',
       series: 'PG-LATE-MARK', aa: 1,
+      companyId: leaseCompany.id, listingId: leaseListing.id,
     });
     await db('fiscal_documents').where({ id: lateDocument.id }).update({
       issue_date: '2026-08-01', status: 'transmitting', mydata_mark: null,
       verification_status: 'pending', verified_at: null,
     });
-    const inFlightRun = await beginRun(company.id, '2026-08-01', { leaseSeconds: 30 });
+    const inFlightRun = await beginRun(leaseCompany.id, '2026-08-01', { leaseSeconds: 30 });
     await recordRunItem(inFlightRun.id, lateDocument.id, 'in_flight', 'waiting for MARK', inFlightRun.lease_token);
     const partial = await finishRun(inFlightRun.id, {}, inFlightRun.lease_token);
     assert.equal(partial.status, 'partial');
@@ -766,10 +791,10 @@ if (process.env.POSTGRES_INTEGRATION_TEST !== 'true') {
     assert.equal(Number(partial.failed_count), 0);
 
     await db('fiscal_documents').where({ id: lateDocument.id }).update({ status: 'sent', mydata_mark: 'PG-LATE-MARK' });
-    await db('fiscal_documents').where({ company_id: company.id }).whereNot({ id: lateDocument.id }).update({
+    await db('fiscal_documents').where({ company_id: leaseCompany.id }).whereNot({ id: lateDocument.id }).update({
       status: 'cancelled', cancellation_status: 'cancelled',
     });
-    const verificationRun = await beginRun(company.id, '2026-08-01', { leaseSeconds: 30 });
+    const verificationRun = await beginRun(leaseCompany.id, '2026-08-01', { leaseSeconds: 30 });
     await recordVerificationResult(verificationRun.id, lateDocument.id, 'PG-LATE-MARK', {
       verified: true, artifact: pdfArtifact(lateDocument, 'PG-LATE-MARK', 'late'),
     }, verificationRun.lease_token);
