@@ -49,9 +49,12 @@ const {
 const { reconcileUncertainTransmission } = require('../src/services/transmission-reconciliation-service');
 const { runGuestyReconciliation } = require('../src/services/guesty-reconciliation-service');
 const { createSandboxSignoff } = require('../src/services/sandbox-signoff-service');
+const {
+  CAPABILITIES, createAcceptanceRun, getAcceptanceMatrix,
+} = require('../src/services/sandbox-acceptance-service');
 const { applyFinancialProfile, calibrateProfile, listObservedChannels } = require('../src/services/financial-profile-service');
 const { evaluateFolio } = require('../src/services/financial-rule-engine');
-const { claimDocument } = require('../src/repositories/fiscal-documents');
+const { claimDocument, listCancellationResolutionEvents } = require('../src/repositories/fiscal-documents');
 
 // ─── Mock Data ────────────────────────────────────────────────────────────────
 
@@ -500,6 +503,23 @@ async function run() {
       && !definitiveFailure.cancellation_retryable && !definitiveFailure.cancellation_uncertain;
   }
   assert(cancellationFailureRecorded, 'αποτυχία CancelInvoice κρατά το αρχικό παραστατικό sent και απαιτεί επίλυση πριν από πιστωτικό');
+  const resolutionEnvironment = process.env.MYDATA_ENV;
+  process.env.MYDATA_ENV = 'production';
+  let crossEnvironmentResolutionBlocked = false;
+  try {
+    await resolveCancellationFailure({
+      documentId: originalTpy.id,
+      decision: 'retain_active',
+      reason: 'Cross environment resolution must fail closed',
+      resolvedBy: 'Smoke Test Accountant',
+      expectedUpdatedAt: definitiveFailure.updated_at,
+      idempotencyKey: 'smoke-cross-environment-001',
+      adminKeyFingerprint: 'a'.repeat(64),
+      verifier: async () => { throw new Error('wrong-environment verifier must not run'); },
+    });
+  } catch (error) { crossEnvironmentResolutionBlocked = error.status === 409; }
+  if (resolutionEnvironment === undefined) delete process.env.MYDATA_ENV; else process.env.MYDATA_ENV = resolutionEnvironment;
+  assert(crossEnvironmentResolutionBlocked, 'resolution και reconciliation δεν χρησιμοποιούν myDATA evidence άλλου περιβάλλοντος');
   const resolutionKey = 'smoke-retain-active-001';
   const resolution = await resolveCancellationFailure({
     documentId: originalTpy.id,
@@ -524,6 +544,39 @@ async function run() {
   assert(resolution.document.status === 'sent' && resolution.document.cancellation_status === 'none'
     && resolution.event.decision === 'retain_active' && idempotentResolution.idempotent,
   'οριστική απόρριψη CancelInvoice επιλύεται μόνο με fresh myDATA check και append-only idempotent audit event');
+  const resolutionAudit = await listCancellationResolutionEvents(originalTpy.id);
+  assert(resolutionAudit.length === 1 && resolutionAudit[0].idempotency_key === resolutionKey,
+    'το append-only cancellation resolution audit είναι ανακτήσιμο ανά παραστατικό');
+  const [alreadyCancelledFailure] = await db('fiscal_documents').insert({
+    document_key: 'smoke-cancellation-found-during-resolution', company_id: securedCompany.id,
+    listing_id: securedListing.id, reservation_id: 'res_CANCEL_FOUND', document_kind: 'service_invoice',
+    document_type: '2.1', series: 'CANCEL-FOUND', aa: 1, issue_date: '2025-07-15',
+    net_value: 100, vat_amount: 13, other_taxes_amount: 0, gross_value: 113,
+    status: 'sent', target_environment: 'sandbox', mydata_environment: 'sandbox',
+    mydata_mark: '400000000009901', verification_status: 'verified', cancellation_status: 'failed',
+    cancellation_retryable: false, cancellation_uncertain: false, cancellation_error: 'explicit AADE rejection',
+    xml_payload: '<invoice/>', source_payload: '{}',
+  }).returning('*');
+  const foundResolutionInput = {
+    documentId: alreadyCancelledFailure.id, decision: 'retain_active',
+    reason: 'Fresh verification found that AADE already cancelled it', resolvedBy: 'Smoke Test Accountant',
+    expectedUpdatedAt: alreadyCancelledFailure.updated_at, idempotencyKey: 'smoke-found-cancellation-001',
+    adminKeyFingerprint: 'a'.repeat(64),
+  };
+  const foundResolution = await resolveCancellationFailure({
+    ...foundResolutionInput,
+    verifier: async (invoiceMark) => ({
+      verified: true, invoiceMark, cancellationMark: '900000000009901', raw: { status: 'verified' },
+    }),
+  });
+  const foundResolutionReplay = await resolveCancellationFailure({
+    ...foundResolutionInput,
+    verifier: async () => { throw new Error('found-cancellation replay must not recheck myDATA'); },
+  });
+  assert(foundResolution.reconciled && foundResolution.document.cancellation_verification_status === 'verified'
+    && foundResolutionReplay.idempotent && foundResolutionReplay.reconciled
+    && (await listCancellationResolutionEvents(alreadyCancelledFailure.id)).length === 1,
+  'ήδη υπάρχον cancellation MARK αποθηκεύεται verified και audited με idempotent replay');
   let invalidCreditInputBlocked = 0;
   for (const input of [
     { grossValue: 1.001, issueDate: '2025-07-16', reference: 'bad-decimals' },
@@ -748,7 +801,7 @@ async function run() {
   assert(storedGuestyToken?.value === 'offline-access-token' && rawGuestyToken.encrypted_access_token.startsWith('enc:v2:'), 'το Guesty OAuth token επιβιώνει restart μόνο σε provider-bound κρυπτογραφημένη μορφή');
   const readiness = await getReadiness();
   assert(readiness.checks.some((check) => check.key === 'guesty' && check.status === 'success') && readiness.checks.some((check) => check.key === `mydata:${securedCompany.id}:sandbox` && check.environment === 'sandbox'), 'το production preflight κρατά πρόσφατη απόδειξη Guesty/myDATA sandbox connection check');
-  assert(!readiness.productionReady && readiness.productionIssues.some((item) => item.code === 'sandbox_signoff'), 'το production preflight μπλοκάρει χωρίς sandbox sign-off MARK');
+  assert(!readiness.productionReady && readiness.productionIssues.some((item) => item.code === 'sandbox_capability'), 'το production preflight μπλοκάρει χωρίς πλήρες sandbox capability evidence');
   await handleUpdateCompany(securedCompany.id, { aade_subscription_key: 'rotated_secured_key' });
   const readinessAfterRotation = await getReadiness();
   assert(!readinessAfterRotation.checks.some((check) => check.key === `mydata:${securedCompany.id}:sandbox`), 'η περιστροφή credentials ακυρώνει αυτόματα το παλιό myDATA connection evidence');
@@ -1121,11 +1174,87 @@ async function run() {
   let cancellationRetryBlocked = false;
   try { await cancelFiscalDocument({ documentId: cancellationTarget.id, canceller: async () => ({ cancellationMark: 'must-not-run' }) }); } catch (error) { cancellationRetryBlocked = error.status === 409; }
   assert(cancellationRetryBlocked, 'η αβέβαιη ακύρωση δεν ξαναστέλνεται πριν από συμφωνία');
+  let unverifiedCancellationEvidenceBlocked = false;
+  try {
+    await createAcceptanceRun({
+      company_id: securedCompany.id, approved_by: 'Smoke Test Accountant',
+      artifacts: [{ capability: CAPABILITIES.CANCEL, document_id: cancellationTarget.id }],
+    });
+  } catch (error) { unverifiedCancellationEvidenceBlocked = error.status === 409; }
+  assert(unverifiedCancellationEvidenceBlocked, 'αβέβαιη ή μη verified ακύρωση δεν γίνεται sandbox acceptance evidence');
   const reconciledCancellation = await reconcileFiscalDocumentCancellation({
     documentId: cancellationTarget.id,
     verifier: async (invoiceMark) => ({ verified: true, invoiceMark, cancellationMark: '800000000000001' }),
   });
   assert(reconciledCancellation.status === 'cancelled' && reconciledCancellation.cancellation_mark === '800000000000001', 'RequestTransmittedDocs συμφωνεί την αβέβαιη ακύρωση με cancellation MARK');
+
+  let wrongPairBlocked = false;
+  try {
+    await createAcceptanceRun({
+      company_id: securedCompany.id, approved_by: 'Smoke Test Accountant',
+      artifacts: [{
+        capability: CAPABILITIES.STAY_TPY,
+        document_id: reconciledPair.find((row) => row.document_type === '2.1').id,
+        paired_document_id: sentRows.find((row) => row.document_type === '8.2').id,
+      }],
+    });
+  } catch (error) { wrongPairBlocked = error.status === 409; }
+  assert(wrongPairBlocked, 'sandbox acceptance απορρίπτει primary/TAKK από διαφορετικές κρατήσεις');
+
+  const acceptanceCreditResult = await createCreditDocument({
+    documentId: originalTpy.id, grossValue: 1, issueDate: uncertainBusinessDate, reference: 'sandbox-acceptance-credit',
+  });
+  await db('fiscal_documents').where({ id: acceptanceCreditResult.document.id }).update({
+    status: 'sent', verification_status: 'verified', mydata_mark: '710000000000001',
+    mydata_uid: 'UID-ACCEPTANCE-CREDIT', mydata_environment: 'sandbox',
+    mydata_response: JSON.stringify({ statusCode: 'Success', invoiceMark: '710000000000001' }),
+  });
+  const acceptanceCredit = await db('fiscal_documents').where({ id: acceptanceCreditResult.document.id }).first();
+
+  const anotherCompany = await db('companies').whereNot({ id: securedCompany.id }).where({ active: true }).first();
+  let wrongCompanyBlocked = false;
+  try {
+    await createAcceptanceRun({
+      company_id: anotherCompany.id, approved_by: 'Smoke Test Accountant',
+      artifacts: [{ capability: CAPABILITIES.CREDIT_TPY, document_id: acceptanceCredit.id }],
+    });
+  } catch (error) { wrongCompanyBlocked = error.status === 409; }
+  assert(wrongCompanyBlocked, 'sandbox acceptance απορρίπτει evidence άλλης εταιρείας');
+
+  const acceptedRun = await createAcceptanceRun({
+    company_id: securedCompany.id, approved_by: 'Smoke Test Accountant',
+    approval_notes: 'Verified credit and CancelInvoice lifecycle',
+    artifacts: [
+      { capability: CAPABILITIES.CREDIT_TPY, document_id: acceptanceCredit.id },
+      { capability: CAPABILITIES.CANCEL, document_id: cancellationTarget.id },
+    ],
+  });
+  const matrixBeforeCredentialRotation = await getAcceptanceMatrix(securedCompany.id);
+  assert(acceptedRun.artifacts.length === 2
+    && matrixBeforeCredentialRotation.accepted.includes(CAPABILITIES.STAY_TPY)
+    && matrixBeforeCredentialRotation.accepted.includes(CAPABILITIES.CREDIT_TPY)
+    && matrixBeforeCredentialRotation.accepted.includes(CAPABILITIES.CANCEL),
+  'legacy stay evidence και normalized credit/cancellation evidence συνθέτουν capability matrix');
+
+  const wrongEnvironmentOriginal = await db('fiscal_documents').where({ id: acceptanceCredit.id }).first();
+  await db('fiscal_documents').where({ id: acceptanceCredit.id }).update({ target_environment: 'production' });
+  let wrongEnvironmentBlocked = false;
+  try {
+    await createAcceptanceRun({
+      company_id: securedCompany.id, approved_by: 'Smoke Test Accountant',
+      artifacts: [{ capability: CAPABILITIES.CREDIT_TPY, document_id: acceptanceCredit.id }],
+    });
+  } catch (error) { wrongEnvironmentBlocked = error.status === 409; }
+  await db('fiscal_documents').where({ id: acceptanceCredit.id }).update({ target_environment: wrongEnvironmentOriginal.target_environment });
+  assert(wrongEnvironmentBlocked, 'production ή legacy target document δεν γίνεται sandbox acceptance evidence');
+
+  await handleUpdateCompany(securedCompany.id, {
+    aade_user_id: 'rotated_acceptance_user', aade_subscription_key: 'rotated_acceptance_key',
+  });
+  const matrixAfterCredentialRotation = await getAcceptanceMatrix(securedCompany.id);
+  assert(!matrixAfterCredentialRotation.accepted.includes(CAPABILITIES.CREDIT_TPY)
+    && !matrixAfterCredentialRotation.accepted.includes(CAPABILITIES.CANCEL),
+  'rotation AADE credentials ακυρώνει normalized sandbox acceptance evidence');
 
   // ── Test 23: Guesty dropped-webhook reconciliation ─────────────────────
   console.log('\n🔄 Test 23: Guesty paginated backfill/cursor για χαμένο webhook');

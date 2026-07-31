@@ -1,7 +1,7 @@
 'use strict';
 
 const express = require('express');
-const { listDocuments } = require('../repositories/fiscal-documents');
+const { listDocuments, listCancellationResolutionEvents } = require('../repositories/fiscal-documents');
 const { cancelFiscalDocument, reconcileFiscalDocumentCancellation, resolveCancellationFailure } = require('../services/cancellation-service');
 const { createCreditDocument } = require('../services/credit-service');
 const { renderFiscalDocumentPdf } = require('../services/pdf-service');
@@ -52,6 +52,14 @@ router.post('/fiscal-documents/:id/resolve-cancellation-failure', async (req, re
       idempotencyKey: req.body.idempotency_key,
       adminKeyFingerprint: req.adminKeyFingerprint,
     }));
+  } catch (error) { next(error); }
+});
+
+router.get('/fiscal-documents/:id/cancellation-resolution-events', async (req, res, next) => {
+  try {
+    const documentId = Number(req.params.id);
+    if (!Number.isInteger(documentId) || documentId <= 0) return res.status(400).json({ error: 'Invalid document id' });
+    return res.json({ data: await listCancellationResolutionEvents(documentId) });
   } catch (error) { next(error); }
 });
 

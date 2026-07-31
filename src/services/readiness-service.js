@@ -1,9 +1,10 @@
 'use strict';
 
 const { db } = require('../database');
-const { isEncrypted, isContextBound, companyCredentialBinding } = require('../security/credentials');
+const { isEncrypted, isContextBound } = require('../security/credentials');
 const { listIntegrationChecks } = require('../repositories/integration-checks');
 const { normalizeAndValidateGreekVat, normalizeCounterpart, normalizeSeries, validateAccommodationClimatePair } = require('../validation/fiscal-fields');
+const { getAcceptanceMatrices } = require('./sandbox-acceptance-service');
 
 function issue(code, message, scope = 'runtime') {
   return { code, message, scope };
@@ -14,7 +15,7 @@ function validationError(check) {
 }
 
 async function getReadiness() {
-  const [companies, listings, rules, legacyRuleCountRow, financialProfiles, observedChannels, reviewCountRow, uncertainCountRow, cancellationUncertainCountRow, environmentMismatchRows, checks, sandboxSignoffs] = await Promise.all([
+  const [companies, listings, rules, legacyRuleCountRow, financialProfiles, observedChannels, reviewCountRow, uncertainCountRow, cancellationUncertainCountRow, cancellationUnverifiedCountRow, environmentMismatchRows, checks] = await Promise.all([
     db('companies').where({ active: true }).select('*'),
     db('listings').where({ active: true }).select('*'),
     db('listing_channel_billing_rules').where({ active: true }).select('*'),
@@ -29,13 +30,17 @@ async function getReadiness() {
     db('fiscal_documents').where({ transmission_uncertain: true }).count({ count: '*' }).first(),
     db('fiscal_documents').where({ cancellation_uncertain: true }).count({ count: '*' }).first(),
     db('fiscal_documents')
+      .where({ status: 'cancelled', cancellation_status: 'cancelled' })
+      .whereNot({ cancellation_verification_status: 'verified' })
+      .count({ count: '*' }).first(),
+    db('fiscal_documents')
       .whereIn('status', ['pending', 'failed', 'transmitting'])
       .where((query) => query.whereNull('target_environment').orWhereNot({ target_environment: 'production' }))
       .select('company_id', 'target_environment')
       .groupBy('company_id', 'target_environment'),
     listIntegrationChecks(),
-    db('sandbox_signoffs').select('company_id', 'reservation_id', 'issuer_vat', 'credential_binding_sha256', 'primary_mark', 'takk_mark', 'approved_by', 'approved_at'),
   ]);
+  const acceptance = await getAcceptanceMatrices(companies);
   const issues = [];
   const freshAfter = Date.now() - 24 * 60 * 60 * 1000;
   const isFreshSuccess = (row) => row?.status === 'success' && Date.parse(row.checked_at) >= freshAfter;
@@ -136,6 +141,8 @@ async function getReadiness() {
   if (uncertainCount > 0) issues.push(issue('uncertain_transmissions', `${uncertainCount} μεταδόσεις έχουν αβέβαιο αποτέλεσμα και απαιτούν συμφωνία MARK`));
   const cancellationUncertainCount = Number(cancellationUncertainCountRow?.count || 0);
   if (cancellationUncertainCount > 0) issues.push(issue('uncertain_cancellations', `${cancellationUncertainCount} ακυρώσεις έχουν αβέβαιο αποτέλεσμα και απαιτούν συμφωνία`));
+  const cancellationUnverifiedCount = Number(cancellationUnverifiedCountRow?.count || 0);
+  if (cancellationUnverifiedCount > 0) issues.push(issue('unverified_cancellations', `${cancellationUnverifiedCount} ακυρώσεις έχουν MARK που δεν έχει ακόμη επαληθευτεί με RequestTransmittedDocs`));
 
   const sandboxReady = issues.length === 0;
   // A sandbox connection check is acceptance evidence, not a renewable
@@ -157,11 +164,13 @@ async function getReadiness() {
   }
   if ((process.env.DB_CLIENT || 'better-sqlite3') !== 'pg') productionIssues.push(issue('production_database', 'Για production απαιτείται PostgreSQL'));
   if (process.env.DAILY_CLOSE_ENABLED !== 'true') productionIssues.push(issue('daily_close_disabled', 'Για production απαιτείται DAILY_CLOSE_ENABLED=true'));
-  for (const company of companies) {
-    if (!sandboxSignoffs.some((signoff) => Number(signoff.company_id) === Number(company.id)
-      && signoff.issuer_vat === company.vat_number
-      && signoff.credential_binding_sha256 === companyCredentialBinding(company))) {
-      productionIssues.push(issue('sandbox_signoff', `${company.company_name}: λείπει λογιστικά εγκεκριμένο sandbox ζεύγος ΑΠΥ/ΤΠΥ + ΤΑΚΚ`, `company:${company.id}`));
+  for (const matrix of acceptance) {
+    for (const capability of matrix.missing) {
+      productionIssues.push(issue(
+        'sandbox_capability',
+        `${matrix.companyName}: λείπει λογιστικά εγκεκριμένο sandbox evidence για ${capability}`,
+        `company:${matrix.companyId}`,
+      ));
     }
   }
   if (process.env.MYDATA_PRODUCTION_ENABLED !== 'true') productionIssues.push(issue('production_breaker', 'Το MYDATA_PRODUCTION_ENABLED παραμένει απενεργοποιημένο'));
@@ -171,6 +180,7 @@ async function getReadiness() {
     productionReady: productionIssues.length === 0,
     issues,
     productionIssues,
+    acceptance,
     checks: checks.map((row) => ({ key: row.check_key, status: row.status, environment: row.environment, checked_at: row.checked_at })),
     counts: {
       companies: companies.length,
@@ -178,9 +188,10 @@ async function getReadiness() {
       reviews: reviewCount,
       uncertainTransmissions: uncertainCount,
       uncertainCancellations: cancellationUncertainCount,
+      unverifiedCancellations: cancellationUnverifiedCount,
       financialProfiles: financialProfiles.length,
       observedFinancialChannels: observedChannels.length,
-      sandboxSignoffs: sandboxSignoffs.length,
+      sandboxAcceptedCapabilities: acceptance.reduce((sum, matrix) => sum + matrix.accepted.length, 0),
     },
   };
 }

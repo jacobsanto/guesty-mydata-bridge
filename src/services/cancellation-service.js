@@ -22,7 +22,8 @@ async function cancelFiscalDocument({ documentId, canceller = cancelMyDataInvoic
   }
   if (document.status === 'cancelled') return document;
   const currentEnvironment = process.env.MYDATA_ENV || 'sandbox';
-  if (document.mydata_mark && document.mydata_environment !== currentEnvironment) {
+  if (document.mydata_mark && (document.mydata_environment !== currentEnvironment
+      || document.target_environment !== currentEnvironment)) {
     const error = new Error(`Document belongs to myDATA ${document.mydata_environment || 'unknown'} and cannot be cancelled from ${currentEnvironment}`);
     error.status = 409;
     throw error;
@@ -54,7 +55,7 @@ async function cancelFiscalDocument({ documentId, canceller = cancelMyDataInvoic
   }
 
   await assertProductionTransmissionEnabled('cancellations');
-  const attemptToken = await claimDocumentCancellation(document.id);
+  const attemptToken = await claimDocumentCancellation(document.id, currentEnvironment);
   if (!attemptToken) {
     const current = await getDocumentById(document.id);
     if (current?.status === 'cancelled') return current;
@@ -87,6 +88,10 @@ async function cancelFiscalDocument({ documentId, canceller = cancelMyDataInvoic
 async function reconcileFiscalDocumentCancellation({ documentId, verifier = verifyCancelledInvoice }) {
   const document = await getDocumentById(documentId);
   if (!document) throw Object.assign(new Error('Fiscal document not found'), { status: 404 });
+  const currentEnvironment = process.env.MYDATA_ENV || 'sandbox';
+  if (document.mydata_environment !== currentEnvironment || document.target_environment !== currentEnvironment) {
+    throw Object.assign(new Error('Fiscal document myDATA environment does not match runtime'), { status: 409 });
+  }
   const uncertain = document.status === 'sent' && document.mydata_mark && document.cancellation_uncertain;
   const awaitingVerification = document.status === 'cancelled' && document.mydata_mark && document.cancellation_mark
     && document.cancellation_verification_status !== 'verified';
@@ -107,10 +112,13 @@ async function reconcileFiscalDocumentCancellation({ documentId, verifier = veri
     if (String(result.cancellationMark) !== String(document.cancellation_mark)) {
       throw Object.assign(new Error('RequestTransmittedDocs returned a different cancellation MARK'), { status: 409 });
     }
-    return markCancellationVerified(document.id, result.cancellationMark, result.raw || result);
+    return markCancellationVerified(document.id, result.cancellationMark, result.raw || result, {
+      expectedEnvironment: currentEnvironment,
+    });
   }
   return markDocumentCancelled(document.id, result.cancellationMark, {
     reconciled: true, verificationResponse: result.raw || result,
+    expectedEnvironment: currentEnvironment,
   });
 }
 
@@ -136,10 +144,19 @@ async function resolveCancellationFailure({
   const prior = await getCancellationResolutionEvent(normalizedKey);
   if (prior) {
     if (prior.payload_hash !== payloadHash) throw Object.assign(new Error('Idempotency key already belongs to a different resolution'), { status: 409 });
-    return { event: prior, document: await getDocumentById(prior.document_id), idempotent: true };
+    return {
+      event: prior,
+      document: await getDocumentById(prior.document_id),
+      idempotent: true,
+      reconciled: prior.to_status === 'cancelled',
+    };
   }
   const document = await getDocumentById(documentId);
   if (!document) throw Object.assign(new Error('Fiscal document not found'), { status: 404 });
+  const currentEnvironment = process.env.MYDATA_ENV || 'sandbox';
+  if (document.mydata_environment !== currentEnvironment || document.target_environment !== currentEnvironment) {
+    throw Object.assign(new Error('Fiscal document myDATA environment does not match runtime'), { status: 409 });
+  }
   if (document.status !== 'sent' || document.cancellation_status !== 'failed'
       || document.cancellation_retryable || document.cancellation_uncertain || !document.mydata_mark) {
     throw Object.assign(new Error('Only a definitive non-retryable CancelInvoice failure can be resolved'), { status: 409 });
@@ -151,18 +168,19 @@ async function resolveCancellationFailure({
     aade_user_id: decryptCompanySecret(company, 'aade_user_id'),
     aade_subscription_key: decryptCompanySecret(company, 'aade_subscription_key'),
   });
-  if (check?.verified && check.cancellationMark) {
-    return { reconciled: true, document: await markDocumentCancelled(document.id, check.cancellationMark, {
-      reconciled: true, verificationResponse: check.raw || check,
-    }) };
-  }
-  if (!check?.notFound || String(check.invoiceMark) !== String(document.mydata_mark)) {
+  const foundCancellation = check?.verified && check.cancellationMark ? {
+    invoiceMark: check.invoiceMark,
+    cancellationMark: check.cancellationMark,
+    raw: check.raw || check,
+  } : null;
+  if (!foundCancellation && (!check?.notFound || String(check.invoiceMark) !== String(document.mydata_mark))) {
     throw Object.assign(new Error('myDATA did not authoritatively confirm that no cancellation exists'), { status: 409 });
   }
   return resolveDefinitiveCancellationFailure({
     documentId: Number(documentId), decision, reason: normalizedReason, resolvedBy: normalizedActor,
     expectedUpdatedAt: expected, idempotencyKey: normalizedKey,
     adminKeyFingerprint: fingerprint, payloadHash,
+    expectedEnvironment: currentEnvironment, foundCancellation,
   });
 }
 

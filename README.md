@@ -136,6 +136,8 @@ rows με το μεγαλύτερο ήδη εκδομένο ΑΑ, ώστε να 
 | `POST` | `/api/fiscal-documents/:id/credit` | Δημιουργία πιστωτικού |
 | `POST` | `/api/fiscal-documents/:id/reconcile-mark` | Συμφωνία αβέβαιης διαβίβασης με επιβεβαιωμένο MARK |
 | `POST` | `/api/fiscal-documents/:id/reconcile-cancellation` | Συμφωνία αβέβαιης ακύρωσης με cancellation MARK |
+| `POST` | `/api/fiscal-documents/:id/resolve-cancellation-failure` | Audited επίλυση οριστικής απόρριψης CancelInvoice μετά από νέο έλεγχο ΑΑΔΕ |
+| `GET` | `/api/fiscal-documents/:id/cancellation-resolution-events` | Append-only ιστορικό αποφάσεων ακύρωσης |
 | `GET` | `/api/reservations?requires_review=true` | Μεταβολές μετά τη δημιουργία παραστατικών |
 | `PATCH` | `/api/reservations/:id/fiscal-override` | Εξαίρεση ΑΠΥ/ΤΠΥ πριν από τη δημιουργία ΑΑ |
 | `DELETE` | `/api/reservations/:id/fiscal-override` | Επιστροφή στον κανόνα καναλιού πριν από τη δημιουργία ΑΑ |
@@ -151,6 +153,8 @@ rows με το μεγαλύτερο ήδη εκδομένο ΑΑ, ώστε να 
 | `POST` | `/api/financial-profiles/:id/suspend` | Άμεσο μπλοκάρισμα ενεργού profile |
 | `GET` | `/api/financial-channels/observed` | Παρατηρημένοι συνδυασμοί listing/platform/source |
 | `GET/POST` | `/api/sandbox-signoffs` | Αμετάβλητη έγκριση verified κύριου + ΤΑΚΚ και hashes PDF |
+| `GET` | `/api/sandbox-acceptance/requirements` | Capability matrix sandbox ανά εταιρεία |
+| `GET/POST` | `/api/sandbox-acceptance/runs` | Immutable λογιστική έγκριση sandbox evidence |
 | `GET` | `/api/readiness` | Sandbox/production preflight ανά εταιρεία και κατάλυμα |
 
 ---
@@ -191,6 +195,8 @@ Render Blueprint, DB-aware readiness checks και graceful shutdown. Η πρώ�
 απενεργοποιημένο ημερήσιο scheduler.
 
 Δες το πλήρες [deployment, backup και rollback runbook](docs/deployment-runbook.md).
-Το production preflight απαιτεί immutable, λογιστικά εγκεκριμένο sandbox sign-off
-ανά εταιρεία, με πραγματικό `sent + verified` ζεύγος ΑΠΥ/ΤΠΥ και ΤΑΚΚ, τα δύο
-MARK και SHA-256 των τελικών PDF.
+Το production preflight απαιτεί immutable, λογιστικά εγκεκριμένο sandbox evidence
+ανά εταιρεία για κάθε οικογένεια που χρησιμοποιεί: `2.1+8.2` και `5.1`, ή/και
+`11.2+8.2` και `11.4`, καθώς και `CancelInvoice` με cancellation MARK
+επαληθευμένο από `RequestTransmittedDocs`. Η έγκριση δεσμεύεται στο ΑΦΜ, στα
+τρέχοντα AADE credentials και στην έκδοση του fiscal contract.

@@ -113,6 +113,7 @@ async function initializeSchemaObjects() {
   await ensureIntegrationChecksTable();
   await ensureIntegrationTokensTable();
   await ensureSandboxSignoffsTable();
+  await ensureSandboxAcceptanceTables();
   await ensureSyncCursorsTable();
   await ensureUniqueIndex(
     'fiscal_documents',
@@ -217,6 +218,48 @@ async function ensureSandboxSignoffsTable() {
     t.foreign('takk_document_id').references('fiscal_documents.id').onDelete('RESTRICT');
   });
   console.log('✅ Δημιουργήθηκε πίνακας: sandbox_signoffs');
+}
+
+async function ensureSandboxAcceptanceTables() {
+  if (!await db.schema.hasTable('sandbox_acceptance_runs')) {
+    await db.schema.createTable('sandbox_acceptance_runs', (t) => {
+      t.increments('id').primary();
+      t.integer('company_id').unsigned().notNullable();
+      t.string('issuer_vat', 9).notNullable();
+      t.string('credential_binding_sha256', 64).notNullable();
+      t.string('contract_version', 80).notNullable();
+      t.string('approved_by', 200).notNullable();
+      t.text('approval_notes').nullable();
+      t.timestamp('approved_at').notNullable().defaultTo(db.fn.now());
+      t.timestamps(true, true);
+      t.foreign('company_id').references('companies.id').onDelete('RESTRICT');
+    });
+    console.log('✅ Δημιουργήθηκε πίνακας: sandbox_acceptance_runs');
+  }
+
+  if (!await db.schema.hasTable('sandbox_acceptance_artifacts')) {
+    await db.schema.createTable('sandbox_acceptance_artifacts', (t) => {
+      t.increments('id').primary();
+      t.integer('run_id').unsigned().notNullable();
+      t.string('capability', 40).notNullable();
+      t.integer('document_id').unsigned().notNullable();
+      t.integer('paired_document_id').unsigned().nullable();
+      t.integer('related_document_id').unsigned().nullable();
+      t.string('document_type', 10).notNullable();
+      t.string('reservation_id', 120).notNullable();
+      t.string('invoice_mark', 30).notNullable();
+      t.string('paired_mark', 30).nullable();
+      t.string('cancellation_mark', 30).nullable();
+      t.text('evidence_json').notNullable();
+      t.timestamps(true, true);
+      t.unique(['run_id', 'capability']);
+      t.foreign('run_id').references('sandbox_acceptance_runs.id').onDelete('RESTRICT');
+      t.foreign('document_id').references('fiscal_documents.id').onDelete('RESTRICT');
+      t.foreign('paired_document_id').references('fiscal_documents.id').onDelete('RESTRICT');
+      t.foreign('related_document_id').references('fiscal_documents.id').onDelete('RESTRICT');
+    });
+    console.log('✅ Δημιουργήθηκε πίνακας: sandbox_acceptance_artifacts');
+  }
 }
 
 async function ensureIntegrationChecksTable() {

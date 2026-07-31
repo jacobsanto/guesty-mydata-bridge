@@ -2,6 +2,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const crypto = require('node:crypto');
 const path = require('node:path');
 const { promisify } = require('node:util');
 const { execFile } = require('node:child_process');
@@ -17,8 +18,11 @@ if (process.env.POSTGRES_INTEGRATION_TEST !== 'true') {
   const execFileAsync = promisify(execFile);
   const projectRoot = path.resolve(__dirname, '..');
   const { db, initSchema } = require('../src/database');
-  const { createDocumentOnce, claimDocument, markDocumentSent } = require('../src/repositories/fiscal-documents');
-  const { upsertReservationSnapshot } = require('../src/repositories/reservation-snapshots');
+  const {
+    createDocumentOnce, claimDocument, markDocumentSent, markDocumentCancelled,
+    resolveDefinitiveCancellationFailure, listCancellationResolutionEvents,
+  } = require('../src/repositories/fiscal-documents');
+  const { upsertReservationSnapshot, reopenSnapshotForReissue } = require('../src/repositories/reservation-snapshots');
   const { prepareReservationDocuments } = require('../src/services/document-service');
   const { beginRun, heartbeatRun, recordRunItem, recordVerificationResult, finishRun } = require('../src/repositories/daily-close');
 
@@ -225,6 +229,90 @@ if (process.env.POSTGRES_INTEGRATION_TEST !== 'true') {
     assert.equal(unchanged.mydata_mark, 'PG-MARK-MONOTONIC');
     await assert.rejects(
       markDocumentSent(document.id, { mark: 'PG-CONFLICTING-MARK' }, { attemptToken }),
+      (error) => error.status === 409,
+    );
+  });
+
+  test('cancellation resolution is PG-race-safe, environment-bound, audited and monotonic', async () => {
+    const document = await insertFiscalDocument({ key: 'pg-cancel-resolution', series: 'PG-CANCEL-RESOLVE', aa: 1 });
+    await db('fiscal_documents').where({ id: document.id }).update({
+      status: 'sent', mydata_mark: '400000000000901', mydata_environment: 'sandbox',
+      verification_status: 'verified', cancellation_status: 'failed',
+      cancellation_retryable: false, cancellation_uncertain: false,
+      cancellation_error: 'explicit AADE rejection', cancellation_attempt_at: db.fn.now(),
+    });
+    const failed = await db('fiscal_documents').where({ id: document.id }).first();
+    const expectedUpdatedAt = failed.updated_at instanceof Date
+      ? failed.updated_at.toISOString() : new Date(failed.updated_at).toISOString();
+    const input = {
+      documentId: document.id, decision: 'authorize_retry', reason: 'Accountant authorized one corrected retry',
+      resolvedBy: 'PG Accountant', expectedUpdatedAt, idempotencyKey: 'pg-resolution-same-key-001',
+      adminKeyFingerprint: 'b'.repeat(64), expectedEnvironment: 'sandbox',
+    };
+    input.payloadHash = crypto.createHash('sha256').update(JSON.stringify({
+      documentId: Number(input.documentId), decision: input.decision, reason: input.reason,
+      resolvedBy: input.resolvedBy, expectedUpdatedAt: input.expectedUpdatedAt,
+    })).digest('hex');
+    const concurrent = await Promise.all(Array.from({ length: 8 }, () => resolveDefinitiveCancellationFailure(input)));
+    assert.equal(concurrent.filter((row) => !row.idempotent).length, 1);
+    assert(concurrent.slice(1).some((row) => row.idempotent));
+    assert.equal((await listCancellationResolutionEvents(document.id)).length, 1);
+
+    const foundDocument = await insertFiscalDocument({ key: 'pg-cancel-found', series: 'PG-CANCEL-FOUND', aa: 1 });
+    await db('fiscal_documents').where({ id: foundDocument.id }).update({
+      status: 'sent', mydata_mark: '400000000000902', mydata_environment: 'sandbox',
+      verification_status: 'verified', cancellation_status: 'failed', cancellation_retryable: false,
+      cancellation_uncertain: false, cancellation_error: 'explicit AADE rejection',
+    });
+    const foundFailed = await db('fiscal_documents').where({ id: foundDocument.id }).first();
+    const foundExpected = foundFailed.updated_at instanceof Date
+      ? foundFailed.updated_at.toISOString() : new Date(foundFailed.updated_at).toISOString();
+    const foundInput = {
+      documentId: foundDocument.id, decision: 'retain_active', reason: 'Fresh AADE check found cancellation',
+      resolvedBy: 'PG Accountant', expectedUpdatedAt: foundExpected, idempotencyKey: 'pg-resolution-found-001',
+      adminKeyFingerprint: 'b'.repeat(64), expectedEnvironment: 'sandbox',
+      foundCancellation: {
+        invoiceMark: '400000000000902', cancellationMark: '900000000000902', raw: { verified: true },
+      },
+    };
+    foundInput.payloadHash = crypto.createHash('sha256').update(JSON.stringify({
+      documentId: Number(foundInput.documentId), decision: foundInput.decision, reason: foundInput.reason,
+      resolvedBy: foundInput.resolvedBy, expectedUpdatedAt: foundInput.expectedUpdatedAt,
+    })).digest('hex');
+    const found = await resolveDefinitiveCancellationFailure(foundInput);
+    const foundReplay = await resolveDefinitiveCancellationFailure(foundInput);
+    assert(found.reconciled && found.document.status === 'cancelled'
+      && found.document.cancellation_verification_status === 'verified');
+    assert(foundReplay.idempotent && foundReplay.reconciled);
+    assert.equal((await listCancellationResolutionEvents(foundDocument.id))[0].decision, 'reconciled_cancelled');
+    await upsertReservationSnapshot(reservation('pg-cancel-found'), billingContext());
+    await db('reservation_snapshots').where({ reservation_id: 'pg-cancel-found' }).update({
+      materialized_at: db.fn.now(), requires_review: true,
+    });
+    await db('fiscal_documents').where({ id: foundDocument.id }).update({ cancellation_verification_status: 'pending' });
+    await assert.rejects(
+      reopenSnapshotForReissue('pg-cancel-found', 'Corrected reservation after cancellation'),
+      (error) => error.status === 409,
+    );
+    await db('fiscal_documents').where({ id: foundDocument.id }).update({ cancellation_verification_status: 'verified' });
+    const reopened = await reopenSnapshotForReissue('pg-cancel-found', 'Corrected reservation after verified cancellation');
+    assert.equal(Number(reopened.fiscal_revision), 1);
+
+    const lateDocument = await insertFiscalDocument({ key: 'pg-cancel-late-verify', series: 'PG-CANCEL-LATE', aa: 1 });
+    await db('fiscal_documents').where({ id: lateDocument.id }).update({
+      status: 'sent', mydata_mark: '400000000000903', mydata_environment: 'sandbox',
+      cancellation_status: 'transmitting', cancellation_token: 'pg-cancel-token',
+    });
+    await markDocumentCancelled(lateDocument.id, '900000000000903', {
+      attemptToken: 'pg-cancel-token', response: { statusCode: 'Success' }, expectedEnvironment: 'sandbox',
+    });
+    const merged = await markDocumentCancelled(lateDocument.id, '900000000000903', {
+      reconciled: true, verificationResponse: { verified: true }, expectedEnvironment: 'sandbox',
+    });
+    assert.equal(merged.cancellation_verification_status, 'verified');
+
+    await assert.rejects(
+      resolveDefinitiveCancellationFailure({ ...input, idempotencyKey: 'pg-resolution-wrong-env', expectedEnvironment: 'production' }),
       (error) => error.status === 409,
     );
   });

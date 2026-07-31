@@ -14,6 +14,7 @@ const connectionsRoutes = require('./routes/connections');
 const reservationsRoutes = require('./routes/reservations');
 const financialProfilesRoutes = require('./routes/financial-profiles');
 const sandboxSignoffsRoutes = require('./routes/sandbox-signoffs');
+const sandboxAcceptanceRoutes = require('./routes/sandbox-acceptance');
 const { adminAuth } = require('./middleware/admin-auth');
 const { startDailyCloseScheduler } = require('./services/daily-close-scheduler');
 const { validateRuntimeConfig } = require('./config/runtime');
@@ -97,6 +98,7 @@ app.use('/api', adminAuth, connectionsRoutes);
 app.use('/api', adminAuth, reservationsRoutes);
 app.use('/api', adminAuth, financialProfilesRoutes);
 app.use('/api', adminAuth, sandboxSignoffsRoutes);
+app.use('/api', adminAuth, sandboxAcceptanceRoutes);
 
 // -------------------------------------------------------------------
 // Global error handler

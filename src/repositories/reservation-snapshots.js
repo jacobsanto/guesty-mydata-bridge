@@ -243,8 +243,9 @@ async function reopenSnapshotForReissue(reservationId, resolution) {
       const error = new Error('A cancelled reservation cannot be reissued'); error.status = 409; throw error;
     }
     const documents = await trx('fiscal_documents').where({ reservation_id: reservationId });
-    if (!documents.length || documents.some((document) => document.status !== 'cancelled')) {
-      const error = new Error('All previous reservation documents must be cancelled before reissue'); error.status = 409; throw error;
+    if (!documents.length || documents.some((document) => document.status !== 'cancelled'
+        || (document.mydata_mark && (document.cancellation_verification_status !== 'verified' || !document.cancellation_mark)))) {
+      const error = new Error('All previous reservation documents must have verified myDATA cancellation before reissue'); error.status = 409; throw error;
     }
     const revision = Number(snapshot.fiscal_revision || 0) + 1;
     const reservation = JSON.parse(snapshot.normalized_payload);
@@ -275,8 +276,9 @@ async function resolveCancelledSnapshot(reservationId, resolution) {
       const error = new Error('Reservation is not a cancelled review candidate'); error.status = 409; throw error;
     }
     const documents = await trx('fiscal_documents').where({ reservation_id: reservationId });
-    if (documents.some((document) => document.status !== 'cancelled')) {
-      const error = new Error('All reservation documents must be cancelled before resolving the review'); error.status = 409; throw error;
+    if (documents.some((document) => document.status !== 'cancelled'
+        || (document.mydata_mark && (document.cancellation_verification_status !== 'verified' || !document.cancellation_mark)))) {
+      const error = new Error('All reservation documents must have verified myDATA cancellation before resolving the review'); error.status = 409; throw error;
     }
     await trx('reservation_snapshots').where({ id: snapshot.id }).update({
       requires_review: false,

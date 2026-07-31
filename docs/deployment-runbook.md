@@ -103,9 +103,11 @@ Before production activation, all of the following must be recorded:
 1. Successful Guesty authenticated connection check within the last 24 hours.
 2. Successful AADE sandbox connection check for every active company within the
    last 24 hours.
-3. One real, accountant-reviewed sandbox reservation with APY or TPY plus its
-   separate TAKK, including request XML, AADE response, MARK, UID, verification,
-   and the final PDFs.
+3. Accountant-reviewed sandbox capability evidence for every document family
+   actually used by the company: `2.1+8.2` and `5.1`, and/or `11.2+8.2` and
+   `11.4`, plus one `CancelInvoice` whose cancellation MARK was independently
+   confirmed through `RequestTransmittedDocs`. Evidence includes request XML,
+   AADE responses, MARK/UID where returned, verification, and final PDFs.
 4. Every active listing mapped to the correct company, document rule, series,
    counterpart where TPY is used, and high/low TAKK amount and category.
 5. Every observed active `listing/platform/source` covered by an approved,
@@ -118,8 +120,9 @@ Before production activation, all of the following must be recorded:
 Take a fresh database backup first. Then, in one maintenance window:
 
 1. Stop incoming Guesty deliveries or record the start time for replay checks.
-2. Record the accountant-approved sandbox sign-off pair in Admin: the verified
-   primary ΑΠΥ/ΤΠΥ document ID, its verified ΤΑΚΚ document ID, approver and notes.
+2. Confirm that Admin shows no missing sandbox capability for any company. Each
+   acceptance run is bound to the issuer VAT, current encrypted AADE credentials,
+   and fiscal contract version; credential rotation requires new evidence.
 3. Set `MYDATA_ENV=production`.
 4. Set `MYDATA_PRODUCTION_ENABLED=true` only after both previous values have
    been independently reviewed.
