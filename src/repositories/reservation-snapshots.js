@@ -59,7 +59,7 @@ function applySnapshotOverride(reservation, snapshot) {
           vatNumber: snapshot.counterpart_vat_override,
           country: snapshot.counterpart_country_override,
           name: snapshot.counterpart_name_override || null,
-          branch: 0,
+          branch: snapshot.counterpart_branch_override ?? 0,
         }
       : undefined,
   };
@@ -163,7 +163,7 @@ async function listReservationSnapshots(filters = {}) {
     'financial_status', 'financial_profile_id', 'financial_profile_version',
     'financial_profile_hash', 'financial_error',
     'invoice_type_override', 'invoice_series_override', 'counterpart_vat_override',
-    'counterpart_country_override', 'counterpart_name_override',
+    'counterpart_country_override', 'counterpart_name_override', 'counterpart_branch_override',
     'fiscal_revision', 'review_resolution', 'reviewed_at', 'generation',
     'requires_review', 'last_error', 'created_at', 'updated_at'
   ).orderBy('updated_at', 'desc');
@@ -192,6 +192,7 @@ async function setFiscalOverride(reservationId, override) {
     counterpart_vat_override: override.invoiceCounterpart?.vatNumber || null,
     counterpart_country_override: override.invoiceCounterpart?.country || null,
     counterpart_name_override: override.invoiceCounterpart?.name || null,
+    counterpart_branch_override: override.invoiceCounterpart?.branch ?? 0,
     normalized_payload: JSON.stringify(reservation),
     payload_hash: fiscalHash(reservation),
     requires_review: false,
@@ -220,6 +221,7 @@ async function clearFiscalOverride(reservationId) {
     counterpart_vat_override: null,
     counterpart_country_override: null,
     counterpart_name_override: null,
+    counterpart_branch_override: null,
     normalized_payload: JSON.stringify(reservation),
     payload_hash: fiscalHash(reservation),
     updated_at: db.fn.now(),

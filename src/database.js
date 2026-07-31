@@ -107,6 +107,7 @@ async function initializeSchemaObjects() {
   await ensureLegacyTenantsTable();
   await ensureInvoicesTable();
   await ensureFiscalDocumentsTable();
+  await ensureCancellationResolutionEventsTable();
   await ensureDocumentSequencesTable();
   await ensureDailyCloseTables();
   await ensureIntegrationChecksTable();
@@ -146,6 +147,32 @@ async function ensureSyncCursorsTable() {
     t.primary(['provider', 'cursor_key']);
   });
   console.log('✅ Δημιουργήθηκε πίνακας: sync_cursors');
+}
+
+async function ensureCancellationResolutionEventsTable() {
+  if (await db.schema.hasTable('cancellation_resolution_events')) return;
+  await db.schema.createTable('cancellation_resolution_events', (t) => {
+    t.increments('id').primary();
+    t.string('idempotency_key', 100).notNullable().unique();
+    t.integer('document_id').unsigned().notNullable();
+    t.integer('company_id').unsigned().notNullable();
+    t.string('decision', 30).notNullable();
+    t.string('from_status', 20).notNullable();
+    t.string('to_status', 20).notNullable();
+    t.string('invoice_mark', 30).notNullable();
+    t.text('prior_cancellation_error').nullable();
+    t.boolean('prior_retryable').notNullable();
+    t.boolean('prior_uncertain').notNullable();
+    t.timestamp('prior_attempt_at').nullable();
+    t.text('reason').notNullable();
+    t.string('resolved_by', 200).notNullable();
+    t.string('admin_key_fingerprint', 64).notNullable();
+    t.string('payload_hash', 64).notNullable();
+    t.timestamp('created_at').notNullable().defaultTo(db.fn.now());
+    t.foreign('document_id').references('fiscal_documents.id').onDelete('RESTRICT');
+    t.foreign('company_id').references('companies.id').onDelete('RESTRICT');
+  });
+  console.log('✅ Δημιουργήθηκε πίνακας: cancellation_resolution_events');
 }
 
 async function ensureSandboxSignoffsTable() {
@@ -225,6 +252,7 @@ async function ensureReservationSnapshotsTable() {
     await ensureColumn('reservation_snapshots', 'counterpart_vat_override', (t) => t.string('counterpart_vat_override', 30).nullable());
     await ensureColumn('reservation_snapshots', 'counterpart_country_override', (t) => t.string('counterpart_country_override', 2).nullable());
     await ensureColumn('reservation_snapshots', 'counterpart_name_override', (t) => t.string('counterpart_name_override', 200).nullable());
+    await ensureColumn('reservation_snapshots', 'counterpart_branch_override', (t) => t.integer('counterpart_branch_override').nullable());
     await ensureColumn('reservation_snapshots', 'fiscal_revision', (t) => t.integer('fiscal_revision').notNullable().defaultTo(0));
     await ensureColumn('reservation_snapshots', 'review_resolution', (t) => t.text('review_resolution').nullable());
     await ensureColumn('reservation_snapshots', 'reviewed_at', (t) => t.timestamp('reviewed_at').nullable());
@@ -256,6 +284,7 @@ async function ensureReservationSnapshotsTable() {
     t.string('counterpart_vat_override', 30).nullable();
     t.string('counterpart_country_override', 2).nullable();
     t.string('counterpart_name_override', 200).nullable();
+    t.integer('counterpart_branch_override').nullable();
     t.integer('fiscal_revision').notNullable().defaultTo(0);
     t.text('review_resolution').nullable();
     t.timestamp('reviewed_at').nullable();
@@ -328,6 +357,7 @@ async function ensureFinancialProfilesTables() {
 async function ensureListingBillingRulesTable() {
   if (await db.schema.hasTable('listing_billing_rules')) {
     await ensureColumn('listing_billing_rules', 'series', (t) => t.string('series', 50).nullable());
+    await ensureColumn('listing_billing_rules', 'counterpart_branch', (t) => t.integer('counterpart_branch').notNullable().defaultTo(0));
     return;
   }
   await db.schema.createTable('listing_billing_rules', (t) => {
@@ -339,6 +369,7 @@ async function ensureListingBillingRulesTable() {
     t.string('counterpart_vat_number', 30).nullable();
     t.string('counterpart_country', 2).nullable();
     t.string('counterpart_name', 200).nullable();
+    t.integer('counterpart_branch').notNullable().defaultTo(0);
     t.boolean('active').notNullable().defaultTo(true);
     t.timestamps(true, true);
     t.unique(['listing_id', 'guesty_source']);
@@ -348,7 +379,10 @@ async function ensureListingBillingRulesTable() {
 }
 
 async function ensureListingChannelBillingRulesTable() {
-  if (await db.schema.hasTable('listing_channel_billing_rules')) return;
+  if (await db.schema.hasTable('listing_channel_billing_rules')) {
+    await ensureColumn('listing_channel_billing_rules', 'counterpart_branch', (t) => t.integer('counterpart_branch').notNullable().defaultTo(0));
+    return;
+  }
   await db.schema.createTable('listing_channel_billing_rules', (t) => {
     t.increments('id').primary();
     t.integer('listing_id').unsigned().notNullable();
@@ -359,6 +393,7 @@ async function ensureListingChannelBillingRulesTable() {
     t.string('counterpart_vat_number', 30).nullable();
     t.string('counterpart_country', 2).nullable();
     t.string('counterpart_name', 200).nullable();
+    t.integer('counterpart_branch').notNullable().defaultTo(0);
     t.boolean('active').notNullable().defaultTo(true);
     t.timestamps(true, true);
     t.unique(['listing_id', 'guesty_platform', 'guesty_source']);
@@ -411,6 +446,7 @@ async function ensureListingsTable() {
       t.string('invoice_counterpart_vat_number', 30).nullable();
       t.string('invoice_counterpart_country', 2).nullable();
       t.string('invoice_counterpart_name', 200).nullable();
+      t.integer('invoice_counterpart_branch').notNullable().defaultTo(0);
       t.decimal('climate_fee_high', 10, 2).nullable();
       t.decimal('climate_fee_low', 10, 2).nullable();
       t.integer('climate_fee_high_category').nullable();
@@ -430,6 +466,7 @@ async function ensureListingsTable() {
   await ensureColumn('listings', 'invoice_counterpart_vat_number', (t) => t.string('invoice_counterpart_vat_number', 30).nullable());
   await ensureColumn('listings', 'invoice_counterpart_country', (t) => t.string('invoice_counterpart_country', 2).nullable());
   await ensureColumn('listings', 'invoice_counterpart_name', (t) => t.string('invoice_counterpart_name', 200).nullable());
+  await ensureColumn('listings', 'invoice_counterpart_branch', (t) => t.integer('invoice_counterpart_branch').notNullable().defaultTo(0));
   await ensureColumn('listings', 'climate_fee_high', (t) => t.decimal('climate_fee_high', 10, 2).nullable());
   await ensureColumn('listings', 'climate_fee_low', (t) => t.decimal('climate_fee_low', 10, 2).nullable());
   await ensureColumn('listings', 'climate_fee_high_category', (t) => t.integer('climate_fee_high_category').nullable());
@@ -508,8 +545,16 @@ async function ensureFiscalDocumentsTable() {
     await ensureColumn('fiscal_documents', 'transmission_uncertain', (t) => t.boolean('transmission_uncertain').notNullable().defaultTo(false));
     await ensureColumn('fiscal_documents', 'transmission_token', (t) => t.string('transmission_token', 64).nullable());
     await ensureColumn('fiscal_documents', 'mydata_environment', (t) => t.string('mydata_environment', 20).nullable());
+    // Legacy NULL rows are deliberately not inferred as production. They must
+    // be cancelled or explicitly rematerialized by an operator.
+    await ensureColumn('fiscal_documents', 'target_environment', (t) => t.string('target_environment', 20).nullable());
     await ensureColumn('fiscal_documents', 'cancellation_retryable', (t) => t.boolean('cancellation_retryable').notNullable().defaultTo(true));
     await ensureColumn('fiscal_documents', 'cancellation_uncertain', (t) => t.boolean('cancellation_uncertain').notNullable().defaultTo(false));
+    await ensureColumn('fiscal_documents', 'cancellation_token', (t) => t.string('cancellation_token', 64).nullable());
+    await ensureColumn('fiscal_documents', 'cancellation_response', (t) => t.text('cancellation_response').nullable());
+    await ensureColumn('fiscal_documents', 'cancellation_verification_response', (t) => t.text('cancellation_verification_response').nullable());
+    await ensureColumn('fiscal_documents', 'cancellation_verification_status', (t) => t.string('cancellation_verification_status', 20).notNullable().defaultTo('pending'));
+    await ensureColumn('fiscal_documents', 'cancellation_verified_at', (t) => t.timestamp('cancellation_verified_at').nullable());
     return;
   }
 
@@ -543,11 +588,17 @@ async function ensureFiscalDocumentsTable() {
     t.timestamp('cancellation_attempt_at').nullable();
     t.boolean('cancellation_retryable').notNullable().defaultTo(true);
     t.boolean('cancellation_uncertain').notNullable().defaultTo(false);
+    t.string('cancellation_token', 64).nullable();
+    t.text('cancellation_response').nullable();
+    t.text('cancellation_verification_response').nullable();
+    t.string('cancellation_verification_status', 20).notNullable().defaultTo('pending');
+    t.timestamp('cancellation_verified_at').nullable();
     t.string('verification_status', 20).notNullable().defaultTo('pending');
     t.timestamp('verified_at').nullable();
     t.text('verification_error').nullable();
     t.text('mydata_response').nullable();
     t.string('mydata_environment', 20).nullable();
+    t.string('target_environment', 20).notNullable();
     t.text('error_message').nullable();
     t.integer('attempt_count').notNullable().defaultTo(0);
     t.boolean('retryable').notNullable().defaultTo(true);

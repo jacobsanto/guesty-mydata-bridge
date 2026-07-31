@@ -249,7 +249,9 @@ async function verifyCancelledInvoice(mark, companyContext) {
   const value = parsed?.RequestedDoc?.cancelledInvoicesDoc?.cancelledInvoice;
   const rows = value ? (Array.isArray(value) ? value : [value]) : [];
   const cancellation = rows.find((row) => String(row.invoiceMark) === String(mark));
-  if (!cancellation?.cancellationMark) throw new Error(`Δεν βρέθηκε ακύρωση για το MARK ${mark}`);
+  if (!cancellation?.cancellationMark) {
+    return { verified: false, notFound: true, invoiceMark: String(mark), raw: rows };
+  }
   return {
     verified: true,
     invoiceMark: String(mark),

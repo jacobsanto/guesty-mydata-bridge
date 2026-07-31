@@ -7,7 +7,10 @@ function adminAuth(req, res, next) {
   if (!configuredToken) {
     const explicitlyInsecureDevelopment = process.env.NODE_ENV !== 'production'
       && process.env.ALLOW_INSECURE_DEV === 'true';
-    if (explicitlyInsecureDevelopment) return next();
+    if (explicitlyInsecureDevelopment) {
+      req.adminKeyFingerprint = crypto.createHash('sha256').update('explicit-insecure-development').digest('hex');
+      return next();
+    }
     return res.status(503).json({ error: 'Admin API is not configured' });
   }
 
@@ -19,6 +22,7 @@ function adminAuth(req, res, next) {
   if (actual.length !== expected.length || !crypto.timingSafeEqual(actual, expected)) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
+  req.adminKeyFingerprint = crypto.createHash('sha256').update(configuredToken).digest('hex');
   return next();
 }
 

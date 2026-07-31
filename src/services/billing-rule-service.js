@@ -17,6 +17,7 @@ function normalize(payload) {
     vatNumber: payload.counterpart_vat_number,
     country: payload.counterpart_country,
     name: payload.counterpart_name,
+    branch: payload.counterpart_branch,
   }, { required: invoiceType === '2.1', label: 'counterpart' });
   const result = {
     guesty_platform: platform,
@@ -26,6 +27,7 @@ function normalize(payload) {
     counterpart_vat_number: counterpart.vatNumber,
     counterpart_country: counterpart.country,
     counterpart_name: counterpart.name,
+    counterpart_branch: counterpart.branch,
     active: payload.active === undefined ? true : Boolean(payload.active),
   };
   return result;

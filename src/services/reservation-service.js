@@ -33,8 +33,8 @@ async function applyFiscalOverride(reservationId, payload) {
         vatNumber: payload.counterpart_vat_number,
         country: payload.counterpart_country,
         name: payload.counterpart_name,
+        branch: payload.counterpart_branch,
       }, { required: true, label: 'counterpart' }),
-      branch: 0,
     };
   }
   const snapshot = await setFiscalOverride(String(reservationId), { invoiceType, invoiceSeries, invoiceCounterpart });

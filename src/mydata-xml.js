@@ -66,7 +66,7 @@ function generateMyDataXML(reservation, billingContext, invoiceAA) {
           vatNumber: billingContext.invoice_counterpart_vat_number,
           country: billingContext.invoice_counterpart_country,
           name: billingContext.invoice_counterpart_name,
-          branch: 0,
+          branch: billingContext.invoice_counterpart_branch,
         }
       : null
   );
@@ -106,7 +106,7 @@ function generateMyDataXML(reservation, billingContext, invoiceAA) {
     const counterpartNode = invoice.ele('counterpart')
       .ele('vatNumber').txt(normalizedCounterpart.vatNumber).up()
       .ele('country').txt(normalizedCounterpart.country).up()
-      .ele('branch').txt(String(counterpart.branch ?? 0)).up();
+      .ele('branch').txt(String(normalizedCounterpart.branch)).up();
     if (normalizedCounterpart.name) counterpartNode.ele('name').txt(normalizedCounterpart.name).up();
     counterpartNode.up();
   }
@@ -288,11 +288,12 @@ function generateCreditXML(credit, billingContext, invoiceAA) {
       vatNumber: billingContext.invoice_counterpart_vat_number,
       country: billingContext.invoice_counterpart_country,
       name: billingContext.invoice_counterpart_name,
+      branch: billingContext.invoice_counterpart_branch,
     }, { required: true, label: 'invoice_counterpart' });
     invoice.ele('counterpart')
       .ele('vatNumber').txt(counterpart.vatNumber).up()
       .ele('country').txt(counterpart.country).up()
-      .ele('branch').txt('0').up()
+      .ele('branch').txt(String(counterpart.branch)).up()
       .ele('name').txt(counterpart.name || '').up()
     .up();
   }

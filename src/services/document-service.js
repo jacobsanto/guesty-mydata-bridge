@@ -66,6 +66,7 @@ async function prepareReservationDocuments(reservation, billingContext, options 
     invoice_counterpart_vat_number: sourceRule.counterpart_vat_number,
     invoice_counterpart_country: sourceRule.counterpart_country,
     invoice_counterpart_name: sourceRule.counterpart_name,
+    invoice_counterpart_branch: sourceRule.counterpart_branch,
   } : billingContext;
   if (reservation.invoiceCounterpart) {
     effectiveContext = {
@@ -73,6 +74,7 @@ async function prepareReservationDocuments(reservation, billingContext, options 
       invoice_counterpart_vat_number: reservation.invoiceCounterpart.vatNumber,
       invoice_counterpart_country: reservation.invoiceCounterpart.country,
       invoice_counterpart_name: reservation.invoiceCounterpart.name,
+      invoice_counterpart_branch: reservation.invoiceCounterpart.branch,
     };
   }
   effectiveContext = { ...effectiveContext, vat_number: normalizeAndValidateGreekVat(effectiveContext.vat_number) };
@@ -80,12 +82,14 @@ async function prepareReservationDocuments(reservation, billingContext, options 
     vatNumber: effectiveContext.invoice_counterpart_vat_number,
     country: effectiveContext.invoice_counterpart_country,
     name: effectiveContext.invoice_counterpart_name,
+    branch: effectiveContext.invoice_counterpart_branch,
   }, { required: invoiceType === '2.1', label: 'invoice_counterpart' });
   effectiveContext = {
     ...effectiveContext,
     invoice_counterpart_vat_number: counterpart.vatNumber,
     invoice_counterpart_country: counterpart.country,
     invoice_counterpart_name: counterpart.name,
+    invoice_counterpart_branch: counterpart.branch,
   };
   const series = normalizeSeries(reservation.invoiceSeries || sourceRule?.series || billingContext.invoice_series || 'A', { required: true });
   const sourcePayload = {
@@ -96,6 +100,7 @@ async function prepareReservationDocuments(reservation, billingContext, options 
       invoice_counterpart_vat_number: effectiveContext.invoice_counterpart_vat_number || null,
       invoice_counterpart_country: effectiveContext.invoice_counterpart_country || null,
       invoice_counterpart_name: effectiveContext.invoice_counterpart_name || null,
+      invoice_counterpart_branch: effectiveContext.invoice_counterpart_branch ?? 0,
       payment_method_type: effectiveContext.payment_method_type || 1,
       payment_method_info: effectiveContext.payment_method_info || null,
     },

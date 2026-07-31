@@ -62,7 +62,12 @@ function addPage(doc, data) {
   drawRule(doc, 123);
 
   const recipient = data.recipient || {};
-  drawText(doc, [recipient.name, recipient.vat, recipient.address, recipient.city, recipient.country].filter(Boolean).join('\n'), PAGE.margin, 145, { size: 10, width: 225 });
+  drawText(doc, [
+    recipient.name,
+    recipient.vat,
+    recipient.branch !== undefined && recipient.branch !== null ? `Υποκατάστημα: ${recipient.branch}` : null,
+    recipient.address, recipient.city, recipient.country,
+  ].filter(Boolean).join('\n'), PAGE.margin, 145, { size: 10, width: 225 });
   const stay = data.stay || {};
   drawText(doc, ['Guest', 'Room', 'Check-In', 'Check-Out', 'Board'].join('\n'), 320, 145, { size: 10, bold: true, width: 72 });
   drawText(doc, [stay.guest, stay.room, stay.checkIn, stay.checkOut, stay.board].map((value) => `: ${value || '-'}`).join('\n'), 395, 145, { size: 10, width: 150 });

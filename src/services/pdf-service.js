@@ -67,6 +67,7 @@ async function buildFiscalDocumentPdfData(documentId) {
         name: billingSnapshot.invoice_counterpart_name || listing.invoice_counterpart_name,
         vat: billingSnapshot.invoice_counterpart_vat_number || listing.invoice_counterpart_vat_number,
         country: billingSnapshot.invoice_counterpart_country || listing.invoice_counterpart_country,
+        branch: billingSnapshot.invoice_counterpart_branch ?? listing.invoice_counterpart_branch ?? 0,
       }
     : { name: guest.fullName || guest.name || [guest.firstName, guest.lastName].filter(Boolean).join(' ') || 'Ιδιώτης πελάτης' };
   return {

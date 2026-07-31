@@ -14,7 +14,7 @@ function validationError(check) {
 }
 
 async function getReadiness() {
-  const [companies, listings, rules, legacyRuleCountRow, financialProfiles, observedChannels, reviewCountRow, uncertainCountRow, cancellationUncertainCountRow, checks, sandboxSignoffs] = await Promise.all([
+  const [companies, listings, rules, legacyRuleCountRow, financialProfiles, observedChannels, reviewCountRow, uncertainCountRow, cancellationUncertainCountRow, environmentMismatchRows, checks, sandboxSignoffs] = await Promise.all([
     db('companies').where({ active: true }).select('*'),
     db('listings').where({ active: true }).select('*'),
     db('listing_channel_billing_rules').where({ active: true }).select('*'),
@@ -28,6 +28,11 @@ async function getReadiness() {
     db('reservation_snapshots').where({ requires_review: true }).count({ count: '*' }).first(),
     db('fiscal_documents').where({ transmission_uncertain: true }).count({ count: '*' }).first(),
     db('fiscal_documents').where({ cancellation_uncertain: true }).count({ count: '*' }).first(),
+    db('fiscal_documents')
+      .whereIn('status', ['pending', 'failed', 'transmitting'])
+      .where((query) => query.whereNull('target_environment').orWhereNot({ target_environment: 'production' }))
+      .select('company_id', 'target_environment')
+      .groupBy('company_id', 'target_environment'),
     listIntegrationChecks(),
     db('sandbox_signoffs').select('company_id', 'reservation_id', 'issuer_vat', 'credential_binding_sha256', 'primary_mark', 'takk_mark', 'approved_by', 'approved_at'),
   ]);
@@ -77,6 +82,7 @@ async function getReadiness() {
       vatNumber: listing.invoice_counterpart_vat_number,
       country: listing.invoice_counterpart_country,
       name: listing.invoice_counterpart_name,
+      branch: listing.invoice_counterpart_branch,
     }, { required: listing.default_invoice_type === '2.1', label: 'invoice_counterpart' }));
     if (counterpartError) issues.push(issue('default_tpy_counterpart', `${listing.listing_id_guesty}: ${counterpartError}`, scope));
   }
@@ -89,6 +95,7 @@ async function getReadiness() {
       vatNumber: rule.counterpart_vat_number,
       country: rule.counterpart_country,
       name: rule.counterpart_name,
+      branch: rule.counterpart_branch,
     }, { required: rule.invoice_type === '2.1', label: 'counterpart' }));
     if (counterpartError) issues.push(issue('rule_tpy_counterpart', `Billing rule ${rule.id}: ${counterpartError}`, scope));
   }
@@ -135,6 +142,13 @@ async function getReadiness() {
   // production health check. Production instead requires its own current-env
   // read-only check, while the signed-off sandbox MARK remains durable evidence.
   const productionIssues = issues.filter((item) => item.code !== 'mydata_sandbox_check');
+  for (const row of environmentMismatchRows) {
+    productionIssues.push(issue(
+      'fiscal_target_environment',
+      `Υπάρχουν μη ολοκληρωμένα παραστατικά ${row.target_environment || 'legacy/άγνωστου'} περιβάλλοντος· ακυρώστε τα ή επανεκδώστε τα πριν από production`,
+      `company:${row.company_id}`,
+    ));
+  }
   for (const company of companies) {
     const productionCheck = checks.find((row) => row.check_key === `mydata:${company.id}:production` && row.environment === 'production');
     if (!isFreshSuccess(productionCheck)) {

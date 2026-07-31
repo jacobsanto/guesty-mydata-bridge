@@ -20,7 +20,7 @@ function assertSandboxDocument(document, kind, companyId, reservationId) {
     throw bad('Sign-off documents must belong to the same company and reservation', 409);
   }
   if (document.status !== 'sent' || document.verification_status !== 'verified' || !document.mydata_mark
-      || document.mydata_environment !== 'sandbox') {
+      || document.mydata_environment !== 'sandbox' || document.target_environment !== 'sandbox') {
     throw bad(`${kind} document must be sent and verified in myDATA sandbox`, 409);
   }
   if (![null, undefined, 'none'].includes(document.cancellation_status)) {

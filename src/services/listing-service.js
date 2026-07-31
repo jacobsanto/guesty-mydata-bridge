@@ -68,6 +68,7 @@ function normalizeCreatePayload(payload) {
     vatNumber: payload.invoice_counterpart_vat_number,
     country: payload.invoice_counterpart_country,
     name: payload.invoice_counterpart_name,
+    branch: payload.invoice_counterpart_branch,
   }, { required: defaultInvoiceType === '2.1', label: 'invoice_counterpart' });
   const climateFeeSeries = normalizeSeries(payload.climate_fee_series || 'TAKK', { fieldName: 'climate_fee_series', required: true });
   const paymentMethodInfo = String(payload.payment_method_info || '').trim() || null;
@@ -89,6 +90,7 @@ function normalizeCreatePayload(payload) {
       invoice_counterpart_vat_number: counterpart.vatNumber,
       invoice_counterpart_country: counterpart.country,
       invoice_counterpart_name: counterpart.name,
+      invoice_counterpart_branch: counterpart.branch,
       climate_fee_high: climateFeeHigh,
       climate_fee_low: climateFeeLow,
       climate_fee_high_category: climateCategoryHigh,
@@ -191,6 +193,7 @@ async function handleUpdateListing(id, payload) {
   for (const field of ['invoice_counterpart_vat_number', 'invoice_counterpart_name']) {
     if (field in payload) normalized[field] = String(payload[field] || '').trim() || null;
   }
+  if ('invoice_counterpart_branch' in payload) normalized.invoice_counterpart_branch = payload.invoice_counterpart_branch;
   if ('invoice_counterpart_country' in payload) {
     normalized.invoice_counterpart_country = String(payload.invoice_counterpart_country || '').trim().toUpperCase() || null;
   }
@@ -222,17 +225,19 @@ async function handleUpdateListing(id, payload) {
   if (finalValue.active !== false || climateFieldsChanged) {
     validateAccommodationClimatePair(finalValue.property_type, finalValue.climate_fee_high_category, finalValue.climate_fee_low_category);
   }
-  const counterpartFieldsChanged = ['default_invoice_type', 'invoice_counterpart_vat_number', 'invoice_counterpart_country', 'invoice_counterpart_name']
+  const counterpartFieldsChanged = ['default_invoice_type', 'invoice_counterpart_vat_number', 'invoice_counterpart_country', 'invoice_counterpart_name', 'invoice_counterpart_branch']
     .some((field) => field in payload);
   if (finalValue.active !== false || counterpartFieldsChanged) {
     const counterpart = normalizeCounterpart({
       vatNumber: finalValue.invoice_counterpart_vat_number,
       country: finalValue.invoice_counterpart_country,
       name: finalValue.invoice_counterpart_name,
+      branch: finalValue.invoice_counterpart_branch,
     }, { required: finalValue.default_invoice_type === '2.1', label: 'invoice_counterpart' });
     normalized.invoice_counterpart_vat_number = counterpart.vatNumber;
     normalized.invoice_counterpart_country = counterpart.country;
     normalized.invoice_counterpart_name = counterpart.name;
+    normalized.invoice_counterpart_branch = counterpart.branch;
   }
   return updateListing(listingId, normalized);
 }

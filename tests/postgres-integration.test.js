@@ -49,6 +49,7 @@ if (process.env.POSTGRES_INTEGRATION_TEST !== 'true') {
       other_taxes_amount: 0,
       gross_value: 113,
       status: 'pending',
+      target_environment: 'sandbox',
       retryable,
       xml_payload: `<invoice aa="${aa}"/>`,
       source_payload: '{}',

@@ -15,7 +15,7 @@
 
 ## Production blockers that require a named decision per company
 
-1. **Counterpart mapping:** The Guesty adapter must provide `invoiceCounterpart` (VAT ID, ISO country, branch; e.g. Airbnb Ireland) for every `2.1` invoice. A direct reservation can explicitly use `11.2` instead.
+1. **Counterpart mapping:** The Guesty adapter must provide `invoiceCounterpart` (VAT ID, ISO country, branch; e.g. Airbnb Ireland) for every `2.1` invoice. A direct reservation can explicitly use `11.2` instead. Branch is configured per listing, exact platform/source rule, or reservation override; it is frozen in the original fiscal snapshot and reused unchanged by the correlated `5.1` credit.
 2. **Climate-fee issuance flow:** Each listing owns its high- and low-season TΑΚ rates. The separate `8.2` document must be issued, numbered, cancelled, and reflected in the customer-facing receipt independently from the `2.1`/`11.2` document.
    For this portfolio, short-term-rental categories `25/26/28/29` are explicitly rejected. Rented rooms/apartments use category pair `24/10`; tourist furnished villas use `27/30`. Amounts remain configurable per listing because the category code and the legally effective amount are separate fields in myDATA.
 3. **Guesty money semantics:** The dedicated Guest Folio invoice items are the authoritative source when available. The bridge includes service lines plus `VAT`, excludes Guesty tax normal types such as `CT`/`LT`, and refuses an empty authoritative folio instead of falling back to a broader total. Verify the account's actual normal-type configuration with one real reservation before sign-off.

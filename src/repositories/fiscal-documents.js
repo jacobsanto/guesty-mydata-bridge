@@ -25,8 +25,17 @@ async function nextDocumentNumber(trx, companyId, documentType, series) {
 }
 
 async function insertDocument(trx, { documentKey, companyId, listingId, reservationId, documentKind, documentType, series, issueDate, amounts, sourcePayload, relatedDocumentId = null, correlatedMark = null, buildXml }) {
+  const targetEnvironment = process.env.MYDATA_ENV || 'sandbox';
+  if (!['sandbox', 'production'].includes(targetEnvironment)) throw new Error('MYDATA_ENV must be sandbox or production');
   const existing = await trx('fiscal_documents').where({ document_key: documentKey }).first();
-  if (existing) return { document: existing, created: false };
+  if (existing) {
+    if (existing.target_environment !== targetEnvironment) {
+      const error = new Error(`Fiscal document key already belongs to ${existing.target_environment || 'legacy/unknown'} environment`);
+      error.status = 409;
+      throw error;
+    }
+    return { document: existing, created: false };
+  }
 
   const aa = await nextDocumentNumber(trx, companyId, documentType, series);
   const xmlPayload = buildXml(aa);
@@ -47,6 +56,7 @@ async function insertDocument(trx, { documentKey, companyId, listingId, reservat
     other_taxes_amount: amounts.otherTaxesAmount || 0,
     gross_value: amounts.grossValue || 0,
     status: 'pending',
+    target_environment: targetEnvironment,
     xml_payload: xmlPayload,
     source_payload: JSON.stringify(sourcePayload || {}),
   }).returning('id');
@@ -62,7 +72,13 @@ async function createDocumentOnce(input) {
     const duplicate = error.code === '23505' || String(error.code || '').startsWith('SQLITE_CONSTRAINT');
     if (duplicate && !input.transaction) {
       const existing = await findDocumentByKey(input.documentKey);
-      if (existing) return { document: existing, created: false };
+      if (existing) {
+        const targetEnvironment = process.env.MYDATA_ENV || 'sandbox';
+        if (existing.target_environment !== targetEnvironment) {
+          throw Object.assign(new Error(`Fiscal document key already belongs to ${existing.target_environment || 'legacy/unknown'} environment`), { status: 409 });
+        }
+        return { document: existing, created: false };
+      }
     }
     throw error;
   }
@@ -92,9 +108,10 @@ async function listDocuments(filters = {}) {
       'd.related_document_id', 'd.correlated_mark', 'd.net_value', 'd.vat_amount',
       'd.other_taxes_amount', 'd.gross_value', 'd.status', 'd.mydata_mark',
       'd.mydata_uid', 'd.mydata_qr_url', 'd.cancellation_mark', 'd.cancelled_at',
-      'd.mydata_environment',
+      'd.mydata_environment', 'd.target_environment',
       'd.cancellation_status', 'd.cancellation_error', 'd.cancellation_attempt_at',
       'd.cancellation_retryable', 'd.cancellation_uncertain',
+      'd.cancellation_verification_status', 'd.cancellation_verified_at',
       'd.verification_status', 'd.verified_at', 'd.verification_error',
       'd.error_message', 'd.attempt_count', 'd.retryable', 'd.transmission_uncertain',
       'd.last_attempt_at', 'd.sent_at',
@@ -114,10 +131,12 @@ async function getDocumentById(id) {
 }
 
 async function listTransmittableDocuments(companyId, businessDate, maxAttempts = 5) {
+  const targetEnvironment = process.env.MYDATA_ENV || 'sandbox';
   return db('fiscal_documents as d')
     .where({ 'd.company_id': companyId })
     .whereIn('d.status', ['pending', 'failed'])
     .where({ 'd.retryable': true, 'd.transmission_uncertain': false })
+    .where({ 'd.target_environment': targetEnvironment })
     .where('d.issue_date', '<=', businessDate)
     .where('d.attempt_count', '<', maxAttempts)
     .whereNotExists(db('reservation_snapshots as review')
@@ -133,10 +152,11 @@ async function listTransmittableDocuments(companyId, businessDate, maxAttempts =
 
 async function claimDocument(id) {
   const transmissionToken = crypto.randomUUID();
+  const targetEnvironment = process.env.MYDATA_ENV || 'sandbox';
   const changed = await db('fiscal_documents')
     .where({ id })
     .whereIn('status', ['pending', 'failed'])
-    .where({ retryable: true, transmission_uncertain: false })
+    .where({ retryable: true, transmission_uncertain: false, target_environment: targetEnvironment })
     .whereNotExists(db('reservation_snapshots as review')
       .select(db.raw('1')).whereRaw('review.reservation_id = fiscal_documents.reservation_id').where({ 'review.requires_review': true }))
     .where((eligible) => eligible
@@ -205,6 +225,12 @@ async function markDocumentSent(id, response, { attemptToken = null, reconciled 
     const document = await trx('fiscal_documents').where({ id }).forUpdate().first();
     if (!document) throw new Error('Fiscal document not found');
     const incomingMark = String(response.mark);
+    const currentEnvironment = process.env.MYDATA_ENV || 'sandbox';
+    if (document.target_environment !== currentEnvironment) {
+      const error = new Error('Fiscal document target environment no longer matches runtime');
+      error.status = 409;
+      throw error;
+    }
     const existingMark = document.mydata_mark == null ? null : String(document.mydata_mark);
 
     // An identical late response is useful evidence, but it must never reset a
@@ -241,7 +267,7 @@ async function markDocumentSent(id, response, { attemptToken = null, reconciled 
       mydata_uid: response.uid || null,
       mydata_qr_url: response.qrUrl || null,
       mydata_response: JSON.stringify(response.raw || response),
-      mydata_environment: process.env.MYDATA_ENV || 'sandbox',
+      mydata_environment: currentEnvironment,
       sent_at: trx.fn.now(),
       verification_status: 'pending',
       verification_error: null,
@@ -314,11 +340,12 @@ async function quarantineStaleTransmissions(companyId, staleMinutes = 60) {
 }
 
 async function claimDocumentCancellation(id) {
+  const cancellationToken = crypto.randomUUID();
   return db.transaction(async (trx) => {
     let documentQuery = trx('fiscal_documents').where({ id });
     if (trx.client.config.client === 'pg') documentQuery = documentQuery.forUpdate();
     const document = await documentQuery.first();
-    if (!document || document.status !== 'sent' || !document.mydata_mark) return false;
+    if (!document || document.status !== 'sent' || !document.mydata_mark) return null;
     const activeCredits = await trx('fiscal_documents')
       .where({ related_document_id: document.id })
       .whereIn('document_type', ['5.1', '11.4'])
@@ -331,13 +358,14 @@ async function claimDocumentCancellation(id) {
     }
     const eligible = ['none', null].includes(document.cancellation_status)
       || (document.cancellation_status === 'failed' && document.cancellation_retryable && !document.cancellation_uncertain);
-    if (!eligible) return false;
+    if (!eligible) return null;
     await trx('fiscal_documents').where({ id: document.id }).update({
       cancellation_status: 'transmitting', cancellation_error: null,
       cancellation_uncertain: false,
+      cancellation_token: cancellationToken,
       cancellation_attempt_at: trx.fn.now(), updated_at: trx.fn.now(),
     });
-    return true;
+    return cancellationToken;
   });
 }
 
@@ -352,14 +380,18 @@ async function quarantineStaleCancellations(staleMinutes = 60) {
     });
 }
 
-async function markCancellationFailed(id, errorMessage, { retryable = false, uncertain = false } = {}) {
-  await db('fiscal_documents').where({ id, status: 'sent', cancellation_status: 'transmitting' }).update({
+async function markCancellationFailed(id, errorMessage, { retryable = false, uncertain = false, attemptToken } = {}) {
+  if (!attemptToken) throw new Error('Cancellation attempt token is required to record failure');
+  const changed = await db('fiscal_documents').where({
+    id, status: 'sent', cancellation_status: 'transmitting', cancellation_token: attemptToken,
+  }).update({
     cancellation_status: 'failed',
     cancellation_retryable: Boolean(retryable),
     cancellation_uncertain: Boolean(uncertain),
     cancellation_error: String(errorMessage).slice(0, 4000),
     updated_at: db.fn.now(),
   });
+  if (changed !== 1) throw Object.assign(new Error('Cancellation attempt no longer owns this fiscal document'), { status: 409 });
 }
 
 async function cancelUnsentDocument(id) {
@@ -378,19 +410,105 @@ async function cancelUnsentDocument(id) {
   return changed === 1;
 }
 
-async function markDocumentCancelled(id, cancellationMark = null) {
-  await db('fiscal_documents').where({ id }).update({
-    status: 'cancelled',
-    cancellation_status: 'cancelled',
-    cancellation_mark: cancellationMark,
-    cancelled_at: db.fn.now(),
-    cancellation_error: null,
-    cancellation_retryable: false,
-    cancellation_uncertain: false,
-    error_message: null,
+async function markDocumentCancelled(id, cancellationMark = null, {
+  attemptToken = null, reconciled = false, response = null, verificationResponse = null,
+} = {}) {
+  if (!cancellationMark) throw new Error('Cancellation MARK is required');
+  return db.transaction(async (trx) => {
+    const document = await trx('fiscal_documents').where({ id }).forUpdate().first();
+    if (!document) throw Object.assign(new Error('Fiscal document not found'), { status: 404 });
+    if (document.status === 'cancelled') {
+      if (String(document.cancellation_mark) !== String(cancellationMark)) {
+        throw Object.assign(new Error('Conflicting cancellation MARK'), { status: 409 });
+      }
+      return document;
+    }
+    const ownsAttempt = attemptToken && document.cancellation_token === attemptToken
+      && (document.cancellation_status === 'transmitting'
+        || (document.cancellation_status === 'failed' && Boolean(document.cancellation_uncertain)));
+    const canReconcile = reconciled && document.status === 'sent'
+      && document.cancellation_status === 'failed' && !document.cancellation_mark;
+    if (!ownsAttempt && !canReconcile) {
+      throw Object.assign(new Error('Cancellation attempt no longer owns this fiscal document'), { status: 409 });
+    }
+    await trx('fiscal_documents').where({ id }).update({
+      status: 'cancelled',
+      cancellation_status: 'cancelled',
+      cancellation_mark: String(cancellationMark),
+      cancellation_response: response ? JSON.stringify(response) : document.cancellation_response,
+      cancellation_verification_response: verificationResponse ? JSON.stringify(verificationResponse) : document.cancellation_verification_response,
+      cancellation_verification_status: verificationResponse ? 'verified' : 'pending',
+      cancellation_verified_at: verificationResponse ? trx.fn.now() : document.cancellation_verified_at,
+      cancellation_token: null,
+      cancelled_at: trx.fn.now(),
+      cancellation_error: null,
+      cancellation_retryable: false,
+      cancellation_uncertain: false,
+      error_message: null,
+      updated_at: trx.fn.now(),
+    });
+    return trx('fiscal_documents').where({ id }).first();
+  });
+}
+
+async function markCancellationVerified(id, cancellationMark, verificationResponse) {
+  const changed = await db('fiscal_documents').where({
+    id, status: 'cancelled', cancellation_status: 'cancelled', cancellation_mark: String(cancellationMark),
+  }).update({
+    cancellation_verification_status: 'verified',
+    cancellation_verification_response: JSON.stringify(verificationResponse),
+    cancellation_verified_at: db.fn.now(),
     updated_at: db.fn.now(),
   });
+  if (changed !== 1) throw Object.assign(new Error('Cancelled document changed before verification'), { status: 409 });
   return getDocumentById(id);
+}
+
+async function getCancellationResolutionEvent(idempotencyKey) {
+  return db('cancellation_resolution_events').where({ idempotency_key: idempotencyKey }).first();
+}
+
+async function resolveDefinitiveCancellationFailure({
+  documentId, decision, reason, resolvedBy, expectedUpdatedAt, idempotencyKey, adminKeyFingerprint, payloadHash,
+}) {
+  return db.transaction(async (trx) => {
+    const existingEvent = await trx('cancellation_resolution_events').where({ idempotency_key: idempotencyKey }).first();
+    if (existingEvent) {
+      if (existingEvent.payload_hash !== payloadHash) throw Object.assign(new Error('Idempotency key already belongs to a different resolution'), { status: 409 });
+      return { event: existingEvent, document: await trx('fiscal_documents').where({ id: existingEvent.document_id }).first(), idempotent: true };
+    }
+    const document = await trx('fiscal_documents').where({ id: documentId }).forUpdate().first();
+    if (!document) throw Object.assign(new Error('Fiscal document not found'), { status: 404 });
+    if (String(document.updated_at) !== String(expectedUpdatedAt)) throw Object.assign(new Error('Fiscal document changed; reload before resolving'), { status: 409 });
+    if (document.status !== 'sent' || !/^\d+$/.test(String(document.mydata_mark || ''))
+        || document.cancellation_status !== 'failed' || Boolean(document.cancellation_uncertain)
+        || Boolean(document.cancellation_retryable) || document.cancellation_mark) {
+      throw Object.assign(new Error('Only a definitive non-retryable CancelInvoice failure can be resolved'), { status: 409 });
+    }
+    const toStatus = decision === 'authorize_retry' ? 'failed' : 'none';
+    await trx('fiscal_documents').where({ id: document.id }).update({
+      cancellation_status: toStatus,
+      cancellation_retryable: decision === 'authorize_retry',
+      cancellation_uncertain: false,
+      cancellation_token: null,
+      ...(decision === 'retain_active' ? { cancellation_error: null } : {}),
+      updated_at: trx.fn.now(),
+    });
+    const inserted = await trx('cancellation_resolution_events').insert({
+      idempotency_key: idempotencyKey, document_id: document.id, company_id: document.company_id,
+      decision, from_status: 'failed', to_status: toStatus, invoice_mark: String(document.mydata_mark),
+      prior_cancellation_error: document.cancellation_error,
+      prior_retryable: Boolean(document.cancellation_retryable), prior_uncertain: Boolean(document.cancellation_uncertain),
+      prior_attempt_at: document.cancellation_attempt_at, reason, resolved_by: resolvedBy,
+      admin_key_fingerprint: adminKeyFingerprint, payload_hash: payloadHash,
+    }).returning('id');
+    const eventId = insertedId(inserted);
+    return {
+      event: await trx('cancellation_resolution_events').where({ id: eventId }).first(),
+      document: await trx('fiscal_documents').where({ id: document.id }).first(),
+      idempotent: false,
+    };
+  });
 }
 
 async function cancelPendingReservationDocuments(reservationId, client = db) {
@@ -420,6 +538,9 @@ module.exports = {
   markCancellationFailed,
   cancelUnsentDocument,
   markDocumentCancelled,
+  markCancellationVerified,
+  getCancellationResolutionEvent,
+  resolveDefinitiveCancellationFailure,
   cancelPendingReservationDocuments,
   listUnverifiedDocuments,
   markDocumentVerified,

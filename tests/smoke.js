@@ -28,7 +28,7 @@ const { handleCreateListing } = require('../src/services/listing-service');
 const { handleCreateCompany, handleUpdateCompany } = require('../src/services/company-service');
 const { prepareReservationDocuments } = require('../src/services/document-service');
 const { executeDailyClose } = require('../src/services/daily-close-service');
-const { cancelFiscalDocument, reconcileFiscalDocumentCancellation } = require('../src/services/cancellation-service');
+const { cancelFiscalDocument, reconcileFiscalDocumentCancellation, resolveCancellationFailure } = require('../src/services/cancellation-service');
 const { normalizeGuestyReservation } = require('../src/guesty/normalizer');
 const { createCreditDocument } = require('../src/services/credit-service');
 const { renderFiscalDocumentPdf, buildFiscalDocumentPdfData } = require('../src/services/pdf-service');
@@ -51,6 +51,7 @@ const { runGuestyReconciliation } = require('../src/services/guesty-reconciliati
 const { createSandboxSignoff } = require('../src/services/sandbox-signoff-service');
 const { applyFinancialProfile, calibrateProfile, listObservedChannels } = require('../src/services/financial-profile-service');
 const { evaluateFolio } = require('../src/services/financial-rule-engine');
+const { claimDocument } = require('../src/repositories/fiscal-documents');
 
 // ─── Mock Data ────────────────────────────────────────────────────────────────
 
@@ -268,6 +269,18 @@ async function run() {
     });
   } catch (error) { rejectedInvalidGreekCounterpart = error.status === 400 && error.message.includes('checksum'); }
   assert(rejectedInvalidGreekCounterpart, 'το ελληνικό ΑΦΜ αντισυμβαλλομένου ελέγχεται πριν δημιουργηθεί ΤΠΥ');
+  let rejectedInvalidBranches = 0;
+  for (const [index, branch] of [-1, 1.5, '1e2', 2147483648].entries()) {
+    try {
+      await handleCreateListing({
+        company_id: securedCompany.id, listing_id_guesty: `lst_BAD_BRANCH_${index}`, property_type: 'apartment',
+        default_invoice_type: '2.1', invoice_counterpart_vat_number: 'IE9827384L', invoice_counterpart_country: 'IE',
+        invoice_counterpart_branch: branch,
+        climate_fee_high: 2, climate_fee_low: 0.5, climate_fee_high_category: 24, climate_fee_low_category: 10,
+      });
+    } catch (error) { if (error.status === 400) rejectedInvalidBranches += 1; }
+  }
+  assert(rejectedInvalidBranches === 4, 'το υποκατάστημα αντισυμβαλλομένου δέχεται μόνο ακέραιο AADE branch 0–2147483647');
   let rejectedShortTermTakkCategory = false;
   try {
     await handleCreateListing({
@@ -287,6 +300,7 @@ async function run() {
     invoice_counterpart_vat_number: 'IE9827384L',
     invoice_counterpart_country: 'IE',
     invoice_counterpart_name: 'Airbnb Ireland UC',
+    invoice_counterpart_branch: 59,
     climate_fee_high: 2,
     climate_fee_low: 0.5,
     climate_fee_high_category: 24,
@@ -302,6 +316,7 @@ async function run() {
     invoice_counterpart_vat_number: securedListing.invoice_counterpart_vat_number,
     invoice_counterpart_country: securedListing.invoice_counterpart_country,
     invoice_counterpart_name: securedListing.invoice_counterpart_name,
+    invoice_counterpart_branch: securedListing.invoice_counterpart_branch,
     property_type: securedListing.property_type,
     climate_fee_high: securedListing.climate_fee_high,
     climate_fee_low: securedListing.climate_fee_low,
@@ -313,6 +328,7 @@ async function run() {
     ...MOCK_RESERVATION,
     reservationId: 'res_QUEUE001',
     listingId: 'lst_QUEUE_TEST',
+    invoiceCounterpart: undefined,
     stayEvidence: {
       reservationListingId: 'lst_QUEUE_TEST', folioListingId: 'lst_QUEUE_TEST',
       lineListingIds: [], stayIndexes: [], singleStayConfirmed: true,
@@ -325,6 +341,13 @@ async function run() {
   const queuedRows = await db('fiscal_documents').where({ reservation_id: 'res_QUEUE001' }).orderBy('id');
   assert(queuedRows.length === 2, 'μία κράτηση δημιουργεί ακριβώς δύο παραστατικά');
   assert(queuedRows.some((row) => row.document_type === '2.1'), 'το κύριο παραστατικό είναι ΤΠΥ 2.1');
+  assert(queuedRows.find((row) => row.document_type === '2.1').xml_payload.includes('<branch>59</branch>'), 'το ΤΠΥ διατηρεί το ρυθμισμένο υποκατάστημα αντισυμβαλλομένου');
+  assert(queuedRows.every((row) => row.target_environment === 'sandbox'), 'κάθε queued παραστατικό δεσμεύεται αμετάβλητα στο sandbox περιβάλλον δημιουργίας');
+  const targetGuardPreviousEnv = process.env.MYDATA_ENV;
+  process.env.MYDATA_ENV = 'production';
+  const crossEnvironmentClaim = await claimDocument(queuedRows[0].id);
+  if (targetGuardPreviousEnv === undefined) delete process.env.MYDATA_ENV; else process.env.MYDATA_ENV = targetGuardPreviousEnv;
+  assert(crossEnvironmentClaim === null, 'sandbox queued παραστατικό δεν μπορεί να γίνει claim από production runtime');
   assert(queuedRows.some((row) => row.document_type === '8.2'), 'το ΤΑΚΚ είναι ανεξάρτητο 8.2');
   assert(firstQueue.primary.created && firstQueue.climate.created, 'η πρώτη παραλαβή δημιουργεί τα παραστατικά');
   assert(!secondQueue.primary.created && !secondQueue.climate.created, 'duplicate Guesty event δεν διπλοεκδίδει');
@@ -334,7 +357,7 @@ async function run() {
   let sentCalls = 0;
   const fakeSender = async () => {
     sentCalls += 1;
-    return { mark: `MARK_${sentCalls}`, uid: `UID_${sentCalls}`, qrUrl: `https://example.test/qr/${sentCalls}`, raw: { ok: true } };
+    return { mark: `40000000000000${sentCalls}`, uid: `UID_${sentCalls}`, qrUrl: `https://example.test/qr/${sentCalls}`, raw: { ok: true } };
   };
   let verificationCalls = 0;
   const fakeVerifier = async (mark) => {
@@ -376,6 +399,13 @@ async function run() {
   assert(cancelledMarkInput === documentToCancel.mydata_mark, 'η ΑΑΔΕ ακύρωση λαμβάνει το MARK του αρχικού παραστατικού');
   assert(cancelled.status === 'cancelled' && cancelled.cancellation_mark === '900000000000001', 'αποθηκεύεται το cancellation MARK');
   assert(cancellationCalls === 1, 'δύο ταυτόχρονες ακυρώσεις στέλνουν μόνο ένα CancelInvoice');
+  const verifiedCancellation = await reconcileFiscalDocumentCancellation({
+    documentId: documentToCancel.id,
+    verifier: async (invoiceMark) => ({
+      verified: true, invoiceMark, cancellationMark: '900000000000001', raw: { cancellationMark: '900000000000001' },
+    }),
+  });
+  assert(verifiedCancellation.cancellation_verification_status === 'verified', 'το cancellation MARK επιβεβαιώνεται χωριστά με RequestTransmittedDocs');
 
   // ── Test 11: Official Guesty payload normalization ──────────────────────
   console.log('\n🔌 Test 11: Κανονικοποίηση επίσημου Guesty webhook payload');
@@ -458,17 +488,42 @@ async function run() {
   // ── Test 12: Credit document ────────────────────────────────────────────
   console.log('\n🧮 Test 12: Συσχετιζόμενο πιστωτικό ΤΠΥ');
   const originalTpy = sentRows.find((row) => row.document_type === '2.1');
+  let definitiveFailure;
   let cancellationFailureRecorded = false;
   try {
     await cancelFiscalDocument({ documentId: originalTpy.id, canceller: async () => {
-      const error = new Error('explicit AADE rejection'); error.retryable = true; throw error;
+      throw new Error('explicit AADE rejection');
     } });
   } catch {
-    const afterFailure = await db('fiscal_documents').where({ id: originalTpy.id }).first();
-    cancellationFailureRecorded = afterFailure.status === 'sent' && afterFailure.cancellation_status === 'failed';
+    definitiveFailure = await db('fiscal_documents').where({ id: originalTpy.id }).first();
+    cancellationFailureRecorded = definitiveFailure.status === 'sent' && definitiveFailure.cancellation_status === 'failed'
+      && !definitiveFailure.cancellation_retryable && !definitiveFailure.cancellation_uncertain;
   }
   assert(cancellationFailureRecorded, 'αποτυχία CancelInvoice κρατά το αρχικό παραστατικό sent και απαιτεί επίλυση πριν από πιστωτικό');
-  await db('fiscal_documents').where({ id: originalTpy.id }).update({ cancellation_status: 'none', cancellation_retryable: true, cancellation_uncertain: false });
+  const resolutionKey = 'smoke-retain-active-001';
+  const resolution = await resolveCancellationFailure({
+    documentId: originalTpy.id,
+    decision: 'retain_active',
+    reason: 'Ο λογιστής επιβεβαίωσε ότι το αρχικό παραμένει ενεργό',
+    resolvedBy: 'Smoke Test Accountant',
+    expectedUpdatedAt: definitiveFailure.updated_at,
+    idempotencyKey: resolutionKey,
+    adminKeyFingerprint: 'a'.repeat(64),
+    verifier: async (invoiceMark) => ({ verified: false, notFound: true, invoiceMark }),
+  });
+  const idempotentResolution = await resolveCancellationFailure({
+    documentId: originalTpy.id,
+    decision: 'retain_active',
+    reason: 'Ο λογιστής επιβεβαίωσε ότι το αρχικό παραμένει ενεργό',
+    resolvedBy: 'Smoke Test Accountant',
+    expectedUpdatedAt: definitiveFailure.updated_at,
+    idempotencyKey: resolutionKey,
+    adminKeyFingerprint: 'a'.repeat(64),
+    verifier: async () => { throw new Error('idempotent resolution must not recheck myDATA'); },
+  });
+  assert(resolution.document.status === 'sent' && resolution.document.cancellation_status === 'none'
+    && resolution.event.decision === 'retain_active' && idempotentResolution.idempotent,
+  'οριστική απόρριψη CancelInvoice επιλύεται μόνο με fresh myDATA check και append-only idempotent audit event');
   let invalidCreditInputBlocked = 0;
   for (const input of [
     { grossValue: 1.001, issueDate: '2025-07-16', reference: 'bad-decimals' },
@@ -487,8 +542,10 @@ async function run() {
   assert(creditResult.document.document_type === '5.1', 'το πιστωτικό ΤΠΥ έχει τύπο 5.1');
   assert(creditResult.document.correlated_mark === originalTpy.mydata_mark, 'το πιστωτικό αποθηκεύει το MARK συσχέτισης');
   assert(creditResult.document.xml_payload.includes(`<correlatedInvoices>${originalTpy.mydata_mark}</correlatedInvoices>`), 'το XML 5.1 περιέχει το αρχικό MARK');
+  assert(creditResult.document.xml_payload.includes('<branch>59</branch>'), 'το πιστωτικό 5.1 κληρονομεί το υποκατάστημα του αρχικού ΤΠΥ');
   const creditSource = JSON.parse(creditResult.document.source_payload);
   assert(creditSource.billingSnapshot?.invoice_counterpart_vat_number === 'IE9827384L', 'το πιστωτικό διατηρεί το fiscal snapshot του αρχικού ΤΠΥ');
+  assert(creditSource.billingSnapshot?.invoice_counterpart_branch === 59, 'το fiscal snapshot παγώνει το υποκατάστημα πριν από μεταγενέστερες αλλαγές ρυθμίσεων');
 
   // ── Test 13: PDF only after MARK ────────────────────────────────────────
   console.log('\n🖨️  Test 13: Τελικό PDF μετά το MARK');
@@ -746,7 +803,7 @@ async function run() {
   } catch (error) { rejectedInvalidOverrideVat = error.status === 400 && error.message.includes('checksum'); }
   assert(rejectedInvalidOverrideVat, 'το override ΤΠΥ απορρίπτει λανθασμένο ελληνικό ΑΦΜ πριν την έκδοση');
   await applyFiscalOverride('res_OVERRIDE001', {
-    invoice_type: '2.1', series: 'CORP', counterpart_vat_number: '099999999', counterpart_country: 'GR', counterpart_name: 'Corporate Guest AE',
+    invoice_type: '2.1', series: 'CORP', counterpart_vat_number: '099999999', counterpart_country: 'GR', counterpart_name: 'Corporate Guest AE', counterpart_branch: 7,
   });
   // A later Guesty refresh must update the amount while preserving the explicit
   // operator choice made before fiscal materialization.
@@ -762,7 +819,7 @@ async function run() {
   assert(stagedDocuments.length === 2 && stagedDocuments.find((row) => row.document_type === '11.2').gross_value === 226, 'το κλείσιμο χρησιμοποιεί το τελευταίο Guesty ποσό και δημιουργεί ΑΠΥ + ΤΑΚΚ');
   const overrideDocuments = await db('fiscal_documents').where({ reservation_id: 'res_OVERRIDE001' });
   const overridePrimary = overrideDocuments.find((row) => row.document_type === '2.1');
-  assert(overridePrimary?.series === 'CORP' && overridePrimary.gross_value === 452 && overridePrimary.xml_payload.includes('099999999'), 'μεμονωμένη κράτηση μπορεί να γίνει ΤΠΥ με δική της σειρά/αντισυμβαλλόμενο');
+  assert(overridePrimary?.series === 'CORP' && overridePrimary.gross_value === 452 && overridePrimary.xml_payload.includes('099999999') && overridePrimary.xml_payload.includes('<branch>7</branch>'), 'μεμονωμένη κράτηση μπορεί να γίνει ΤΠΥ με δική της σειρά/αντισυμβαλλόμενο/υποκατάστημα');
   const unknownSnapshot = await db('reservation_snapshots').where({ reservation_id: 'res_UNKNOWN_CHANNEL' }).first();
   assert(Boolean(unknownSnapshot.requires_review) && (await db('fiscal_documents').where({ reservation_id: 'res_UNKNOWN_CHANNEL' })).length === 0, 'άγνωστο κανάλι μπαίνει σε review χωρίς ΑΠΥ/ΤΠΥ, ΤΑΚΚ ή δέσμευση ΑΑ');
   let materializedOverrideBlocked = false;

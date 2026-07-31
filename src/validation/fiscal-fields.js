@@ -45,7 +45,20 @@ function normalizeAndValidateGreekVat(value, fieldName = 'vat_number') {
   return vat;
 }
 
-function normalizeCounterpart({ vatNumber, country, name } = {}, { required = false, label = 'counterpart' } = {}) {
+function normalizeBranch(value, fieldName = 'branch') {
+  if (value === undefined || value === null || value === '') return 0;
+  const text = String(value).trim();
+  if (!/^(0|[1-9]\d*)$/.test(text)) {
+    throw bad(`${fieldName} must be a non-negative base-10 integer`);
+  }
+  const branch = Number(text);
+  if (!Number.isInteger(branch) || branch < 0 || branch > 2147483647) {
+    throw bad(`${fieldName} must be a non-negative 32-bit integer`);
+  }
+  return branch;
+}
+
+function normalizeCounterpart({ vatNumber, country, name, branch } = {}, { required = false, label = 'counterpart' } = {}) {
   const normalizedCountry = normalizeCountryCode(country, `${label}_country`);
   let normalizedVat = String(vatNumber || '').trim().toUpperCase().replace(/\s/g, '');
   const normalizedName = String(name || '').trim() || null;
@@ -64,6 +77,7 @@ function normalizeCounterpart({ vatNumber, country, name } = {}, { required = fa
     vatNumber: normalizedVat || null,
     country: normalizedCountry,
     name: normalizedName,
+    branch: normalizeBranch(branch, `${label}_branch`),
   };
 }
 
@@ -98,6 +112,7 @@ module.exports = {
   normalizeAndValidateGreekVat,
   normalizeAccommodationClimateCategory,
   normalizeCounterpart,
+  normalizeBranch,
   normalizeCountryCode,
   normalizeGreekVat,
   normalizeSeries,

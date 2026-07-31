@@ -1,7 +1,13 @@
 'use strict';
 
+const crypto = require('crypto');
+
 const { getCompanyById } = require('../repositories/companies');
-const { getDocumentById, claimDocumentCancellation, quarantineStaleCancellations, markCancellationFailed, cancelUnsentDocument, markDocumentCancelled } = require('../repositories/fiscal-documents');
+const {
+  getDocumentById, claimDocumentCancellation, quarantineStaleCancellations, markCancellationFailed,
+  cancelUnsentDocument, markDocumentCancelled, markCancellationVerified,
+  getCancellationResolutionEvent, resolveDefinitiveCancellationFailure,
+} = require('../repositories/fiscal-documents');
 const { decryptCompanySecret } = require('../security/credentials');
 const { cancelMyDataInvoice, verifyCancelledInvoice } = require('../mydata-client');
 const { assertProductionTransmissionEnabled } = require('../security/production-guard');
@@ -15,6 +21,12 @@ async function cancelFiscalDocument({ documentId, canceller = cancelMyDataInvoic
     throw error;
   }
   if (document.status === 'cancelled') return document;
+  const currentEnvironment = process.env.MYDATA_ENV || 'sandbox';
+  if (document.mydata_mark && document.mydata_environment !== currentEnvironment) {
+    const error = new Error(`Document belongs to myDATA ${document.mydata_environment || 'unknown'} and cannot be cancelled from ${currentEnvironment}`);
+    error.status = 409;
+    throw error;
+  }
   if (document.cancellation_uncertain) {
     const error = new Error('Cancellation outcome is uncertain; reconcile it from myDATA before retry');
     error.status = 409;
@@ -42,14 +54,15 @@ async function cancelFiscalDocument({ documentId, canceller = cancelMyDataInvoic
   }
 
   await assertProductionTransmissionEnabled('cancellations');
-  if (!await claimDocumentCancellation(document.id)) {
+  const attemptToken = await claimDocumentCancellation(document.id);
+  if (!attemptToken) {
     const current = await getDocumentById(document.id);
     if (current?.status === 'cancelled') return current;
     const error = new Error('Document cancellation is already in progress'); error.status = 409; throw error;
   }
   const company = await getCompanyById(document.company_id);
   if (!company) {
-    await markCancellationFailed(document.id, 'Company not found');
+    await markCancellationFailed(document.id, 'Company not found', { attemptToken });
     const error = new Error('Company not found');
     error.status = 404;
     throw error;
@@ -60,11 +73,12 @@ async function cancelFiscalDocument({ documentId, canceller = cancelMyDataInvoic
       aade_user_id: decryptCompanySecret(company, 'aade_user_id'),
       aade_subscription_key: decryptCompanySecret(company, 'aade_subscription_key'),
     });
-    return markDocumentCancelled(document.id, result.cancellationMark);
+    return markDocumentCancelled(document.id, result.cancellationMark, { attemptToken, response: result.raw || result });
   } catch (error) {
     await markCancellationFailed(document.id, error.message, {
       retryable: error.retryable === true,
       uncertain: error.transmissionUncertain === true,
+      attemptToken,
     });
     throw error;
   }
@@ -73,8 +87,11 @@ async function cancelFiscalDocument({ documentId, canceller = cancelMyDataInvoic
 async function reconcileFiscalDocumentCancellation({ documentId, verifier = verifyCancelledInvoice }) {
   const document = await getDocumentById(documentId);
   if (!document) throw Object.assign(new Error('Fiscal document not found'), { status: 404 });
-  if (document.status !== 'sent' || !document.mydata_mark || !document.cancellation_uncertain) {
-    throw Object.assign(new Error('Only an uncertain myDATA cancellation can be reconciled'), { status: 409 });
+  const uncertain = document.status === 'sent' && document.mydata_mark && document.cancellation_uncertain;
+  const awaitingVerification = document.status === 'cancelled' && document.mydata_mark && document.cancellation_mark
+    && document.cancellation_verification_status !== 'verified';
+  if (!uncertain && !awaitingVerification) {
+    throw Object.assign(new Error('Only an uncertain cancellation or unverified cancellation MARK can be reconciled'), { status: 409 });
   }
   const company = await getCompanyById(document.company_id);
   if (!company) throw Object.assign(new Error('Company not found'), { status: 404 });
@@ -86,7 +103,67 @@ async function reconcileFiscalDocumentCancellation({ documentId, verifier = veri
   if (!result?.verified || String(result.invoiceMark) !== String(document.mydata_mark) || !result.cancellationMark) {
     throw Object.assign(new Error('RequestTransmittedDocs did not verify the cancellation'), { status: 409 });
   }
-  return markDocumentCancelled(document.id, result.cancellationMark);
+  if (awaitingVerification) {
+    if (String(result.cancellationMark) !== String(document.cancellation_mark)) {
+      throw Object.assign(new Error('RequestTransmittedDocs returned a different cancellation MARK'), { status: 409 });
+    }
+    return markCancellationVerified(document.id, result.cancellationMark, result.raw || result);
+  }
+  return markDocumentCancelled(document.id, result.cancellationMark, {
+    reconciled: true, verificationResponse: result.raw || result,
+  });
 }
 
-module.exports = { cancelFiscalDocument, reconcileFiscalDocumentCancellation };
+function requiredText(value, field, min, max) {
+  const text = String(value || '').trim();
+  if (text.length < min || text.length > max) throw Object.assign(new Error(`${field} must contain ${min}-${max} characters`), { status: 400 });
+  return text;
+}
+
+async function resolveCancellationFailure({
+  documentId, decision, reason, resolvedBy, expectedUpdatedAt, idempotencyKey,
+  adminKeyFingerprint, verifier = verifyCancelledInvoice,
+}) {
+  if (!['authorize_retry', 'retain_active'].includes(decision)) throw Object.assign(new Error('decision must be authorize_retry or retain_active'), { status: 400 });
+  const normalizedReason = requiredText(reason, 'reason', 10, 4000);
+  const normalizedActor = requiredText(resolvedBy, 'resolved_by', 1, 200);
+  const normalizedKey = requiredText(idempotencyKey, 'idempotency_key', 8, 100);
+  const expected = requiredText(expectedUpdatedAt, 'expected_updated_at', 1, 100);
+  const fingerprint = requiredText(adminKeyFingerprint, 'admin_key_fingerprint', 16, 64);
+  const payloadHash = crypto.createHash('sha256').update(JSON.stringify({
+    documentId: Number(documentId), decision, reason: normalizedReason, resolvedBy: normalizedActor, expectedUpdatedAt: expected,
+  })).digest('hex');
+  const prior = await getCancellationResolutionEvent(normalizedKey);
+  if (prior) {
+    if (prior.payload_hash !== payloadHash) throw Object.assign(new Error('Idempotency key already belongs to a different resolution'), { status: 409 });
+    return { event: prior, document: await getDocumentById(prior.document_id), idempotent: true };
+  }
+  const document = await getDocumentById(documentId);
+  if (!document) throw Object.assign(new Error('Fiscal document not found'), { status: 404 });
+  if (document.status !== 'sent' || document.cancellation_status !== 'failed'
+      || document.cancellation_retryable || document.cancellation_uncertain || !document.mydata_mark) {
+    throw Object.assign(new Error('Only a definitive non-retryable CancelInvoice failure can be resolved'), { status: 409 });
+  }
+  const company = await getCompanyById(document.company_id);
+  if (!company) throw Object.assign(new Error('Company not found'), { status: 404 });
+  const check = await verifier(document.mydata_mark, {
+    ...company,
+    aade_user_id: decryptCompanySecret(company, 'aade_user_id'),
+    aade_subscription_key: decryptCompanySecret(company, 'aade_subscription_key'),
+  });
+  if (check?.verified && check.cancellationMark) {
+    return { reconciled: true, document: await markDocumentCancelled(document.id, check.cancellationMark, {
+      reconciled: true, verificationResponse: check.raw || check,
+    }) };
+  }
+  if (!check?.notFound || String(check.invoiceMark) !== String(document.mydata_mark)) {
+    throw Object.assign(new Error('myDATA did not authoritatively confirm that no cancellation exists'), { status: 409 });
+  }
+  return resolveDefinitiveCancellationFailure({
+    documentId: Number(documentId), decision, reason: normalizedReason, resolvedBy: normalizedActor,
+    expectedUpdatedAt: expected, idempotencyKey: normalizedKey,
+    adminKeyFingerprint: fingerprint, payloadHash,
+  });
+}
+
+module.exports = { cancelFiscalDocument, reconcileFiscalDocumentCancellation, resolveCancellationFailure };
