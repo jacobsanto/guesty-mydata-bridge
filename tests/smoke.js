@@ -415,18 +415,23 @@ async function run() {
   assert(cancelledMarkInput === documentToCancel.mydata_mark, 'η ΑΑΔΕ ακύρωση λαμβάνει το MARK του αρχικού παραστατικού');
   assert(cancelled.status === 'cancelled' && cancelled.cancellation_mark === '900000000000001', 'αποθηκεύεται το cancellation MARK');
   assert(cancellationCalls === 1, 'δύο ταυτόχρονες ακυρώσεις στέλνουν μόνο ένα CancelInvoice');
+  let knownCancellationVerificationOptions = null;
   await executeDailyClose({
     companyId: securedCompany.id,
     businessDate: '2025-07-15',
     materializer: async () => [],
     sender: async () => { throw new Error('no invoice transmission expected while verifying cancellation'); },
     verifier: fakeVerifier,
-    cancellationVerifier: async (invoiceMark) => ({
-      verified: true, invoiceMark, cancellationMark: '900000000000001', raw: { cancellationMark: '900000000000001' },
-    }),
+    cancellationVerifier: async (invoiceMark, _companyContext, options) => {
+      knownCancellationVerificationOptions = options;
+      return {
+        verified: true, invoiceMark, cancellationMark: '900000000000001', raw: { cancellationMark: '900000000000001' },
+      };
+    },
   });
   const verifiedCancellation = await db('fiscal_documents').where({ id: documentToCancel.id }).first();
   assert(verifiedCancellation.cancellation_verification_status === 'verified', 'το επόμενο ημερήσιο κλείσιμο επαληθεύει αυτόματα το cancellation MARK με RequestTransmittedDocs');
+  assert(knownCancellationVerificationOptions?.cancellationMark === '900000000000001', 'known cancellation MARK δίνεται στον verifier για exact RequestTransmittedDocs interval');
 
   // ── Test 11: Official Guesty payload normalization ──────────────────────
   console.log('\n🔌 Test 11: Κανονικοποίηση επίσημου Guesty webhook payload');
@@ -1020,6 +1025,7 @@ async function run() {
     && queuedAutomaticCancellations.every((document) => document.status === 'sent' && document.cancellation_status === 'requested'),
   'authoritative Guesty cancellation δημιουργεί durable cancellation work για ΑΠΥ/ΤΠΥ και ΤΑΚΚ που έχουν MARK');
   const automaticCancellationCalls = [];
+  const automaticCancellationVerificationOptions = [];
   const cancellationMarkFor = (mark) => String(BigInt(mark) + 500000000000000n);
   await executeDailyClose({
     companyId: securedCompany.id,
@@ -1030,13 +1036,18 @@ async function run() {
       automaticCancellationCalls.push(String(mark));
       return { cancellationMark: cancellationMarkFor(mark), raw: { statusCode: 'Success' } };
     },
-    cancellationVerifier: async (mark) => ({
-      verified: true, invoiceMark: String(mark), cancellationMark: cancellationMarkFor(mark), raw: { verified: true },
-    }),
+    cancellationVerifier: async (mark, _companyContext, options) => {
+      automaticCancellationVerificationOptions.push(options);
+      return {
+        verified: true, invoiceMark: String(mark), cancellationMark: cancellationMarkFor(mark), raw: { verified: true },
+      };
+    },
   });
   const automaticallyCancelled = await db('fiscal_documents').where({ reservation_id: automaticCancellationReservation.reservationId });
   const automaticallyResolvedSnapshot = await db('reservation_snapshots').where({ reservation_id: automaticCancellationReservation.reservationId }).first();
   assert(automaticCancellationCalls.length === 2
+    && automaticCancellationVerificationOptions.length === 2
+    && automaticCancellationVerificationOptions.every((options) => options?.cancellationMark)
     && automaticallyCancelled.every((document) => document.status === 'cancelled'
       && document.cancellation_status === 'cancelled'
       && document.cancellation_verification_status === 'verified')
@@ -1455,11 +1466,16 @@ async function run() {
     });
   } catch (error) { unverifiedCancellationEvidenceBlocked = error.status === 409; }
   assert(unverifiedCancellationEvidenceBlocked, 'αβέβαιη ή μη verified ακύρωση δεν γίνεται sandbox acceptance evidence');
+  let unknownCancellationVerificationOptions = null;
   const reconciledCancellation = await reconcileFiscalDocumentCancellation({
     documentId: cancellationTarget.id,
-    verifier: async (invoiceMark) => ({ verified: true, invoiceMark, cancellationMark: '800000000000001' }),
+    verifier: async (invoiceMark, _companyContext, options) => {
+      unknownCancellationVerificationOptions = options;
+      return { verified: true, invoiceMark, cancellationMark: '800000000000001' };
+    },
   });
   assert(reconciledCancellation.status === 'cancelled' && reconciledCancellation.cancellation_mark === '800000000000001', 'RequestTransmittedDocs συμφωνεί την αβέβαιη ακύρωση με cancellation MARK');
+  assert(unknownCancellationVerificationOptions?.cancellationMark === undefined, 'unknown CancelInvoice outcome ενεργοποιεί bounded forward reconciliation χωρίς guessed MARK');
 
   let wrongPairBlocked = false;
   try {

@@ -221,43 +221,132 @@ async function verifyTransmittedDocument(mark, companyContext, expectedDocument 
   return { verified: true, mark: String(mark), uid: invoice.uid ? String(invoice.uid) : null, raw: invoice };
 }
 
-async function verifyCancelledInvoice(mark, companyContext) {
-  if (!/^\d+$/.test(String(mark || ''))) throw new Error('A numeric invoice MARK is required for cancellation verification');
-  const lowerMark = (BigInt(String(mark)) - 1n).toString();
-  let response;
-  try {
-    response = await axios.get(getEndpoint('RequestTransmittedDocs'), {
-      headers: {
-        'aade-user-id': companyContext.aade_user_id,
-        'ocp-apim-subscription-key': companyContext.aade_subscription_key,
-        Accept: 'application/xml',
-      },
-      params: { mark: lowerMark, maxMark: String(mark) },
-      timeout: parseInt(process.env.MYDATA_TIMEOUT_MS || '15000', 10),
-      validateStatus: () => true,
-    });
-  } catch (error) {
-    throw new Error(`Network error κατά την επαλήθευση ακύρωσης myDATA: ${error.message}`);
+async function verifyCancelledInvoice(invoiceMark, companyContext, options = {}) {
+  const normalizedInvoiceMark = numericMark(invoiceMark, 'invoice MARK');
+  const knownCancellationMark = options.cancellationMark === undefined || options.cancellationMark === null
+    ? null
+    : numericMark(options.cancellationMark, 'cancellation MARK');
+  if (knownCancellationMark && BigInt(knownCancellationMark) <= BigInt(normalizedInvoiceMark)) {
+    const error = new Error('Το cancellation MARK πρέπει να είναι μεταγενέστερο του invoice MARK');
+    error.status = 409;
+    error.correlationMismatch = true;
+    throw error;
   }
-  if (response.status >= 400) throw new Error(`ΑΑΔΕ cancellation verification HTTP ${response.status}`);
-  let parsed;
-  try {
-    parsed = await new xml2js.Parser({ explicitArray: false, ignoreAttrs: true }).parseStringPromise(response.data);
-  } catch {
-    throw new Error('Αδυναμία parse απάντησης ακυρωμένων RequestTransmittedDocs');
+  const configuredMaxPages = Number(options.maxPages ?? process.env.MYDATA_CANCELLATION_SCAN_MAX_PAGES ?? 10);
+  if (!Number.isInteger(configuredMaxPages) || configuredMaxPages < 1 || configuredMaxPages > 100) {
+    throw new Error('Cancellation verification maxPages must be an integer between 1 and 100');
   }
-  const value = parsed?.RequestedDoc?.cancelledInvoicesDoc?.cancelledInvoice;
-  const rows = value ? (Array.isArray(value) ? value : [value]) : [];
-  const cancellation = rows.find((row) => String(row.invoiceMark) === String(mark));
-  if (!cancellation?.cancellationMark) {
-    return { verified: false, notFound: true, invoiceMark: String(mark), raw: rows };
+
+  // A known cancellation MARK permits an exact one-record interval. When the
+  // CancelInvoice response was lost, scan forward from the original invoice
+  // MARK, but never beyond the configured page bound.
+  const searchMark = knownCancellationMark
+    ? (BigInt(knownCancellationMark) - 1n).toString()
+    : normalizedInvoiceMark;
+  const baseParams = knownCancellationMark
+    ? { mark: searchMark, maxMark: knownCancellationMark }
+    : { mark: searchMark };
+  let continuation = null;
+
+  for (let page = 1; page <= configuredMaxPages; page += 1) {
+    let response;
+    try {
+      response = await axios.get(getEndpoint('RequestTransmittedDocs'), {
+        headers: {
+          'aade-user-id': companyContext.aade_user_id,
+          'ocp-apim-subscription-key': companyContext.aade_subscription_key,
+          Accept: 'application/xml',
+        },
+        params: {
+          ...baseParams,
+          ...(continuation || {}),
+        },
+        timeout: parseInt(process.env.MYDATA_TIMEOUT_MS || '15000', 10),
+        validateStatus: () => true,
+      });
+    } catch (error) {
+      const wrapped = new Error(`Network error κατά την επαλήθευση ακύρωσης myDATA: ${error.message}`);
+      wrapped.retryable = true;
+      wrapped.cause = error;
+      throw wrapped;
+    }
+    if (response.status >= 400) {
+      const error = new Error(`ΑΑΔΕ cancellation verification HTTP ${response.status}`);
+      error.retryable = response.status === 429 || response.status >= 500;
+      throw error;
+    }
+
+    let parsed;
+    try {
+      parsed = await new xml2js.Parser({ explicitArray: false, ignoreAttrs: true }).parseStringPromise(response.data);
+    } catch {
+      throw new Error('Αδυναμία parse απάντησης ακυρωμένων RequestTransmittedDocs');
+    }
+    const requestedDoc = parsed?.RequestedDoc;
+    if (!requestedDoc) throw new Error('Μη αναμενόμενη δομή απάντησης RequestTransmittedDocs');
+    const value = requestedDoc.cancelledInvoicesDoc?.cancelledInvoice;
+    const rows = value ? (Array.isArray(value) ? value : [value]) : [];
+    const exactCancellationRows = knownCancellationMark
+      ? rows.filter((row) => String(row.cancellationMark) === knownCancellationMark)
+      : rows;
+    if (knownCancellationMark && exactCancellationRows.some((row) => String(row.invoiceMark) !== normalizedInvoiceMark)) {
+      const error = new Error(`Το cancellation MARK ${knownCancellationMark} ανήκει σε διαφορετικό invoice MARK`);
+      error.status = 409;
+      error.correlationMismatch = true;
+      throw error;
+    }
+    const correlated = exactCancellationRows.filter((row) => String(row.invoiceMark) === normalizedInvoiceMark);
+    const correlatedMarks = correlated.map((row) => numericMark(row.cancellationMark, 'cancellation MARK'));
+    if (correlatedMarks.some((mark) => BigInt(mark) <= BigInt(normalizedInvoiceMark))) {
+      const error = new Error(`Μη έγκυρο cancellation MARK για invoice MARK ${normalizedInvoiceMark}`);
+      error.status = 409;
+      error.correlationMismatch = true;
+      throw error;
+    }
+    const cancellationMarks = [...new Set(correlatedMarks)];
+    if (cancellationMarks.length > 1) {
+      const error = new Error(`Πολλαπλά cancellation MARK βρέθηκαν για invoice MARK ${normalizedInvoiceMark}`);
+      error.status = 409;
+      error.correlationMismatch = true;
+      throw error;
+    }
+    if (cancellationMarks.length === 1) {
+      const cancellationMark = cancellationMarks[0];
+      if (knownCancellationMark && cancellationMark !== knownCancellationMark) {
+        const error = new Error('Το RequestTransmittedDocs επέστρεψε διαφορετικό cancellation MARK');
+        error.status = 409;
+        error.correlationMismatch = true;
+        throw error;
+      }
+      return {
+        verified: true,
+        invoiceMark: normalizedInvoiceMark,
+        cancellationMark,
+        raw: correlated.find((row) => String(row.cancellationMark) === cancellationMark),
+        pagesScanned: page,
+      };
+    }
+
+    const token = requestedDoc.continuationToken;
+    if (!token?.nextPartitionKey || !token?.nextRowKey) {
+      return {
+        verified: false,
+        notFound: true,
+        invoiceMark: normalizedInvoiceMark,
+        pagesScanned: page,
+        raw: { searchMark, maxMark: knownCancellationMark },
+      };
+    }
+    continuation = {
+      nextPartitionKey: String(token.nextPartitionKey),
+      nextRowKey: String(token.nextRowKey),
+    };
   }
-  return {
-    verified: true,
-    invoiceMark: String(mark),
-    cancellationMark: numericMark(cancellation.cancellationMark, 'cancellation MARK'),
-    raw: cancellation,
-  };
+
+  const error = new Error(`Η επαλήθευση ακύρωσης ξεπέρασε το όριο ${configuredMaxPages} σελίδων RequestTransmittedDocs`);
+  error.retryable = true;
+  error.scanIncomplete = true;
+  throw error;
 }
 
 async function testMyDataConnection(companyContext) {

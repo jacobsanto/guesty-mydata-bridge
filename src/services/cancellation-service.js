@@ -109,6 +109,8 @@ async function reconcileFiscalDocumentCancellation({ documentId, verifier = veri
     ...company,
     aade_user_id: decryptCompanySecret(company, 'aade_user_id'),
     aade_subscription_key: decryptCompanySecret(company, 'aade_subscription_key'),
+  }, {
+    cancellationMark: document.cancellation_mark || undefined,
   });
   if (!result?.verified || String(result.invoiceMark) !== String(document.mydata_mark) || !result.cancellationMark) {
     throw Object.assign(new Error('RequestTransmittedDocs did not verify the cancellation'), { status: 409 });
@@ -172,6 +174,8 @@ async function resolveCancellationFailure({
     ...company,
     aade_user_id: decryptCompanySecret(company, 'aade_user_id'),
     aade_subscription_key: decryptCompanySecret(company, 'aade_subscription_key'),
+  }, {
+    cancellationMark: document.cancellation_mark || undefined,
   });
   const foundCancellation = check?.verified && check.cancellationMark ? {
     invoiceMark: check.invoiceMark,

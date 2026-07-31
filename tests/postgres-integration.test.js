@@ -508,6 +508,7 @@ if (process.env.POSTGRES_INTEGRATION_TEST !== 'true') {
     const queued = await db('fiscal_documents').where({ reservation_id: autoReservation.reservationId });
     assert(queued.every((document) => document.cancellation_status === 'requested'));
     const calls = [];
+    const verificationOptions = [];
     const cancellationMark = (mark) => String(BigInt(mark) + 500000000000000n);
     await executeDailyClose({
       companyId: autoCompany.id,
@@ -515,12 +516,17 @@ if (process.env.POSTGRES_INTEGRATION_TEST !== 'true') {
       materializer: async () => [],
       sender: async () => { throw new Error('must not send new invoices'); },
       cancellationSender: async (mark) => { calls.push(String(mark)); return { cancellationMark: cancellationMark(mark) }; },
-      cancellationVerifier: async (mark) => ({
-        verified: true, invoiceMark: String(mark), cancellationMark: cancellationMark(mark),
-      }),
+      cancellationVerifier: async (mark, _companyContext, options) => {
+        verificationOptions.push(options);
+        return {
+          verified: true, invoiceMark: String(mark), cancellationMark: cancellationMark(mark),
+        };
+      },
     });
     const cancelled = await db('fiscal_documents').where({ reservation_id: autoReservation.reservationId });
     assert.equal(calls.length, 2);
+    assert.equal(verificationOptions.length, 2);
+    assert(verificationOptions.every((options) => options?.cancellationMark));
     assert(cancelled.every((document) => document.status === 'cancelled'
       && document.cancellation_verification_status === 'verified'));
     assert.equal(Boolean((await db('reservation_snapshots').where({ reservation_id: autoReservation.reservationId }).first()).requires_review), false);
@@ -532,6 +538,7 @@ if (process.env.POSTGRES_INTEGRATION_TEST !== 'true') {
       cancellationVerifier: async () => { throw new Error('duplicate verification'); },
     });
     assert.equal(calls.length, 2);
+    assert.equal(verificationOptions.length, 2);
   });
 
   test('materialization fails closed when a listing is deactivated after staging', async () => {
