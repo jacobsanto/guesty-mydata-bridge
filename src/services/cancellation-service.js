@@ -13,13 +13,14 @@ const { cancelMyDataInvoice, verifyCancelledInvoice } = require('../mydata-clien
 const { assertProductionTransmissionEnabled } = require('../security/production-guard');
 
 async function cancelFiscalDocument({ documentId, canceller = cancelMyDataInvoice }) {
-  await quarantineStaleCancellations(Number(process.env.MYDATA_STALE_CANCELLATION_MINUTES || 60));
-  const document = await getDocumentById(documentId);
+  let document = await getDocumentById(documentId);
   if (!document) {
     const error = new Error('Fiscal document not found');
     error.status = 404;
     throw error;
   }
+  await quarantineStaleCancellations(document.company_id, Number(process.env.MYDATA_STALE_CANCELLATION_MINUTES || 60));
+  document = await getDocumentById(documentId);
   if (document.status === 'cancelled') return document;
   const currentEnvironment = process.env.MYDATA_ENV || 'sandbox';
   if (document.mydata_mark && (document.mydata_environment !== currentEnvironment
@@ -91,6 +92,10 @@ async function reconcileFiscalDocumentCancellation({ documentId, verifier = veri
   const currentEnvironment = process.env.MYDATA_ENV || 'sandbox';
   if (document.mydata_environment !== currentEnvironment || document.target_environment !== currentEnvironment) {
     throw Object.assign(new Error('Fiscal document myDATA environment does not match runtime'), { status: 409 });
+  }
+  if (document.status === 'cancelled' && document.cancellation_status === 'cancelled'
+      && document.cancellation_verification_status === 'verified' && document.cancellation_mark) {
+    return document;
   }
   const uncertain = document.status === 'sent' && document.mydata_mark && document.cancellation_uncertain;
   const awaitingVerification = document.status === 'cancelled' && document.mydata_mark && document.cancellation_mark

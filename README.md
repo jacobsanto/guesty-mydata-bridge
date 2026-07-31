@@ -19,11 +19,14 @@ Multitenant εφαρμογή για ενοικιαζόμενα δωμάτια κ
 - Δημιουργεί ουρά και την αποστέλλει στο ημερήσιο κλείσιμο με τα κρυπτογραφημένα credentials κάθε εταιρείας
 - Υποστηρίζει αυτόματο ημερήσιο scheduler (`DAILY_CLOSE_ENABLED`, ώρα και timezone)
 - Το ημερήσιο κλείσιμο χρησιμοποιεί ανανεούμενο database lease: δεύτερο instance αποκλείεται, ενώ ληγμένο lease μετά από crash ανακτάται χωρίς να μπορεί ο παλιός worker να δηλώσει completion
+- Πριν από κάθε προγραμματισμένο κλείσιμο εκτελεί Guesty reconciliation. Αν το reconciliation αποτύχει, το κλείσιμο αποτυγχάνει κλειστά για όλες τις εταιρείες και δεν στέλνει τα ήδη staged στοιχεία ως δήθεν πλήρη.
+- Οι κρατήσεις που δεν μπορούν να γίνουν stage λόγω άγνωστου/inactive listing ή εταιρείας μένουν σε durable reconciliation inbox. Το cursor μπορεί να προχωρήσει χωρίς να χαθούν: επανελέγχονται στο επόμενο reconciliation ή με ρητό retry endpoint.
 - Επιβεβαιώνει κάθε MARK με `RequestTransmittedDocs` χωρίς επαναποστολή όταν αποτύχει μόνο το verification
 - Αποθηκεύει MARK, UID, QR URL, cancellation MARK, retries και ιστορικό σε SQLite ή PostgreSQL
 - Υποστηρίζει ακύρωση `CancelInvoice` και πιστωτικά `5.1` / `11.4`
-- Παράγει το τελικό PDF μόνο μετά την επιβεβαίωση MARK, με πραγματικό myDATA QR
+- Μετά την επιβεβαίωση MARK αρχειοθετεί ατομικά το ακριβές PDF, SHA-256 και πλήρες issuer/recipient/render snapshot. Το PDF είναι δεσμευμένο στο MARK, δεν αναδημιουργείται από μεταγενέστερο branding και το GET αποτυγχάνει πριν υπάρξει verified archive.
 - Το PDF ΤΑΚΚ κρατά immutable snapshot των ποσών υψηλής/χαμηλής περιόδου και εμφανίζει το σωστό ποσό ανά νύχτα όταν μία διαμονή περνά σε άλλη περίοδο
+- Μετά από επιτυχημένο `CancelInvoice`, το cancellation MARK επαληθεύεται αυτόματα από το επόμενο ημερήσιο κλείσιμο πριν επιτραπούν νέες υποβολές της ίδιας εταιρείας. Παραμένει διαθέσιμη και χειροκίνητη συμφωνία για uncertain/pending περιπτώσεις.
 - Idempotency: duplicate webhooks δεν παράγουν διπλό παραστατικό
 - Svix signature validation για τα τρέχοντα Guesty webhooks (και legacy HMAC compatibility)
 
@@ -95,6 +98,12 @@ adjustments ή deduction flags. Το ποσό προκύπτει μόνο από
 γραμμή, αλλαγή νομίσματος, split/relocation, no-show ή απόκλιση calibration
 στέλνει την κράτηση σε review και δεν δημιουργεί παραστατικό ή ΑΑ.
 
+Το `platform/source` δεν πρέπει να συμπληρώνεται από υπόθεση ή εμπορική ονομασία.
+Καταγράφεται από πραγματική κράτηση του συγκεκριμένου Guesty account. Επομένως
+Booking.com, Airbnb, κάθε άλλο OTA/direct source και το Guesty Booking Engine
+αρχικοποιούνται χωριστά για κάθε listing, ακόμη και όταν εμφανίζουν παρόμοιες
+γραμμές ή ίδιο τελικό ποσό.
+
 ---
 
 ## Migration SQLite → PostgreSQL
@@ -131,7 +140,7 @@ rows με το μεγαλύτερο ήδη εκδομένο ΑΑ, ώστε να 
 | `POST` | `/api/daily-close` | Αποστολή εκκρεμών παραστατικών έως business date |
 | `GET` | `/api/daily-close-runs` | Ιστορικό κλεισιμάτων και αποτελεσμάτων |
 | `GET` | `/api/fiscal-documents` | Κατάλογος παραστατικών και MARK |
-| `GET` | `/api/fiscal-documents/:id/pdf` | PDF μετά το MARK |
+| `GET` | `/api/fiscal-documents/:id/pdf` | Ακριβές archived PDF μόνο μετά από verified MARK/archive |
 | `POST` | `/api/fiscal-documents/:id/cancel` | Πλήρης ακύρωση |
 | `POST` | `/api/fiscal-documents/:id/credit` | Δημιουργία πιστωτικού |
 | `POST` | `/api/fiscal-documents/:id/reconcile-mark` | Συμφωνία αβέβαιης διαβίβασης με επιβεβαιωμένο MARK |
@@ -145,6 +154,8 @@ rows με το μεγαλύτερο ήδη εκδομένο ΑΑ, ώστε να 
 | `POST` | `/api/reservations/:id/resolve-cancellation` | Κλείσιμο ελέγχου ακύρωσης όταν όλα τα παραστατικά έχουν ακυρωθεί |
 | `POST` | `/api/connections/guesty/test` | Read-only Guesty authenticated API test |
 | `POST` | `/api/connections/guesty/reconcile` | Paginated backfill για χαμένα webhooks με persistent cursor |
+| `GET` | `/api/connections/guesty/reconciliation-inbox?status=unresolved` | Durable inbox/DLQ για unmapped/inactive κρατήσεις και αποτυχίες κατά το retry τους |
+| `POST` | `/api/connections/guesty/reconciliation-inbox/retry` | Επανέλεγχος όλων των unresolved inbox entries μετά τη διόρθωση mapping/Guesty |
 | `POST` | `/api/companies/:id/mydata-connection/test` | Read-only myDATA credential test |
 | `GET/POST` | `/api/financial-profiles` | Κατάλογος και νέα versioned profiles ποσών |
 | `PATCH` | `/api/financial-profiles/:id` | Ενημέρωση μόνο draft profile |
@@ -155,7 +166,8 @@ rows με το μεγαλύτερο ήδη εκδομένο ΑΑ, ώστε να 
 | `GET/POST` | `/api/sandbox-signoffs` | Αμετάβλητη έγκριση verified κύριου + ΤΑΚΚ και hashes PDF |
 | `GET` | `/api/sandbox-acceptance/requirements` | Capability matrix sandbox ανά εταιρεία |
 | `GET/POST` | `/api/sandbox-acceptance/runs` | Immutable λογιστική έγκριση sandbox evidence |
-| `GET` | `/api/readiness` | Sandbox/production preflight ανά εταιρεία και κατάλυμα |
+| `GET` | `/api/readiness` | Συνολικό sandbox/production preflight |
+| `GET` | `/api/readiness?company_id=:id` | Tenant-scoped preflight· πρόβλημα άλλου ΑΦΜ δεν μπλοκάρει την υποβολή της εταιρείας |
 
 ---
 
@@ -186,6 +198,21 @@ npm run test:xsd
 ## Πριν από production
 
 Διάβασε και ολοκλήρωσε το [myDATA v2.0.1 readiness baseline](docs/mydata-v2.0.1-readiness.md). Το production circuit breaker απαιτεί ρητά `MYDATA_PRODUCTION_ENABLED=true`, πέρα από `MYDATA_ENV=production`.
+
+### Εξωτερικές προϋποθέσεις και σημερινά όρια
+
+Το repository δεν αποτελεί από μόνο του production ενεργοποίηση. Απαιτούνται
+πραγματικά Guesty OAuth/webhook credentials, ανά-εταιρεία production credentials
+ΑΑΔΕ, δημόσιο HTTPS endpoint, PostgreSQL με επιβεβαιωμένα backups/restore,
+πραγματικό Guesty calibration ανά `listing/platform/source` και λογιστική
+έγκριση sandbox evidence για όλες τις οικογένειες παραστατικών.
+
+Σήμερα δεν παρέχονται ακόμη αποστολή PDF με email ή Guesty messaging, delivery
+outbox/bounce tracking, χρήστες/RBAC ανά εταιρεία, εξωτερικό durable scheduler,
+αυτόματα off-site backups ή ολοκληρωμένα metrics/alerts. Το admin API
+προστατεύεται από ένα κοινό bearer token και ο scheduler τρέχει μέσα στο μοναδικό
+web process. Αυτά είναι ρητά production-operability gaps και όχι ολοκληρωμένες
+δυνατότητες.
 
 ## Deployment
 

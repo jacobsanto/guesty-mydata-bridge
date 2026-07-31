@@ -14,32 +14,78 @@ function validationError(check) {
   try { check(); return null; } catch (error) { return error.message; }
 }
 
-async function getReadiness() {
-  const [companies, listings, rules, legacyRuleCountRow, financialProfiles, observedChannels, reviewCountRow, uncertainCountRow, cancellationUncertainCountRow, cancellationUnverifiedCountRow, environmentMismatchRows, checks] = await Promise.all([
-    db('companies').where({ active: true }).select('*'),
-    db('listings').where({ active: true }).select('*'),
-    db('listing_channel_billing_rules').where({ active: true }).select('*'),
-    db('listing_billing_rules').where({ active: true }).count({ count: '*' }).first(),
-    db('financial_profiles').select('id', 'listing_id', 'platform_key', 'source_key', 'version', 'status', 'line_rules', 'minimum_samples'),
-    db('reservation_snapshots')
+function normalizeCompanyId(companyId) {
+  if (companyId === null || companyId === undefined) return null;
+  const normalized = Number(companyId);
+  if (!Number.isInteger(normalized) || normalized <= 0) {
+    throw Object.assign(new Error('companyId must be a positive integer'), { status: 400 });
+  }
+  return normalized;
+}
+
+async function getReadiness({ companyId = null } = {}) {
+  const scopedCompanyId = normalizeCompanyId(companyId);
+  const companiesQuery = db('companies').where({ active: true }).select('*');
+  const listingsQuery = db('listings').where({ active: true }).select('*');
+  const rulesQuery = db('listing_channel_billing_rules as r')
+    .join('listings as l', 'l.id', 'r.listing_id')
+    .where({ 'r.active': true })
+    .select('r.*');
+  const legacyRulesQuery = db('listing_billing_rules as r')
+    .join('listings as l', 'l.id', 'r.listing_id')
+    .where({ 'r.active': true })
+    .count({ count: '*' })
+    .first();
+  const financialProfilesQuery = db('financial_profiles as p')
+    .join('listings as l', 'l.id', 'p.listing_id')
+    .select('p.id', 'p.listing_id', 'p.platform_key', 'p.source_key', 'p.version', 'p.status', 'p.line_rules', 'p.minimum_samples');
+  const observedChannelsQuery = db('reservation_snapshots')
       .whereIn('status', ['confirmed', 'checked_out'])
       .whereNull('materialized_at')
       .select('listing_id', 'listing_id_guesty', 'platform_key', 'source_key')
-      .groupBy('listing_id', 'listing_id_guesty', 'platform_key', 'source_key'),
-    db('reservation_snapshots').where({ requires_review: true }).count({ count: '*' }).first(),
-    db('fiscal_documents').where({ transmission_uncertain: true }).count({ count: '*' }).first(),
-    db('fiscal_documents').where({ cancellation_uncertain: true }).count({ count: '*' }).first(),
-    db('fiscal_documents')
+      .groupBy('listing_id', 'listing_id_guesty', 'platform_key', 'source_key');
+  const reviewCountQuery = db('reservation_snapshots').where({ requires_review: true }).count({ count: '*' }).first();
+  const uncertainCountQuery = db('fiscal_documents').where({ transmission_uncertain: true }).count({ count: '*' }).first();
+  const cancellationUncertainCountQuery = db('fiscal_documents').where({ cancellation_uncertain: true }).count({ count: '*' }).first();
+  const cancellationUnverifiedCountQuery = db('fiscal_documents')
       .where({ status: 'cancelled', cancellation_status: 'cancelled' })
       .whereNot({ cancellation_verification_status: 'verified' })
-      .count({ count: '*' }).first(),
-    db('fiscal_documents')
+      .count({ count: '*' }).first();
+  const environmentMismatchQuery = db('fiscal_documents')
       .whereIn('status', ['pending', 'failed', 'transmitting'])
       .where((query) => query.whereNull('target_environment').orWhereNot({ target_environment: 'production' }))
       .select('company_id', 'target_environment')
-      .groupBy('company_id', 'target_environment'),
-    listIntegrationChecks(),
+      .groupBy('company_id', 'target_environment');
+
+  if (scopedCompanyId !== null) {
+    companiesQuery.where({ id: scopedCompanyId });
+    listingsQuery.where({ company_id: scopedCompanyId });
+    rulesQuery.where({ 'l.company_id': scopedCompanyId });
+    legacyRulesQuery.where({ 'l.company_id': scopedCompanyId });
+    financialProfilesQuery.where({ 'l.company_id': scopedCompanyId });
+    observedChannelsQuery.where({ company_id: scopedCompanyId });
+    reviewCountQuery.where({ company_id: scopedCompanyId });
+    uncertainCountQuery.where({ company_id: scopedCompanyId });
+    cancellationUncertainCountQuery.where({ company_id: scopedCompanyId });
+    cancellationUnverifiedCountQuery.where({ company_id: scopedCompanyId });
+    environmentMismatchQuery.where({ company_id: scopedCompanyId });
+  }
+
+  const [companies, listings, rules, legacyRuleCountRow, financialProfiles, observedChannels, reviewCountRow, uncertainCountRow, cancellationUncertainCountRow, cancellationUnverifiedCountRow, environmentMismatchRows, allChecks] = await Promise.all([
+    companiesQuery,
+    listingsQuery,
+    rulesQuery,
+    legacyRulesQuery,
+    financialProfilesQuery,
+    observedChannelsQuery,
+    reviewCountQuery,
+    uncertainCountQuery,
+    cancellationUncertainCountQuery,
+    cancellationUnverifiedCountQuery,
+    environmentMismatchQuery,
+    listIntegrationChecks(scopedCompanyId === null ? undefined : { companyId: scopedCompanyId }),
   ]);
+  const checks = allChecks;
   const acceptance = await getAcceptanceMatrices(companies);
   const issues = [];
   const freshAfter = Date.now() - 24 * 60 * 60 * 1000;
@@ -76,6 +122,9 @@ async function getReadiness() {
     if (!activeCompanyIds.has(Number(listing.company_id))) issues.push(issue('inactive_company', `${listing.listing_id_guesty}: η συνδεδεμένη εταιρεία δεν είναι ενεργή`, scope));
     for (const field of ['climate_fee_high', 'climate_fee_low', 'climate_fee_high_category', 'climate_fee_low_category']) {
       if (listing[field] === null || listing[field] === undefined) issues.push(issue('takk_config', `${listing.listing_id_guesty}: λείπει ${field}`, scope));
+    }
+    if (Number(listing.climate_fee_high) <= 0 || Number(listing.climate_fee_low) <= 0) {
+      issues.push(issue('takk_amount', `${listing.listing_id_guesty}: τα ποσά ΤΑΚΚ υψηλής/χαμηλής περιόδου πρέπει να είναι θετικά για ενεργό κατάλυμα`, scope));
     }
     const categoryError = validationError(() => validateAccommodationClimatePair(
       listing.property_type, listing.climate_fee_high_category, listing.climate_fee_low_category,

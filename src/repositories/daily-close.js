@@ -3,6 +3,7 @@
 const crypto = require('crypto');
 const { db } = require('../database');
 const { insertedId } = require('../database-utils');
+const { insertFiscalPdfArtifactOnce } = require('./fiscal-pdf-artifacts');
 
 function leaseExpiry(leaseSeconds) {
   return Date.now() + leaseSeconds * 1000;
@@ -140,6 +141,10 @@ async function recordVerificationResult(runId, documentId, mark, outcome, leaseT
       error.status = 409;
       throw error;
     }
+    if (verified) {
+      if (!outcome.artifact) throw new Error('Verified fiscal document requires an immutable PDF artifact');
+      await insertFiscalPdfArtifactOnce(outcome.artifact, trx);
+    }
     await trx('daily_close_items')
       .insert({
         run_id: runId,
@@ -180,7 +185,8 @@ async function finishRun(runId, counts, leaseToken) {
         .whereIn('d.status', ['pending', 'failed', 'transmitting'])
         .orWhere((sent) => sent.where({ 'd.status': 'sent' }).andWhere((verification) => verification
           .whereNot({ 'd.verification_status': 'verified' })
-          .orWhereNull('d.verification_status')))
+          .orWhereNull('d.verification_status')
+          .orWhereNotExists(trx('fiscal_pdf_artifacts as pdf').select(trx.raw('1')).whereRaw('pdf.document_id = d.id'))))
         .orWhereExists(trx('reservation_snapshots as review')
           .select(trx.raw('1'))
           .whereRaw('review.reservation_id = d.reservation_id')
@@ -188,11 +194,12 @@ async function finishRun(runId, counts, leaseToken) {
       .forUpdate()
       .select(
         'd.id', 'd.status', 'd.verification_status',
+        trx.raw('EXISTS (SELECT 1 FROM fiscal_pdf_artifacts pdf_state WHERE pdf_state.document_id = d.id) AS has_pdf_artifact'),
         trx.raw('EXISTS (SELECT 1 FROM reservation_snapshots review_state WHERE review_state.reservation_id = d.reservation_id AND review_state.requires_review = ?) AS requires_review', [true]),
       );
     const items = await trx('daily_close_items').where({ run_id: runId }).select('document_id', 'result');
     const verifiedCount = items.filter((item) => item.result === 'verified').length;
-    const failedItemCount = items.filter((item) => ['failed', 'blocked', 'verification_failed'].includes(item.result)).length;
+    const failedItemCount = items.filter((item) => ['failed', 'blocked', 'verification_failed', 'artifact_failed'].includes(item.result)).length;
     const inFlightCount = items.filter((item) => item.result === 'in_flight').length;
     const failedCount = failedItemCount + materializationFailures;
     const itemsByDocument = new Map(items.map((item) => [Number(item.document_id), item.result]));
@@ -201,7 +208,8 @@ async function finishRun(runId, counts, leaseToken) {
       if (!result) return true;
       if (result === 'in_flight') return true;
       if (result === 'verified') {
-        return document.status !== 'sent' || document.verification_status !== 'verified' || Boolean(document.requires_review);
+        return document.status !== 'sent' || document.verification_status !== 'verified'
+          || !Boolean(document.has_pdf_artifact) || Boolean(document.requires_review);
       }
       return false;
     });

@@ -43,11 +43,23 @@ async function runScheduledDailyClose({
   const businessDate = scheduledBusinessDate(now, timeZone, closeTime);
   const companies = (await listCompanies()).filter((company) => company.active);
   const results = [];
-  let reconciliationWarning = null;
   // Reconcile before deciding that a completed close has no new work. A late
   // webhook/backfill can stage a due reservation that has no fiscal row yet.
+  // A failed reconciliation makes that decision unsafe in every environment:
+  // sandbox may report the error, but it must not transmit stale staged work.
   if (companies.length && process.env.GUESTY_CLIENT_ID && process.env.GUESTY_CLIENT_SECRET) {
-    try { await reconciler(); } catch (error) { reconciliationWarning = `Guesty reconciliation failed: ${error.message}`; }
+    try {
+      await reconciler();
+    } catch (error) {
+      const message = `Guesty reconciliation failed: ${error.message}`;
+      return companies.map((company) => ({
+        companyId: company.id,
+        businessDate,
+        skipped: true,
+        status: 'error',
+        error: message,
+      }));
+    }
   }
   let guestyChecked = false;
   for (const company of companies) {
@@ -63,7 +75,7 @@ async function runScheduledDailyClose({
         await myDataConnectionTest(company.id);
       }
       const run = await executor({ companyId: company.id, businessDate });
-      results.push({ companyId: company.id, businessDate, skipped: false, status: run.status, ...(reconciliationWarning ? { warning: reconciliationWarning } : {}) });
+      results.push({ companyId: company.id, businessDate, skipped: false, status: run.status });
     } catch (error) {
       results.push({ companyId: company.id, businessDate, skipped: false, status: 'error', error: error.message });
     }

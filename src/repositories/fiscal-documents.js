@@ -3,6 +3,7 @@
 const crypto = require('crypto');
 const { db } = require('../database');
 const { insertedId } = require('../database-utils');
+const { insertFiscalPdfArtifactOnce } = require('./fiscal-pdf-artifacts');
 
 async function nextDocumentNumber(trx, companyId, documentType, series) {
   await trx('document_sequences').insert({
@@ -207,10 +208,34 @@ async function hasDueFiscalWork(companyId, businessDate, client = db) {
       .whereIn('d.status', ['pending', 'failed', 'transmitting'])
       .orWhere((sent) => sent.where({ 'd.status': 'sent' }).andWhere((verification) => verification
         .whereNot({ 'd.verification_status': 'verified' })
-        .orWhereNull('d.verification_status')))
+        .orWhereNull('d.verification_status')
+        .orWhereNotExists(client('fiscal_pdf_artifacts as pdf').select(client.raw('1')).whereRaw('pdf.document_id = d.id'))))
       .orWhere({ 'review.requires_review': true }))
     .first('d.id');
   if (row) return true;
+  const pendingCancellation = await client('fiscal_documents')
+    .where({
+      company_id: companyId,
+      status: 'cancelled',
+      cancellation_status: 'cancelled',
+      target_environment: process.env.MYDATA_ENV || 'sandbox',
+      mydata_environment: process.env.MYDATA_ENV || 'sandbox',
+    })
+    .where('issue_date', '<=', businessDate)
+    .whereNotNull('mydata_mark')
+    .whereNotNull('cancellation_mark')
+    .whereNot({ cancellation_verification_status: 'verified' })
+    .first('id');
+  if (pendingCancellation) return true;
+  const requestedCancellation = await client('fiscal_documents')
+    .where({ company_id: companyId, status: 'sent' })
+    .where('issue_date', '<=', businessDate)
+    .whereNotNull('mydata_mark')
+    .where((query) => query
+      .where({ cancellation_status: 'requested' })
+      .orWhere((retryable) => retryable.where({ cancellation_status: 'failed', cancellation_retryable: true, cancellation_uncertain: false })))
+    .first('id');
+  if (requestedCancellation) return true;
   const snapshot = await client('reservation_snapshots')
     .where({ company_id: companyId, requires_review: false })
     .whereNull('materialized_at')
@@ -290,12 +315,35 @@ async function listUnverifiedDocuments(companyId, businessDate) {
     .orderBy('id', 'asc');
 }
 
-async function markDocumentVerified(id) {
-  await db('fiscal_documents').where({ id }).update({
-    verification_status: 'verified',
-    verification_error: null,
-    verified_at: db.fn.now(),
-    updated_at: db.fn.now(),
+async function listVerifiedDocumentsMissingPdfArtifact(companyId, businessDate) {
+  return db('fiscal_documents as d')
+    .where({ 'd.company_id': companyId, 'd.status': 'sent', 'd.verification_status': 'verified' })
+    .where('d.issue_date', '<=', businessDate)
+    .whereNotNull('d.mydata_mark')
+    .where((query) => query.whereNull('d.cancellation_status').orWhere({ 'd.cancellation_status': 'none' }))
+    .whereNotExists(db('fiscal_pdf_artifacts as pdf').select(db.raw('1')).whereRaw('pdf.document_id = d.id'))
+    .select('d.*')
+    .orderBy('d.issue_date', 'asc')
+    .orderBy('d.id', 'asc');
+}
+
+async function markDocumentVerified(id, artifact) {
+  if (!artifact) throw new Error('Verified fiscal document requires an immutable PDF artifact');
+  return db.transaction(async (trx) => {
+    const document = await trx('fiscal_documents').where({ id, status: 'sent' }).forUpdate().first();
+    if (!document?.mydata_mark || String(document.mydata_mark) !== String(artifact.mark)) {
+      const error = new Error('PDF artifact MARK does not match the fiscal document');
+      error.status = 409;
+      throw error;
+    }
+    await trx('fiscal_documents').where({ id }).update({
+      verification_status: 'verified',
+      verification_error: null,
+      verified_at: db.fn.now(),
+      updated_at: db.fn.now(),
+    });
+    await insertFiscalPdfArtifactOnce(artifact, trx);
+    return trx('fiscal_documents').where({ id }).first();
   });
 }
 
@@ -361,7 +409,7 @@ async function claimDocumentCancellation(id, expectedEnvironment = process.env.M
       error.status = 409;
       throw error;
     }
-    const eligible = ['none', null].includes(document.cancellation_status)
+    const eligible = ['none', null, 'requested'].includes(document.cancellation_status)
       || (document.cancellation_status === 'failed' && document.cancellation_retryable && !document.cancellation_uncertain);
     if (!eligible) return null;
     await trx('fiscal_documents').where({ id: document.id }).update({
@@ -374,9 +422,11 @@ async function claimDocumentCancellation(id, expectedEnvironment = process.env.M
   });
 }
 
-async function quarantineStaleCancellations(staleMinutes = 60) {
+async function quarantineStaleCancellations(companyId, staleMinutes = 60) {
+  const normalizedCompanyId = Number(companyId);
+  if (!Number.isInteger(normalizedCompanyId) || normalizedCompanyId <= 0) throw new Error('companyId must be a positive integer');
   const staleBefore = new Date(Date.now() - Number(staleMinutes) * 60 * 1000).toISOString().slice(0, 19).replace('T', ' ');
-  return db('fiscal_documents').where({ status: 'sent', cancellation_status: 'transmitting' })
+  return db('fiscal_documents').where({ company_id: normalizedCompanyId, status: 'sent', cancellation_status: 'transmitting' })
     .where('cancellation_attempt_at', '<', staleBefore)
     .update({
       cancellation_status: 'failed', cancellation_retryable: false, cancellation_uncertain: true,
@@ -504,6 +554,40 @@ async function listCancellationResolutionEvents(documentId) {
     .orderBy('id', 'desc');
 }
 
+async function listPendingCancellationVerifications(companyId, businessDate, {
+  targetEnvironment = process.env.MYDATA_ENV || 'sandbox', client = db,
+} = {}) {
+  return client('fiscal_documents')
+    .where({
+      company_id: companyId,
+      status: 'cancelled',
+      cancellation_status: 'cancelled',
+      target_environment: targetEnvironment,
+      mydata_environment: targetEnvironment,
+    })
+    .where('issue_date', '<=', businessDate)
+    .whereNotNull('mydata_mark')
+    .whereNotNull('cancellation_mark')
+    .whereNot({ cancellation_verification_status: 'verified' })
+    .orderBy('issue_date', 'asc')
+    .orderBy('id', 'asc');
+}
+
+async function listAutomaticCancellationWork(companyId, businessDate, {
+  targetEnvironment = process.env.MYDATA_ENV || 'sandbox', client = db,
+} = {}) {
+  return client('fiscal_documents')
+    .where({ company_id: companyId, status: 'sent', target_environment: targetEnvironment, mydata_environment: targetEnvironment })
+    .whereIn('document_type', ['11.2', '2.1', '8.2'])
+    .where('issue_date', '<=', businessDate)
+    .whereNotNull('mydata_mark')
+    .where((query) => query
+      .where({ cancellation_status: 'requested' })
+      .orWhere((retryable) => retryable.where({ cancellation_status: 'failed', cancellation_retryable: true, cancellation_uncertain: false })))
+    .orderBy('issue_date', 'asc')
+    .orderBy('id', 'asc');
+}
+
 function timestampsEquivalent(actual, expected) {
   if (String(actual) === String(expected)) return true;
   const actualMs = Date.parse(actual instanceof Date ? actual.toISOString() : String(actual));
@@ -598,6 +682,24 @@ async function cancelPendingReservationDocuments(reservationId, client = db) {
     .update({ status: 'cancelled', cancellation_status: 'cancelled', cancelled_at: client.fn.now(), updated_at: client.fn.now() });
 }
 
+async function queueReservationDocumentCancellations(reservationId, client = db) {
+  return client('fiscal_documents')
+    .where({ reservation_id: reservationId })
+    .whereIn('document_type', ['11.2', '2.1', '8.2'])
+    .whereNot({ status: 'cancelled' })
+    .where((query) => query
+      .whereIn('status', ['sent', 'transmitting'])
+      .orWhere({ transmission_uncertain: true }))
+    .where((query) => query.whereNull('cancellation_status').orWhere({ cancellation_status: 'none' }))
+    .update({
+      cancellation_status: 'requested',
+      cancellation_error: null,
+      cancellation_retryable: true,
+      cancellation_uncertain: false,
+      updated_at: client.fn.now(),
+    });
+}
+
 module.exports = {
   createDocumentOnce,
   findDocumentByKey,
@@ -620,9 +722,13 @@ module.exports = {
   markCancellationVerified,
   getCancellationResolutionEvent,
   listCancellationResolutionEvents,
+  listPendingCancellationVerifications,
+  listAutomaticCancellationWork,
   resolveDefinitiveCancellationFailure,
   cancelPendingReservationDocuments,
+  queueReservationDocumentCancellations,
   listUnverifiedDocuments,
+  listVerifiedDocumentsMissingPdfArtifact,
   markDocumentVerified,
   markVerificationFailed,
 };

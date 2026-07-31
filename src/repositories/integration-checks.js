@@ -56,21 +56,27 @@ async function releaseGuestyWebhookEvent(eventId) {
   return db('integration_checks').where({ check_key: webhookCheckKey(eventId), status: 'processing' }).delete();
 }
 
-async function recordIntegrationCheck(checkKey, status, environment = null, message = null) {
+async function recordIntegrationCheck(checkKey, status, environment = null, message = null, client = db) {
   const row = {
     check_key: checkKey,
     status,
     environment,
     message: message ? String(message).slice(0, 1000) : null,
-    checked_at: db.fn.now(),
-    updated_at: db.fn.now(),
+    checked_at: client.fn.now(),
+    updated_at: client.fn.now(),
   };
-  await db('integration_checks').insert(row).onConflict('check_key').merge(row);
-  return db('integration_checks').where({ check_key: checkKey }).first();
+  await client('integration_checks').insert(row).onConflict('check_key').merge(row);
+  return client('integration_checks').where({ check_key: checkKey }).first();
 }
 
-async function listIntegrationChecks() {
-  return db('integration_checks').select('*').orderBy('check_key');
+async function listIntegrationChecks({ companyId = null } = {}) {
+  const query = db('integration_checks').select('*').orderBy('check_key');
+  if (companyId !== null && companyId !== undefined) {
+    query.where((scope) => scope
+      .where({ check_key: 'guesty' })
+      .orWhere('check_key', 'like', `mydata:${Number(companyId)}:%`));
+  }
+  return query;
 }
 
 async function deleteIntegrationChecks(prefix) {

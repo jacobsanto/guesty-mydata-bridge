@@ -186,6 +186,10 @@ function reservationRow(payload, reservationId) {
   return rows[0];
 }
 
+function isCancelledReservation(reservation) {
+  return ['cancelled', 'canceled'].includes(String(reservation?.status || '').trim().toLowerCase());
+}
+
 async function fetchConsistentReservationSnapshot(reservationId, { get, config = {}, maxAttempts = 3 } = {}) {
   if (typeof get !== 'function') throw new Error('Guesty HTTP getter is required');
   if (!Number.isInteger(maxAttempts) || maxAttempts < 1 || maxAttempts > 5) throw new Error('Guesty snapshot maxAttempts must be 1-5');
@@ -203,20 +207,30 @@ async function fetchConsistentReservationSnapshot(reservationId, { get, config =
   });
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    // Cancellation is authoritative reservation lifecycle state and remains
+    // available after Guesty removes or withholds Guest Folio resources. Read
+    // the core reservation twice first, so a stable cancellation can be
+    // ingested without ever depending on a folio endpoint.
+    const reservationBefore = reservationRow((await reservationRequest()).data, reservationId);
+    const reservationCandidate = reservationRow((await reservationRequest()).data, reservationId);
+    if (fiscalVersion(reservationBefore) !== fiscalVersion(reservationCandidate)) continue;
+    if (isCancelledReservation(reservationCandidate)) {
+      return { ...reservationCandidate, authoritativeCancellation: true };
+    }
+
     // Read the folio twice as well as bracketing it with reservation/overview.
     // Guesty can change invoice items without exposing the mutation in either
     // surrounding payload, so all three fiscal views must remain identical.
-    const [reservationBeforeResponse, overviewBeforeResponse] = await Promise.all([reservationRequest(), overviewRequest()]);
+    const overviewBeforeResponse = await overviewRequest();
     const invoiceItemsBeforeResponse = await invoiceItemsRequest();
     const invoiceItemsAfterResponse = await invoiceItemsRequest();
     const [reservationAfterResponse, overviewAfterResponse] = await Promise.all([reservationRequest(), overviewRequest()]);
-    const reservationBefore = reservationRow(reservationBeforeResponse.data, reservationId);
     const reservationAfter = reservationRow(reservationAfterResponse.data, reservationId);
     const overviewBefore = requireFolioResult(overviewBeforeResponse.data, reservationId, 'overview');
     const overviewAfter = requireFolioResult(overviewAfterResponse.data, reservationId, 'overview');
     const invoiceFolioBefore = requireFolioResult(invoiceItemsBeforeResponse.data, reservationId, 'invoice items');
     const invoiceFolio = requireFolioResult(invoiceItemsAfterResponse.data, reservationId, 'invoice items');
-    if (fiscalVersion(reservationBefore) !== fiscalVersion(reservationAfter)
+    if (fiscalVersion(reservationCandidate) !== fiscalVersion(reservationAfter)
         || fiscalVersion(overviewBefore) !== fiscalVersion(overviewAfter)
         || fiscalVersion(invoiceFolioBefore) !== fiscalVersion(invoiceFolio)) {
       continue;

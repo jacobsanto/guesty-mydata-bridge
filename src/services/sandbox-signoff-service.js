@@ -3,7 +3,7 @@
 const crypto = require('crypto');
 const { db } = require('../database');
 const { getDocumentById } = require('../repositories/fiscal-documents');
-const { renderFiscalDocumentPdf } = require('./pdf-service');
+const { getFiscalPdfArtifact } = require('../repositories/fiscal-pdf-artifacts');
 const { companyCredentialBinding } = require('../security/credentials');
 
 function bad(message, status = 400) { return Object.assign(new Error(message), { status }); }
@@ -43,7 +43,12 @@ async function createSandboxSignoff(payload) {
   const reservationId = String(primary?.reservation_id || '');
   assertSandboxDocument(primary, 'primary', companyId, reservationId);
   assertSandboxDocument(takk, 'TAKK', companyId, reservationId);
-  const [primaryPdf, takkPdf] = await Promise.all([renderFiscalDocumentPdf(primary.id), renderFiscalDocumentPdf(takk.id)]);
+  const [primaryPdf, takkPdf] = await Promise.all([getFiscalPdfArtifact(primary.id), getFiscalPdfArtifact(takk.id)]);
+  if (!primaryPdf || !takkPdf) throw bad('Sandbox sign-off requires archived PDF artifacts', 409);
+  if (String(primaryPdf.mydata_mark) !== String(primary.mydata_mark)
+      || String(takkPdf.mydata_mark) !== String(takk.mydata_mark)) {
+    throw bad('Sandbox sign-off PDF artifacts do not match their document MARKs', 409);
+  }
   const company = await db('companies').where({ id: companyId }).first();
   if (!company) throw bad('Sandbox sign-off company not found', 404);
   const row = {
@@ -52,8 +57,8 @@ async function createSandboxSignoff(payload) {
     credential_binding_sha256: companyCredentialBinding(company),
     primary_document_id: primary.id, takk_document_id: takk.id,
     primary_mark: String(primary.mydata_mark), takk_mark: String(takk.mydata_mark),
-    primary_pdf_sha256: crypto.createHash('sha256').update(primaryPdf).digest('hex'),
-    takk_pdf_sha256: crypto.createHash('sha256').update(takkPdf).digest('hex'),
+    primary_pdf_sha256: primaryPdf.pdf_sha256,
+    takk_pdf_sha256: takkPdf.pdf_sha256,
     primary_xml_sha256: sha256(primary.xml_payload),
     takk_xml_sha256: sha256(takk.xml_payload),
     primary_response_sha256: sha256(primary.mydata_response),

@@ -8,6 +8,7 @@ const {
 const { decryptCompanySecret } = require('../security/credentials');
 const { verifyTransmittedDocument } = require('../mydata-client');
 const { assertSameFiscalIdentity } = require('../validation/mydata-identity');
+const { prepareFiscalDocumentPdfArtifact } = require('./pdf-service');
 
 function conflict(message) {
   return Object.assign(new Error(message), { status: 409 });
@@ -40,7 +41,13 @@ async function reconcileUncertainTransmission({ documentId, mark, verifier = ver
     qrUrl: result.raw.qrUrl || null,
     raw: { reconciledFromRequestTransmittedDocs: true, invoice: result.raw },
   }, { reconciled: true });
-  await markDocumentVerified(document.id);
+  const artifact = await prepareFiscalDocumentPdfArtifact(document.id, {
+    verified: true,
+    mark: numericMark,
+    uid: result.uid || result.raw.uid || null,
+    qrUrl: result.raw.qrUrl || null,
+  });
+  await markDocumentVerified(document.id, artifact);
   return getDocumentById(document.id);
 }
 

@@ -133,9 +133,46 @@ function fiscalGuest(guest) {
   return fullName ? { fullName: String(fullName).slice(0, 200) } : null;
 }
 
+function normalizeAuthoritativeCancellation(raw) {
+  const checkIn = dateOnly(raw.checkInDateLocalized || raw.checkIn);
+  const checkOut = dateOnly(raw.checkOutDateLocalized || raw.checkOut);
+  const reservationId = raw._id || raw.reservationId || raw.id;
+  const listingId = typeof raw.listingId === 'object'
+    ? (raw.listingId?._id || raw.listingId?.id)
+    : raw.listingId;
+  const status = String(raw.status || '').trim().toLowerCase();
+  if (!['cancelled', 'canceled'].includes(status)) {
+    throw new Error('Guesty authoritative cancellation has a non-cancelled status');
+  }
+  if (!reservationId || !listingId || !checkIn || !checkOut) {
+    throw new Error('Guesty cancellation is missing reservation id, listing id, or localized stay dates');
+  }
+  const derivedNights = nightsBetween(checkIn, checkOut);
+  return {
+    reservationId: String(reservationId),
+    listingId: String(listingId),
+    status,
+    checkIn,
+    checkOut,
+    nights: derivedNights,
+    financials: { amountSource: 'authoritative_cancellation' },
+    fiscalInvoiceItems: [],
+    guest: fiscalGuest(raw.guest),
+    platform: null,
+    source: null,
+    platformKey: null,
+    sourceKey: null,
+    guestStayStatus: raw.guestStay?.status ? String(raw.guestStay.status).trim().toLowerCase() : null,
+    stayEvidence: null,
+    folioOverview: null,
+    authoritativeCancellation: true,
+  };
+}
+
 function normalizeGuestyReservation(payload) {
   const raw = payload?.reservation || payload;
   if (!raw || typeof raw !== 'object') throw new Error('Guesty reservation payload is missing');
+  if (raw.authoritativeCancellation === true) return normalizeAuthoritativeCancellation(raw);
   if (!Object.prototype.hasOwnProperty.call(raw, 'fiscalFolioOverview')) {
     throw new Error('Guesty authoritative Guest Folio overview is required');
   }
@@ -144,8 +181,8 @@ function normalizeGuestyReservation(payload) {
   }
   const checkIn = dateOnly(raw.checkInDateLocalized || raw.checkIn);
   const checkOut = dateOnly(raw.checkOutDateLocalized || raw.checkOut);
-  const reservationId = raw._id || raw.reservationId;
-  const listingId = typeof raw.listingId === 'object' ? raw.listingId?._id : raw.listingId;
+  const reservationId = raw._id || raw.reservationId || raw.id;
+  const listingId = typeof raw.listingId === 'object' ? (raw.listingId?._id || raw.listingId?.id) : raw.listingId;
   if (!reservationId || !listingId || !checkIn || !checkOut) {
     throw new Error('Guesty payload is missing reservation id, listing id, or localized stay dates');
   }

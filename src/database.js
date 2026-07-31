@@ -1,6 +1,7 @@
 'use strict';
 
 require('dotenv').config();
+const crypto = require('crypto');
 const knex = require('knex');
 const { insertedId } = require('./database-utils');
 const { encryptSecret, reencryptSecret, isEncrypted, companySecretContext } = require('./security/credentials');
@@ -107,6 +108,7 @@ async function initializeSchemaObjects() {
   await ensureLegacyTenantsTable();
   await ensureInvoicesTable();
   await ensureFiscalDocumentsTable();
+  await ensureFiscalPdfArtifactsTable();
   await ensureCancellationResolutionEventsTable();
   await ensureDocumentSequencesTable();
   await ensureDailyCloseTables();
@@ -115,6 +117,7 @@ async function initializeSchemaObjects() {
   await ensureSandboxSignoffsTable();
   await ensureSandboxAcceptanceTables();
   await ensureSyncCursorsTable();
+  await ensureGuestyReconciliationInboxTable();
   await ensureUniqueIndex(
     'fiscal_documents',
     'fiscal_documents_company_type_series_aa_uq',
@@ -148,6 +151,24 @@ async function ensureSyncCursorsTable() {
     t.primary(['provider', 'cursor_key']);
   });
   console.log('✅ Δημιουργήθηκε πίνακας: sync_cursors');
+}
+
+async function ensureGuestyReconciliationInboxTable() {
+  if (await db.schema.hasTable('guesty_reconciliation_inbox')) return;
+  await db.schema.createTable('guesty_reconciliation_inbox', (t) => {
+    t.increments('id').primary();
+    t.string('reservation_id', 120).notNullable().unique();
+    t.string('listing_id', 120).nullable().index();
+    t.string('status', 20).notNullable().defaultTo('unresolved').index();
+    t.string('reason', 40).notNullable();
+    t.integer('attempts').notNullable().defaultTo(1);
+    t.text('last_error').nullable();
+    t.timestamp('first_seen_at').notNullable().defaultTo(db.fn.now());
+    t.timestamp('last_seen_at').notNullable().defaultTo(db.fn.now());
+    t.timestamp('resolved_at').nullable();
+    t.timestamps(true, true);
+  });
+  console.log('✅ Δημιουργήθηκε πίνακας: guesty_reconciliation_inbox');
 }
 
 async function ensureCancellationResolutionEventsTable() {
@@ -656,6 +677,89 @@ async function ensureFiscalDocumentsTable() {
     t.foreign('related_document_id').references('fiscal_documents.id').onDelete('RESTRICT');
   });
   console.log('✅ Δημιουργήθηκε πίνακας: fiscal_documents');
+}
+
+async function ensureFiscalPdfArtifactsTable() {
+  if (!await db.schema.hasTable('fiscal_pdf_artifacts')) {
+    await db.schema.createTable('fiscal_pdf_artifacts', (t) => {
+      t.increments('id').primary();
+      t.integer('document_id').unsigned().notNullable().unique();
+      t.integer('company_id').unsigned().notNullable().index();
+      t.string('mydata_mark', 30).notNullable();
+      t.string('mydata_uid', 50).nullable();
+      t.string('pdf_sha256', 64).notNullable();
+      t.binary('pdf_bytes').notNullable();
+      t.text('render_snapshot').notNullable();
+      t.string('render_snapshot_sha256', 64).notNullable();
+      t.string('render_version', 30).notNullable().defaultTo('fiscal-pdf-v1');
+      t.timestamp('archived_at').notNullable().defaultTo(db.fn.now());
+      t.foreign('document_id').references('fiscal_documents.id').onDelete('RESTRICT');
+      t.foreign('company_id').references('companies.id').onDelete('RESTRICT');
+    });
+    console.log('✅ Δημιουργήθηκε πίνακας: fiscal_pdf_artifacts');
+  } else {
+    await ensureColumn('fiscal_pdf_artifacts', 'render_snapshot_sha256', (t) => t.string('render_snapshot_sha256', 64).nullable());
+  }
+
+  const unhashed = await db('fiscal_pdf_artifacts').whereNull('render_snapshot_sha256').select('id', 'render_snapshot');
+  for (const artifact of unhashed) {
+    const digest = crypto.createHash('sha256').update(String(artifact.render_snapshot)).digest('hex');
+    await db('fiscal_pdf_artifacts').where({ id: artifact.id }).update({ render_snapshot_sha256: digest });
+  }
+
+  if (db.client.config.client === 'pg') {
+    await db.raw(`
+      CREATE OR REPLACE FUNCTION reject_fiscal_pdf_artifact_mutation()
+      RETURNS trigger AS $archive_guard$
+      BEGIN
+        RAISE EXCEPTION 'Fiscal PDF artifacts are immutable and append-only' USING ERRCODE = '55000';
+      END;
+      $archive_guard$ LANGUAGE plpgsql
+    `);
+    await db.raw(`
+      CREATE OR REPLACE FUNCTION validate_fiscal_pdf_artifact_insert()
+      RETURNS trigger AS $archive_validation$
+      BEGIN
+        IF NEW.render_snapshot_sha256 IS NULL OR length(NEW.render_snapshot_sha256) <> 64 THEN
+          RAISE EXCEPTION 'Fiscal PDF artifact render snapshot checksum is required' USING ERRCODE = '23514';
+        END IF;
+        RETURN NEW;
+      END;
+      $archive_validation$ LANGUAGE plpgsql
+    `);
+    await db.raw(`
+      DO $archive_triggers$
+      BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'fiscal_pdf_artifacts_no_update' AND tgrelid = 'fiscal_pdf_artifacts'::regclass) THEN
+          CREATE TRIGGER fiscal_pdf_artifacts_no_update BEFORE UPDATE ON fiscal_pdf_artifacts
+          FOR EACH ROW EXECUTE FUNCTION reject_fiscal_pdf_artifact_mutation();
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'fiscal_pdf_artifacts_no_delete' AND tgrelid = 'fiscal_pdf_artifacts'::regclass) THEN
+          CREATE TRIGGER fiscal_pdf_artifacts_no_delete BEFORE DELETE ON fiscal_pdf_artifacts
+          FOR EACH ROW EXECUTE FUNCTION reject_fiscal_pdf_artifact_mutation();
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'fiscal_pdf_artifacts_validate_insert' AND tgrelid = 'fiscal_pdf_artifacts'::regclass) THEN
+          CREATE TRIGGER fiscal_pdf_artifacts_validate_insert BEFORE INSERT ON fiscal_pdf_artifacts
+          FOR EACH ROW EXECUTE FUNCTION validate_fiscal_pdf_artifact_insert();
+        END IF;
+      END;
+      $archive_triggers$
+    `);
+  } else {
+    await db.raw(`CREATE TRIGGER IF NOT EXISTS fiscal_pdf_artifacts_no_update
+      BEFORE UPDATE ON fiscal_pdf_artifacts BEGIN
+        SELECT RAISE(ABORT, 'Fiscal PDF artifacts are immutable and append-only');
+      END`);
+    await db.raw(`CREATE TRIGGER IF NOT EXISTS fiscal_pdf_artifacts_no_delete
+      BEFORE DELETE ON fiscal_pdf_artifacts BEGIN
+        SELECT RAISE(ABORT, 'Fiscal PDF artifacts are immutable and append-only');
+      END`);
+    await db.raw(`CREATE TRIGGER IF NOT EXISTS fiscal_pdf_artifacts_validate_insert
+      BEFORE INSERT ON fiscal_pdf_artifacts
+      WHEN NEW.render_snapshot_sha256 IS NULL OR length(NEW.render_snapshot_sha256) <> 64 BEGIN
+        SELECT RAISE(ABORT, 'Fiscal PDF artifact render snapshot checksum is required');
+      END`);
+  }
 }
 
 async function ensureDocumentSequencesTable() {

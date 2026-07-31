@@ -68,6 +68,14 @@ function applySnapshotOverride(reservation, snapshot) {
 async function upsertReservationSnapshot(reservation, billingContext, options = {}) {
   const execute = async (trx) => {
   let existing = await trx('reservation_snapshots').where({ reservation_id: reservation.reservationId }).forUpdate().first();
+  if (existing && (Number(existing.company_id) !== Number(billingContext.company_id)
+      || Number(existing.listing_id) !== Number(billingContext.listing_id)
+      || String(existing.listing_id_guesty) !== String(reservation.listingId))) {
+    const error = new Error('Guesty reservation id is already bound to a different company or listing');
+    error.status = 409;
+    error.code = 'RESERVATION_OWNERSHIP_COLLISION';
+    throw error;
+  }
   if (options.expectedGeneration !== undefined
       && Number(existing?.generation || 0) !== Number(options.expectedGeneration)) {
     const error = new Error('Reservation changed while fiscal materialization was in progress');
@@ -292,6 +300,31 @@ async function resolveCancelledSnapshot(reservationId, resolution) {
   });
 }
 
+async function resolveCancelledSnapshotAutomatically(reservationId, client = db) {
+  const execute = async (trx) => {
+    let snapshotQuery = trx('reservation_snapshots').where({ reservation_id: reservationId });
+    if (trx.client.config.client === 'pg') snapshotQuery = snapshotQuery.forUpdate();
+    const snapshot = await snapshotQuery.first();
+    if (!snapshot || !['cancelled', 'canceled'].includes(String(snapshot.status).toLowerCase())) return null;
+    if (!snapshot.requires_review) return snapshot;
+    const documents = await trx('fiscal_documents').where({ reservation_id: reservationId });
+    const settled = documents.every((document) => document.status === 'cancelled'
+      && (!document.mydata_mark || (document.cancellation_verification_status === 'verified' && document.cancellation_mark)));
+    if (!settled) return null;
+    await trx('reservation_snapshots').where({ id: snapshot.id, requires_review: true }).update({
+      requires_review: false,
+      review_resolution: 'Automatic Guesty cancellation completed and verified through myDATA',
+      reviewed_at: trx.fn.now(),
+      last_error: null,
+      updated_at: trx.fn.now(),
+      generation: trx.raw('generation + 1'),
+    });
+    return trx('reservation_snapshots').where({ id: snapshot.id }).first();
+  };
+  if (client !== db) return execute(client);
+  return db.transaction(execute);
+}
+
 async function markSnapshotMaterialized(id, expectedGeneration, options = {}) {
   const client = options.transaction || db;
   const changed = await client('reservation_snapshots').where({ id, generation: expectedGeneration }).update({
@@ -319,4 +352,4 @@ async function markSnapshotError(id, error, expectedGeneration) {
   });
 }
 
-module.exports = { fiscalHash, applySnapshotOverride, upsertReservationSnapshot, listDueReservationSnapshots, listReservationSnapshots, setFiscalOverride, clearFiscalOverride, reopenSnapshotForReissue, resolveCancelledSnapshot, markSnapshotMaterialized, markSnapshotError };
+module.exports = { fiscalHash, applySnapshotOverride, upsertReservationSnapshot, listDueReservationSnapshots, listReservationSnapshots, setFiscalOverride, clearFiscalOverride, reopenSnapshotForReissue, resolveCancelledSnapshot, resolveCancelledSnapshotAutomatically, markSnapshotMaterialized, markSnapshotError };

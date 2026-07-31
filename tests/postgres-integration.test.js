@@ -20,11 +20,27 @@ if (process.env.POSTGRES_INTEGRATION_TEST !== 'true') {
   const { db, initSchema } = require('../src/database');
   const {
     createDocumentOnce, claimDocument, markDocumentSent, markDocumentCancelled,
-    resolveDefinitiveCancellationFailure, listCancellationResolutionEvents,
+    resolveDefinitiveCancellationFailure, listCancellationResolutionEvents, quarantineStaleCancellations,
   } = require('../src/repositories/fiscal-documents');
   const { upsertReservationSnapshot, reopenSnapshotForReissue } = require('../src/repositories/reservation-snapshots');
   const { prepareReservationDocuments } = require('../src/services/document-service');
+  const { executeDailyClose } = require('../src/services/daily-close-service');
+  const { stageReservation, materializeDueReservations } = require('../src/services/reservation-service');
+  const { runGuestyReconciliation, retryGuestyUnresolvedReservations } = require('../src/services/guesty-reconciliation-service');
   const { beginRun, heartbeatRun, recordRunItem, recordVerificationResult, finishRun } = require('../src/repositories/daily-close');
+  const { getFiscalPdfArtifact, insertFiscalPdfArtifactOnce } = require('../src/repositories/fiscal-pdf-artifacts');
+  const { recordIntegrationCheck } = require('../src/repositories/integration-checks');
+  const {
+    assertApprovedFinancialProfileBinding, profileConfigHash, suspendFinancialProfile,
+  } = require('../src/repositories/financial-profiles');
+  const { getReadiness } = require('../src/services/readiness-service');
+  const { assertProductionTransmissionEnabled } = require('../src/security/production-guard');
+  const {
+    encryptSecret, companySecretContext, companyCredentialBinding,
+  } = require('../src/security/credentials');
+  const {
+    ACCEPTANCE_CONTRACT_VERSION, CAPABILITIES,
+  } = require('../src/services/sandbox-acceptance-service');
 
   let company;
   let listing;
@@ -37,12 +53,15 @@ if (process.env.POSTGRES_INTEGRATION_TEST !== 'true') {
     });
   }
 
-  async function insertFiscalDocument({ key, type = '11.2', series, aa, kind = 'service_receipt', retryable = true }) {
+  async function insertFiscalDocument({
+    key, reservationId = key, type = '11.2', series, aa, kind = 'service_receipt', retryable = true,
+    companyId = company.id, listingId = listing.id,
+  }) {
     await db('fiscal_documents').insert({
       document_key: key,
-      company_id: company.id,
-      listing_id: listing.id,
-      reservation_id: key,
+      company_id: companyId,
+      listing_id: listingId,
+      reservation_id: reservationId,
       document_kind: kind,
       document_type: type,
       series,
@@ -59,6 +78,18 @@ if (process.env.POSTGRES_INTEGRATION_TEST !== 'true') {
       source_payload: '{}',
     });
     return db('fiscal_documents').where({ document_key: key }).first();
+  }
+
+  function pdfArtifact(document, mark, suffix = '') {
+    return {
+      documentId: document.id,
+      companyId: document.company_id,
+      mark,
+      uid: `UID-${mark}`,
+      pdfBytes: Buffer.from(`%PDF-1.4\n${mark}:${suffix}\n%%EOF`),
+      renderSnapshot: { documentType: document.document_type, series: document.series, number: document.aa, mark },
+      renderVersion: 'test-v1',
+    };
   }
 
   test.before(async () => {
@@ -106,6 +137,120 @@ if (process.env.POSTGRES_INTEGRATION_TEST !== 'true') {
       'document_sequences_company_type_series_uq',
       'daily_close_runs_company_date_uq',
     ]) assert(indexes.includes(expected), `${expected} exists`);
+  });
+
+  test('PostgreSQL readiness and production submission guard isolate one broken company', async () => {
+    const savedEnv = { ...process.env };
+    try {
+      Object.assign(process.env, {
+        NODE_ENV: 'test',
+        GUESTY_CLIENT_ID: 'pg-scope-client',
+        GUESTY_CLIENT_SECRET: 'pg-scope-secret',
+        GUESTY_WEBHOOK_SECRET: 'pg-scope-webhook',
+        MYDATA_ENV: 'production',
+        MYDATA_PRODUCTION_ENABLED: 'true',
+        DAILY_CLOSE_ENABLED: 'true',
+      });
+      const readyVat = '109262634';
+      const readyIdentity = { vat_number: readyVat };
+      const [readyCompany] = await db('companies').insert({
+        company_name: 'PostgreSQL Ready Tenant',
+        vat_number: readyVat,
+        aade_user_id: encryptSecret('pg-ready-user', companySecretContext(readyIdentity, 'aade_user_id')),
+        aade_subscription_key: encryptSecret('pg-ready-key', companySecretContext(readyIdentity, 'aade_subscription_key')),
+        invoice_series: 'PG-READY',
+        pdf_address: 'Θήρα 84700',
+        pdf_tax_office: 'Θήρας',
+        active: true,
+      }).returning('*');
+      const [readyListing] = await db('listings').insert({
+        company_id: readyCompany.id,
+        listing_id_guesty: 'pg-ready-listing',
+        property_type: 'apartment',
+        default_invoice_type: '11.2',
+        climate_fee_high: 8,
+        climate_fee_low: 2,
+        climate_fee_high_category: 24,
+        climate_fee_low_category: 10,
+        climate_fee_series: 'PG-READY-TAKK',
+        payment_method_type: 1,
+        active: true,
+      }).returning('*');
+      const [brokenCompany] = await db('companies').insert({
+        company_name: 'PostgreSQL Broken Tenant',
+        vat_number: '094524053',
+        aade_user_id: 'plaintext-user',
+        aade_subscription_key: 'plaintext-key',
+        invoice_series: '',
+        active: true,
+      }).returning('*');
+      await db('listings').insert({
+        company_id: brokenCompany.id,
+        listing_id_guesty: 'pg-broken-listing',
+        property_type: 'apartment',
+        default_invoice_type: '11.2',
+        climate_fee_high: 0,
+        climate_fee_low: 0,
+        climate_fee_high_category: 24,
+        climate_fee_low_category: 10,
+        climate_fee_series: 'PG-BROKEN-TAKK',
+        payment_method_type: 1,
+        active: true,
+      });
+      const [evidence] = await db('fiscal_documents').insert({
+        document_key: `pg-readiness-evidence-${readyCompany.id}`,
+        company_id: readyCompany.id,
+        listing_id: readyListing.id,
+        reservation_id: `pg-readiness-evidence-${readyCompany.id}`,
+        document_kind: 'climate_fee_receipt',
+        document_type: '8.2',
+        series: `PG-R-${readyCompany.id}`,
+        aa: 1,
+        issue_date: '2026-07-31',
+        status: 'sent',
+        xml_payload: '<InvoicesDoc/>',
+        source_payload: '{}',
+        mydata_mark: `40000000000${readyCompany.id}`,
+        verification_status: 'verified',
+        mydata_environment: 'sandbox',
+        target_environment: 'sandbox',
+      }).returning('*');
+      const [acceptanceRun] = await db('sandbox_acceptance_runs').insert({
+        company_id: readyCompany.id,
+        issuer_vat: readyCompany.vat_number,
+        credential_binding_sha256: companyCredentialBinding(readyCompany),
+        contract_version: ACCEPTANCE_CONTRACT_VERSION,
+        approved_by: 'PostgreSQL Readiness Scope Test',
+      }).returning('*');
+      await db('sandbox_acceptance_artifacts').insert([
+        CAPABILITIES.STAY_APY, CAPABILITIES.CREDIT_APY, CAPABILITIES.CANCEL,
+      ].map((capability) => ({
+        run_id: acceptanceRun.id,
+        capability,
+        document_id: evidence.id,
+        document_type: '8.2',
+        reservation_id: evidence.reservation_id,
+        invoice_mark: evidence.mydata_mark,
+        evidence_json: '{}',
+      })));
+      await recordIntegrationCheck('guesty', 'success', 'guesty');
+      await recordIntegrationCheck(`mydata:${readyCompany.id}:sandbox`, 'success', 'sandbox');
+      await recordIntegrationCheck(`mydata:${readyCompany.id}:production`, 'success', 'production');
+
+      const ready = await getReadiness({ companyId: readyCompany.id });
+      const broken = await getReadiness({ companyId: brokenCompany.id });
+      assert.equal(ready.productionReady, true);
+      assert.equal(ready.counts.companies, 1);
+      assert.equal(ready.counts.listings, 1);
+      assert(ready.checks.every((check) => check.key === 'guesty' || check.key.startsWith(`mydata:${readyCompany.id}:`)));
+      assert.equal(broken.productionReady, false);
+      assert(broken.productionIssues.some((item) => item.scope === `company:${brokenCompany.id}`));
+      await assert.doesNotReject(assertProductionTransmissionEnabled('submissions', readyCompany.id));
+      await assert.rejects(assertProductionTransmissionEnabled('submissions', brokenCompany.id), /Production myDATA preflight failed/);
+    } finally {
+      for (const key of Object.keys(process.env)) if (!(key in savedEnv)) delete process.env[key];
+      Object.assign(process.env, savedEnv);
+    }
   });
 
   test('concurrent PostgreSQL AA allocation is unique, gap-free and monotonic', async () => {
@@ -207,6 +352,201 @@ if (process.env.POSTGRES_INTEGRATION_TEST !== 'true') {
     const finalSnapshot = await db('reservation_snapshots').where({ reservation_id: currentReservation.reservationId }).first();
     assert.equal(finalSnapshot.status, 'cancelled');
     assert.equal(Number((await db('fiscal_documents').where({ reservation_id: currentReservation.reservationId }).count({ count: '*' }).first()).count), 0);
+  });
+
+  test('core-only Guesty cancellation backfill locally cancels unsent docs, quarantines sent docs, and persists its watermark', async () => {
+    const reservationId = 'pg-core-cancellation';
+    await stageReservation(reservation(reservationId), billingContext());
+    await db('reservation_snapshots').where({ reservation_id: reservationId }).update({ materialized_at: db.fn.now() });
+    const sent = await insertFiscalDocument({
+      key: 'pg-core-cancellation-sent', reservationId, series: 'PG-CORE-CANCEL', aa: 1,
+    });
+    const pending = await insertFiscalDocument({
+      key: 'pg-core-cancellation-pending', reservationId, series: 'PG-CORE-CANCEL', aa: 2,
+    });
+    await db('fiscal_documents').where({ id: sent.id }).update({
+      status: 'sent', mydata_mark: '400000000007001', verification_status: 'verified',
+    });
+    const to = '2026-08-01T00:00:00.000Z';
+    const result = await runGuestyReconciliation({
+      from: '2026-07-31T00:00:00.000Z', to,
+      searcher: async () => [reservationId],
+      fetcher: async () => ({
+        _id: reservationId,
+        listingId: listing.listing_id_guesty,
+        status: 'cancelled',
+        checkInDateLocalized: '2026-07-30',
+        checkOutDateLocalized: '2026-07-31',
+        authoritativeCancellation: true,
+      }),
+    });
+    assert.equal(result.watermark, to);
+    assert.equal((await db('fiscal_documents').where({ id: pending.id }).first()).status, 'cancelled');
+    assert.equal((await db('fiscal_documents').where({ id: sent.id }).first()).status, 'sent');
+    const snapshot = await db('reservation_snapshots').where({ reservation_id: reservationId }).first();
+    assert.equal(snapshot.status, 'cancelled');
+    assert.equal(Boolean(snapshot.requires_review), true);
+    assert.match(snapshot.last_error, /quarantined/);
+    const successEvidence = await db('integration_checks').where({ check_key: 'guesty:reservation_reconciliation' }).first();
+    assert.equal(successEvidence.status, 'success');
+    assert.equal(JSON.parse(successEvidence.message).successfulWatermark, to);
+
+    await assert.rejects(
+      runGuestyReconciliation({
+        from: to, to: '2026-08-02T00:00:00.000Z',
+        searcher: async () => { throw new Error('PG Guesty outage'); },
+      }),
+      /PG Guesty outage/,
+    );
+    const failedEvidence = await db('integration_checks').where({ check_key: 'guesty:reservation_reconciliation' }).first();
+    assert.equal(failedEvidence.status, 'failed');
+    assert.equal(JSON.parse(failedEvidence.message).priorSuccessfulWatermark, to);
+    assert.equal((await db('sync_cursors').where({ provider: 'guesty', cursor_key: 'reservations_last_updated' }).first()).cursor_value, to);
+  });
+
+  test('inactive Guesty rows survive cursor advancement and resolve idempotently after activation', async () => {
+    const reservationId = 'pg-inactive-reconciliation-inbox';
+    const payload = {
+      _id: reservationId,
+      listingId: listing.listing_id_guesty,
+      status: 'cancelled',
+      checkInDateLocalized: '2026-08-01',
+      checkOutDateLocalized: '2026-08-02',
+      authoritativeCancellation: true,
+    };
+    await db('listings').where({ id: listing.id }).update({ active: false });
+    try {
+      const unresolved = await runGuestyReconciliation({
+        from: '2026-08-02T00:00:00.000Z', to: '2026-08-03T00:00:00.000Z',
+        searcher: async () => [reservationId],
+        fetcher: async () => payload,
+      });
+      const inbox = await db('guesty_reconciliation_inbox').where({ reservation_id: reservationId }).first();
+      assert.equal(unresolved.watermark, '2026-08-03T00:00:00.000Z');
+      assert.equal(inbox.status, 'unresolved');
+      assert.equal(inbox.reason, 'inactive_listing');
+      assert.equal(Number(inbox.attempts), 1);
+    } finally {
+      await db('listings').where({ id: listing.id }).update({ active: true });
+    }
+    const resolved = await runGuestyReconciliation({
+      from: '2026-08-03T00:00:00.000Z', to: '2026-08-04T00:00:00.000Z',
+      searcher: async () => [],
+      fetcher: async () => payload,
+    });
+    const inbox = await db('guesty_reconciliation_inbox').where({ reservation_id: reservationId }).first();
+    assert.equal(resolved.retried, 1);
+    assert.equal(inbox.status, 'resolved');
+    assert(inbox.resolved_at);
+    assert.equal(Number(inbox.attempts), 2);
+    assert.equal((await db('reservation_snapshots').where({ reservation_id: reservationId }).first()).status, 'cancelled');
+    const replay = await retryGuestyUnresolvedReservations({ fetcher: async () => { throw new Error('resolved row replayed'); } });
+    assert.equal(replay.attempted, 0);
+  });
+
+  test('authoritative Guesty cancellation durably queues and automatically verifies APY and TAKK cancellation work', async () => {
+    const vatNumber = '111111111';
+    const identity = { vat_number: vatNumber };
+    const [autoCompany] = await db('companies').insert({
+      company_name: 'PG Automatic Cancellation Tenant',
+      vat_number: vatNumber,
+      aade_user_id: encryptSecret('pg-auto-user', companySecretContext(identity, 'aade_user_id')),
+      aade_subscription_key: encryptSecret('pg-auto-key', companySecretContext(identity, 'aade_subscription_key')),
+      invoice_series: 'PG-AUTO-CANCEL',
+      active: true,
+    }).returning('*');
+    const [autoListing] = await db('listings').insert({
+      company_id: autoCompany.id,
+      listing_id_guesty: 'pg-auto-cancel-listing',
+      property_type: 'apartment',
+      default_invoice_type: '11.2',
+      climate_fee_high: 10,
+      climate_fee_low: 1.5,
+      climate_fee_high_category: 24,
+      climate_fee_low_category: 10,
+      climate_fee_series: 'PG-AUTO-CANCEL-TAKK',
+      payment_method_type: 1,
+      active: true,
+    }).returning('*');
+    const autoBilling = {
+      company_id: autoCompany.id,
+      listing_id: autoListing.id,
+      listing_id_guesty: autoListing.listing_id_guesty,
+      vat_number: autoCompany.vat_number,
+      property_type: autoListing.property_type,
+      default_invoice_type: autoListing.default_invoice_type,
+      invoice_series: autoCompany.invoice_series,
+      climate_fee_high: autoListing.climate_fee_high,
+      climate_fee_low: autoListing.climate_fee_low,
+      climate_fee_high_category: autoListing.climate_fee_high_category,
+      climate_fee_low_category: autoListing.climate_fee_low_category,
+      climate_fee_series: autoListing.climate_fee_series,
+      payment_method_type: 1,
+    };
+    const autoReservation = {
+      reservationId: 'pg-auto-cancel-reservation',
+      listingId: autoListing.listing_id_guesty,
+      status: 'checked_out',
+      platform: 'direct', platformKey: 'direct', source: 'direct', sourceKey: 'direct',
+      checkIn: '2026-07-30', checkOut: '2026-07-31', nights: 1,
+      financials: { totalGross: 113 },
+      financialProfile: { status: 'matched', id: 1, version: 1, configHash: 'b'.repeat(64) },
+    };
+    await stageReservation(autoReservation, autoBilling);
+    const pair = await prepareReservationDocuments(autoReservation, autoBilling);
+    await db('reservation_snapshots').where({ reservation_id: autoReservation.reservationId }).update({ materialized_at: db.fn.now() });
+    const marks = new Map([
+      [pair.primary.document.id, '400000000008001'],
+      [pair.climate.document.id, '400000000008002'],
+    ]);
+    for (const [documentId, mark] of marks) {
+      await db('fiscal_documents').where({ id: documentId }).update({
+        status: 'sent', mydata_mark: mark, mydata_environment: 'sandbox', verification_status: 'verified',
+      });
+    }
+    await stageReservation({ ...autoReservation, status: 'cancelled' }, autoBilling);
+    const queued = await db('fiscal_documents').where({ reservation_id: autoReservation.reservationId });
+    assert(queued.every((document) => document.cancellation_status === 'requested'));
+    const calls = [];
+    const cancellationMark = (mark) => String(BigInt(mark) + 500000000000000n);
+    await executeDailyClose({
+      companyId: autoCompany.id,
+      businessDate: '2026-08-10',
+      materializer: async () => [],
+      sender: async () => { throw new Error('must not send new invoices'); },
+      cancellationSender: async (mark) => { calls.push(String(mark)); return { cancellationMark: cancellationMark(mark) }; },
+      cancellationVerifier: async (mark) => ({
+        verified: true, invoiceMark: String(mark), cancellationMark: cancellationMark(mark),
+      }),
+    });
+    const cancelled = await db('fiscal_documents').where({ reservation_id: autoReservation.reservationId });
+    assert.equal(calls.length, 2);
+    assert(cancelled.every((document) => document.status === 'cancelled'
+      && document.cancellation_verification_status === 'verified'));
+    assert.equal(Boolean((await db('reservation_snapshots').where({ reservation_id: autoReservation.reservationId }).first()).requires_review), false);
+    await executeDailyClose({
+      companyId: autoCompany.id,
+      businessDate: '2026-08-10',
+      materializer: async () => [],
+      cancellationSender: async () => { throw new Error('duplicate CancelInvoice'); },
+      cancellationVerifier: async () => { throw new Error('duplicate verification'); },
+    });
+    assert.equal(calls.length, 2);
+  });
+
+  test('materialization fails closed when a listing is deactivated after staging', async () => {
+    const reservationId = 'pg-inactive-at-close';
+    await stageReservation(reservation(reservationId), billingContext());
+    await db('listings').where({ id: listing.id }).update({ active: false });
+    let results;
+    try {
+      results = await materializeDueReservations(company.id, '2026-07-31', { useGuestyRefresh: false });
+    } finally {
+      await db('listings').where({ id: listing.id }).update({ active: true });
+    }
+    assert.match(results.find((row) => row.reservationId === reservationId).error, /inactive/);
+    assert.equal(Number((await db('fiscal_documents').where({ reservation_id: reservationId }).count({ count: '*' }).first()).count), 0);
+    assert.equal(Boolean((await db('reservation_snapshots').where({ reservation_id: reservationId }).first()).requires_review), true);
   });
 
   test('late transmission responses never downgrade verified or cancelled fiscal state', async () => {
@@ -381,32 +721,53 @@ if (process.env.POSTGRES_INTEGRATION_TEST !== 'true') {
       (error) => error.status === 409,
     );
     assert.equal((await db('fiscal_documents').where({ id: document.id }).first()).verification_status, 'pending');
-    await recordVerificationResult(recovered.id, document.id, 'PG-LEASE-MARK', { verified: true }, recovered.lease_token);
+    const firstArtifact = pdfArtifact(document, 'PG-LEASE-MARK', 'original');
+    await recordVerificationResult(recovered.id, document.id, 'PG-LEASE-MARK', {
+      verified: true, artifact: firstArtifact,
+    }, recovered.lease_token);
     assert.equal((await db('fiscal_documents').where({ id: document.id }).first()).verification_status, 'verified');
+    const archivedHash = (await getFiscalPdfArtifact(document.id)).pdf_sha256;
+    await insertFiscalPdfArtifactOnce(pdfArtifact(document, 'PG-LEASE-MARK', 'different-render'));
+    assert.equal((await getFiscalPdfArtifact(document.id)).pdf_sha256, archivedHash, 'idempotent archive never overwrites the first exact PDF');
+    await assert.rejects(
+      db('fiscal_pdf_artifacts').where({ document_id: document.id }).update({ render_snapshot: '{}' }),
+      /immutable and append-only/,
+    );
+    await assert.rejects(
+      db('fiscal_pdf_artifacts').where({ document_id: document.id }).delete(),
+      /immutable and append-only/,
+    );
+    assert.match((await getFiscalPdfArtifact(document.id)).render_snapshot_sha256, /^[a-f0-9]{64}$/);
     const finished = await finishRun(recovered.id, { total: 0, sent: 0, failed: 0 }, recovered.lease_token);
     assert.equal(finished.status, 'completed');
     assert.equal(Number(finished.document_count), 1);
     assert.equal(Number(finished.sent_count), 1);
     assert.equal(Number(finished.failed_count), 0);
 
-    await db('fiscal_documents').where({ id: document.id }).update({
+    const lateDocument = await insertFiscalDocument({
+      key: 'pg-late-mark-after-crash', reservationId: 'pg-late-mark-after-crash',
+      series: 'PG-LATE-MARK', aa: 1,
+    });
+    await db('fiscal_documents').where({ id: lateDocument.id }).update({
       issue_date: '2026-08-01', status: 'transmitting', mydata_mark: null,
       verification_status: 'pending', verified_at: null,
     });
     const inFlightRun = await beginRun(company.id, '2026-08-01', { leaseSeconds: 30 });
-    await recordRunItem(inFlightRun.id, document.id, 'in_flight', 'waiting for MARK', inFlightRun.lease_token);
+    await recordRunItem(inFlightRun.id, lateDocument.id, 'in_flight', 'waiting for MARK', inFlightRun.lease_token);
     const partial = await finishRun(inFlightRun.id, {}, inFlightRun.lease_token);
     assert.equal(partial.status, 'partial');
     assert.equal(Number(partial.document_count), 1);
     assert.equal(Number(partial.sent_count), 0);
     assert.equal(Number(partial.failed_count), 0);
 
-    await db('fiscal_documents').where({ id: document.id }).update({ status: 'sent', mydata_mark: 'PG-LATE-MARK' });
-    await db('fiscal_documents').where({ company_id: company.id }).whereNot({ id: document.id }).update({
+    await db('fiscal_documents').where({ id: lateDocument.id }).update({ status: 'sent', mydata_mark: 'PG-LATE-MARK' });
+    await db('fiscal_documents').where({ company_id: company.id }).whereNot({ id: lateDocument.id }).update({
       status: 'cancelled', cancellation_status: 'cancelled',
     });
     const verificationRun = await beginRun(company.id, '2026-08-01', { leaseSeconds: 30 });
-    await recordVerificationResult(verificationRun.id, document.id, 'PG-LATE-MARK', { verified: true }, verificationRun.lease_token);
+    await recordVerificationResult(verificationRun.id, lateDocument.id, 'PG-LATE-MARK', {
+      verified: true, artifact: pdfArtifact(lateDocument, 'PG-LATE-MARK', 'late'),
+    }, verificationRun.lease_token);
     const completed = await finishRun(verificationRun.id, {}, verificationRun.lease_token);
     assert.equal(completed.status, 'completed');
     assert.equal(Number(completed.document_count), 1);

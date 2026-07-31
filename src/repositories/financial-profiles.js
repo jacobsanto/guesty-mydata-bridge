@@ -130,6 +130,30 @@ async function getApprovedFinancialProfile(listingId, platformKey, sourceKey, ex
   return hydrateProfile(row);
 }
 
+async function assertApprovedFinancialProfileBinding(expected, listingId, platformKey, sourceKey, executor) {
+  if (!executor) throw new Error('Financial profile revalidation requires the materialization transaction');
+  let query = executor('financial_profiles').where({ id: Number(expected?.id) });
+  if (executor.client.config.client === 'pg') query = query.forUpdate();
+  const raw = await query.first();
+  const profile = hydrateProfile(raw);
+  const actualConfigHash = profile ? profileConfigHash(normalizeProfileConfig(profile)) : null;
+  const valid = profile
+    && profile.status === 'approved'
+    && Number(profile.listing_id) === Number(listingId)
+    && profile.platform_key === normalizeKey(platformKey, 'platform_key')
+    && profile.source_key === normalizeKey(sourceKey, 'source_key')
+    && Number(profile.version) === Number(expected?.version)
+    && profile.config_hash === String(expected?.configHash || '')
+    && actualConfigHash === profile.config_hash;
+  if (!valid) {
+    const error = new Error('Approved financial profile changed before fiscal materialization');
+    error.status = 409;
+    error.code = 'FINANCIAL_PROFILE_CHANGED';
+    throw error;
+  }
+  return profile;
+}
+
 async function createNextFinancialProfileVersion(data) {
   const listingId = Number(data.listing_id);
   if (!Number.isInteger(listingId) || listingId <= 0) throw repositoryError('listing_id must be a positive integer');
@@ -344,6 +368,7 @@ module.exports = {
   listFinancialProfiles,
   getFinancialProfileById,
   getApprovedFinancialProfile,
+  assertApprovedFinancialProfileBinding,
   createNextFinancialProfileVersion,
   updateDraftFinancialProfile,
   deleteDraftFinancialProfile,

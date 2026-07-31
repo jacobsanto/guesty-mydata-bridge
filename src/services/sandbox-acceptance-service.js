@@ -8,7 +8,7 @@ const {
   insertAcceptanceRun, listAcceptanceRuns, listLegacyAcceptanceEvidence,
 } = require('../repositories/sandbox-acceptance');
 const { companyCredentialBinding } = require('../security/credentials');
-const { renderFiscalDocumentPdf } = require('./pdf-service');
+const { getFiscalPdfArtifact } = require('../repositories/fiscal-pdf-artifacts');
 
 const ACCEPTANCE_CONTRACT_VERSION = 'mydata-v2.0.1-accommodation-1';
 const CAPABILITIES = Object.freeze({
@@ -99,12 +99,17 @@ function assertSandboxSubmission(document, companyId, acceptedTypes, label) {
 }
 
 async function submissionHashes(document) {
-  const pdf = await renderFiscalDocumentPdf(document.id);
+  const pdfArtifact = await getFiscalPdfArtifact(document.id);
+  if (!pdfArtifact) throw bad('Verified sandbox document is missing its archived PDF artifact', 409);
+  if (Number(pdfArtifact.company_id) !== Number(document.company_id)
+      || String(pdfArtifact.mydata_mark) !== String(document.mydata_mark)) {
+    throw bad('Archived sandbox PDF does not match the document fiscal identity', 409);
+  }
   return {
     xml_sha256: sha256(document.xml_payload),
     send_response_sha256: sha256(document.mydata_response),
     uid_sha256: sha256(document.mydata_uid),
-    pdf_sha256: sha256(pdf),
+    pdf_sha256: pdfArtifact.pdf_sha256,
   };
 }
 
@@ -207,7 +212,7 @@ async function createAcceptanceRun(payload) {
 async function getAcceptanceMatrices(companies) {
   const ids = companies.map((company) => Number(company.id));
   const [runs, legacy] = await Promise.all([
-    listAcceptanceRuns(),
+    listAcceptanceRuns(ids.length === 1 ? { companyId: ids[0] } : {}),
     listLegacyAcceptanceEvidence(ids),
   ]);
   const matrices = [];

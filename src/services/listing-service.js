@@ -8,6 +8,7 @@ const {
   updateListing,
 } = require('../repositories/listings');
 const { getCompanyById } = require('../repositories/companies');
+const { db } = require('../database');
 const { normalizeAccommodationClimateCategory, normalizeCounterpart, normalizeSeries, validateAccommodationClimatePair } = require('../validation/fiscal-fields');
 
 const PROPERTY_TYPES = new Set(['villa', 'apartment']);
@@ -79,6 +80,10 @@ function normalizeCreatePayload(payload) {
   if (climateCategoryHigh !== null && climateCategoryLow !== null) {
     validateAccommodationClimatePair(propertyType, climateCategoryHigh, climateCategoryLow);
   }
+  const active = payload.active === undefined ? true : Boolean(payload.active);
+  if (active && (climateFeeHigh <= 0 || climateFeeLow <= 0)) {
+    errors.push('active accommodation listings require positive high/low TAKK amounts; use an inactive listing until accountant configuration is complete');
+  }
 
   return {
     errors,
@@ -98,7 +103,7 @@ function normalizeCreatePayload(payload) {
       climate_fee_series: climateFeeSeries,
       payment_method_type: normalizePaymentMethod(payload.payment_method_type),
       payment_method_info: paymentMethodInfo,
-      active: payload.active === undefined ? true : Boolean(payload.active),
+      active,
     },
   };
 }
@@ -156,6 +161,17 @@ async function handleUpdateListing(id, payload) {
   if ('company_id' in payload) {
     normalized.company_id = parseId(payload.company_id, 'company_id');
     await ensureCompanyExists(normalized.company_id);
+    if (normalized.company_id !== Number(existing.company_id)) {
+      const [document, snapshot] = await Promise.all([
+        db('fiscal_documents').where({ listing_id: listingId }).first('id'),
+        db('reservation_snapshots').where({ listing_id: listingId }).first('id'),
+      ]);
+      if (document || snapshot) {
+        const error = new Error('A listing with reservation or fiscal history cannot be reassigned to another company');
+        error.status = 409;
+        throw error;
+      }
+    }
   }
   if ('listing_id_guesty' in payload) {
     const value = String(payload.listing_id_guesty || '').trim();
@@ -220,6 +236,11 @@ async function handleUpdateListing(id, payload) {
       error.status = 400;
       throw error;
     }
+  }
+  if (finalValue.active !== false && (Number(finalValue.climate_fee_high) <= 0 || Number(finalValue.climate_fee_low) <= 0)) {
+    const error = new Error('active accommodation listings require positive high/low TAKK amounts; deactivate the listing until accountant configuration is complete');
+    error.status = 400;
+    throw error;
   }
   const climateFieldsChanged = ['property_type', 'climate_fee_high_category', 'climate_fee_low_category'].some((field) => field in payload);
   if (finalValue.active !== false || climateFieldsChanged) {

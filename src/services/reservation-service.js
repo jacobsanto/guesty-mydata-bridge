@@ -1,23 +1,50 @@
 'use strict';
 
 const { applySnapshotOverride, upsertReservationSnapshot, listDueReservationSnapshots, setFiscalOverride, clearFiscalOverride, reopenSnapshotForReissue, resolveCancelledSnapshot, markSnapshotMaterialized, markSnapshotError } = require('../repositories/reservation-snapshots');
-const { cancelPendingReservationDocuments } = require('../repositories/fiscal-documents');
+const { cancelPendingReservationDocuments, queueReservationDocumentCancellations } = require('../repositories/fiscal-documents');
 const { getCompanyAndListingByGuestyListingId } = require('../repositories/listings');
 const { prepareReservationDocuments } = require('./document-service');
 const { fetchReservation } = require('../guesty/client');
 const { normalizeGuestyReservation } = require('../guesty/normalizer');
 const { normalizeCounterpart, normalizeSeries } = require('../validation/fiscal-fields');
 const { applyFinancialProfile } = require('./financial-profile-service');
+const { assertApprovedFinancialProfileBinding } = require('../repositories/financial-profiles');
 const { db } = require('../database');
 
 const CANCELLED_STATUSES = new Set(['cancelled', 'canceled']);
 
+async function stageCancellation(reservation, billingContext, options = {}) {
+  const execute = async (trx) => {
+    const snapshot = await upsertReservationSnapshot(reservation, billingContext, {
+      transaction: trx,
+      ...(options.expectedGeneration === undefined ? {} : { expectedGeneration: options.expectedGeneration }),
+    });
+    await cancelPendingReservationDocuments(reservation.reservationId, trx);
+    await queueReservationDocumentCancellations(reservation.reservationId, trx);
+    const active = await trx('fiscal_documents')
+      .where({ reservation_id: reservation.reservationId })
+      .whereNot({ status: 'cancelled' })
+      .count({ count: '*' })
+      .first();
+    if (Number(active?.count || 0) > 0) {
+      await trx('reservation_snapshots').where({ id: snapshot.id }).update({
+        requires_review: true,
+        financial_status: 'review',
+        last_error: 'Guesty cancellation quarantined: transmitted or in-flight fiscal documents require AADE cancellation review',
+        updated_at: trx.fn.now(),
+      });
+    }
+    return trx('reservation_snapshots').where({ id: snapshot.id }).first();
+  };
+  if (options.transaction) return execute(options.transaction);
+  return db.transaction(execute);
+}
+
 async function stageReservation(reservation, billingContext) {
-  const snapshot = await upsertReservationSnapshot(reservation, billingContext);
   if (CANCELLED_STATUSES.has(String(reservation.status).toLowerCase())) {
-    await cancelPendingReservationDocuments(reservation.reservationId);
+    return stageCancellation(reservation, billingContext);
   }
-  return snapshot;
+  return upsertReservationSnapshot(reservation, billingContext);
 }
 
 async function applyFiscalOverride(reservationId, payload) {
@@ -69,6 +96,7 @@ async function resolveCancellationReview(reservationId, payload) {
 async function materializeDueReservations(companyId, businessDate, {
   fetcher = fetchReservation,
   useGuestyRefresh = Boolean(process.env.GUESTY_CLIENT_ID && process.env.GUESTY_CLIENT_SECRET),
+  beforeMaterializationTransaction = null,
 } = {}) {
   const snapshots = await listDueReservationSnapshots(companyId, businessDate);
   const results = [];
@@ -81,19 +109,29 @@ async function materializeDueReservations(companyId, businessDate, {
       reservation = applySnapshotOverride(reservation, snapshot);
       const billingContext = await getCompanyAndListingByGuestyListingId(reservation.listingId);
       if (!billingContext || billingContext.company_id !== companyId) throw new Error('Latest Guesty listing has no matching company configuration');
+      if (!billingContext.company_active || !billingContext.listing_active) {
+        throw new Error('Latest Guesty company/listing mapping is inactive; fiscal materialization is blocked');
+      }
       if (CANCELLED_STATUSES.has(String(reservation.status).toLowerCase())) {
         await db.transaction(async (trx) => {
-          await upsertReservationSnapshot(reservation, billingContext, {
+          await stageCancellation(reservation, billingContext, {
             transaction: trx,
             expectedGeneration: snapshot.generation,
           });
-          await cancelPendingReservationDocuments(reservation.reservationId, trx);
         });
         results.push({ reservationId: snapshot.reservation_id, skipped: true, reason: 'cancelled' });
         continue;
       }
       reservation = await applyFinancialProfile(reservation, billingContext);
+      if (beforeMaterializationTransaction) await beforeMaterializationTransaction({ reservation, billingContext, snapshot });
       const documents = await db.transaction(async (trx) => {
+        await assertApprovedFinancialProfileBinding(
+          reservation.financialProfile,
+          billingContext.listing_id,
+          reservation.platformKey,
+          reservation.sourceKey,
+          trx,
+        );
         const current = await upsertReservationSnapshot(reservation, billingContext, {
           transaction: trx,
           expectedGeneration: snapshot.generation,

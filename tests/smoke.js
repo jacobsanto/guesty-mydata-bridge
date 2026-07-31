@@ -24,14 +24,17 @@ const {
 } = require('../src/database');
 const { generateMyDataXML, generateClimateFeeXML, generateCreditXML, calculateClimateFeePerNight } = require('../src/mydata-xml');
 const { encryptSecret, decryptSecret, reencryptSecret, decryptCompanySecret } = require('../src/security/credentials');
-const { handleCreateListing } = require('../src/services/listing-service');
+const { handleCreateListing, handleUpdateListing } = require('../src/services/listing-service');
 const { handleCreateCompany, handleUpdateCompany } = require('../src/services/company-service');
 const { prepareReservationDocuments } = require('../src/services/document-service');
 const { executeDailyClose } = require('../src/services/daily-close-service');
 const { cancelFiscalDocument, reconcileFiscalDocumentCancellation, resolveCancellationFailure } = require('../src/services/cancellation-service');
 const { normalizeGuestyReservation } = require('../src/guesty/normalizer');
 const { createCreditDocument } = require('../src/services/credit-service');
-const { renderFiscalDocumentPdf, buildFiscalDocumentPdfData } = require('../src/services/pdf-service');
+const {
+  renderFiscalDocumentPdf, buildFiscalDocumentPdfData, archiveVerifiedFiscalDocumentPdf,
+} = require('../src/services/pdf-service');
+const { getFiscalPdfArtifact } = require('../src/repositories/fiscal-pdf-artifacts');
 const { handleCreateBillingRule } = require('../src/services/billing-rule-service');
 const { scheduledBusinessDate, runScheduledDailyClose } = require('../src/services/daily-close-scheduler');
 const { beginRun, finishRun, listRuns, listRunItems } = require('../src/repositories/daily-close');
@@ -44,17 +47,17 @@ const { credentialFingerprint } = require('../src/guesty/client');
 const { getIntegrationToken, saveIntegrationToken } = require('../src/repositories/integration-tokens');
 const {
   createNextFinancialProfileVersion, recordCalibrationSample,
-  approveFinancialProfile, updateDraftFinancialProfile, getApprovedFinancialProfile,
+  approveFinancialProfile, updateDraftFinancialProfile, getApprovedFinancialProfile, profileConfigHash,
 } = require('../src/repositories/financial-profiles');
 const { reconcileUncertainTransmission } = require('../src/services/transmission-reconciliation-service');
-const { runGuestyReconciliation } = require('../src/services/guesty-reconciliation-service');
+const { runGuestyReconciliation, retryGuestyUnresolvedReservations } = require('../src/services/guesty-reconciliation-service');
 const { createSandboxSignoff } = require('../src/services/sandbox-signoff-service');
 const {
   CAPABILITIES, createAcceptanceRun, getAcceptanceMatrix,
 } = require('../src/services/sandbox-acceptance-service');
 const { applyFinancialProfile, calibrateProfile, listObservedChannels } = require('../src/services/financial-profile-service');
 const { evaluateFolio } = require('../src/services/financial-rule-engine');
-const { claimDocument, listCancellationResolutionEvents } = require('../src/repositories/fiscal-documents');
+const { claimDocument, markDocumentSent, quarantineStaleCancellations, listCancellationResolutionEvents } = require('../src/repositories/fiscal-documents');
 
 // ─── Mock Data ────────────────────────────────────────────────────────────────
 
@@ -263,6 +266,14 @@ async function run() {
     await handleCreateListing({ company_id: securedCompany.id, listing_id_guesty: 'lst_NO_TAKK_CONFIG', property_type: 'apartment' });
   } catch (error) { rejectedMissingClimateConfig = error.status === 400 && error.message.includes('climate_fee_high'); }
   assert(rejectedMissingClimateConfig, 'κάθε κατάλυμα απαιτεί ρητή ρύθμιση ΤΑΚΚ πριν ενεργοποιηθεί');
+  let rejectedZeroClimateConfig = false;
+  try {
+    await handleCreateListing({
+      company_id: securedCompany.id, listing_id_guesty: 'lst_ZERO_TAKK', property_type: 'apartment',
+      climate_fee_high: 0, climate_fee_low: 0, climate_fee_high_category: 24, climate_fee_low_category: 10,
+    });
+  } catch (error) { rejectedZeroClimateConfig = error.status === 400 && error.message.includes('positive high/low TAKK'); }
+  assert(rejectedZeroClimateConfig, 'ενεργό κατάλυμα δεν μπορεί να παραλείψει σιωπηρά το χωριστό ΤΑΚΚ με μηδενική ρύθμιση');
   let rejectedInvalidGreekCounterpart = false;
   try {
     await handleCreateListing({
@@ -377,6 +388,8 @@ async function run() {
   assert(closeRun.status === 'completed' && closeRun.sent_count === 2, 'το κλείσιμο έστειλε και τα δύο παραστατικά');
   assert(sentRows.length === 2 && sentRows.every((row) => row.mydata_mark && row.mydata_uid), 'αποθηκεύτηκαν MARK και UID ανά παραστατικό');
   assert(sentRows.every((row) => row.verification_status === 'verified') && verificationCalls === 2, 'κάθε MARK επιβεβαιώθηκε μέσω RequestTransmittedDocs');
+  const archivedAfterClose = await db('fiscal_pdf_artifacts').whereIn('document_id', sentRows.map((row) => row.id));
+  assert(archivedAfterClose.length === 2 && archivedAfterClose.every((row) => row.pdf_sha256?.length === 64), 'το verified MARK αρχειοθετεί ατομικά ακριβές PDF και SHA-256');
   const closeHistory = await listRuns({ companyId: securedCompany.id });
   const closeItems = await listRunItems(closeRun.id);
   assert(closeHistory[0].business_date === '2025-07-15' && closeItems.length === 2, 'το ιστορικό κλεισίματος διατηρεί αποτέλεσμα ανά παραστατικό');
@@ -402,13 +415,18 @@ async function run() {
   assert(cancelledMarkInput === documentToCancel.mydata_mark, 'η ΑΑΔΕ ακύρωση λαμβάνει το MARK του αρχικού παραστατικού');
   assert(cancelled.status === 'cancelled' && cancelled.cancellation_mark === '900000000000001', 'αποθηκεύεται το cancellation MARK');
   assert(cancellationCalls === 1, 'δύο ταυτόχρονες ακυρώσεις στέλνουν μόνο ένα CancelInvoice');
-  const verifiedCancellation = await reconcileFiscalDocumentCancellation({
-    documentId: documentToCancel.id,
-    verifier: async (invoiceMark) => ({
+  await executeDailyClose({
+    companyId: securedCompany.id,
+    businessDate: '2025-07-15',
+    materializer: async () => [],
+    sender: async () => { throw new Error('no invoice transmission expected while verifying cancellation'); },
+    verifier: fakeVerifier,
+    cancellationVerifier: async (invoiceMark) => ({
       verified: true, invoiceMark, cancellationMark: '900000000000001', raw: { cancellationMark: '900000000000001' },
     }),
   });
-  assert(verifiedCancellation.cancellation_verification_status === 'verified', 'το cancellation MARK επιβεβαιώνεται χωριστά με RequestTransmittedDocs');
+  const verifiedCancellation = await db('fiscal_documents').where({ id: documentToCancel.id }).first();
+  assert(verifiedCancellation.cancellation_verification_status === 'verified', 'το επόμενο ημερήσιο κλείσιμο επαληθεύει αυτόματα το cancellation MARK με RequestTransmittedDocs');
 
   // ── Test 11: Official Guesty payload normalization ──────────────────────
   console.log('\n🔌 Test 11: Κανονικοποίηση επίσημου Guesty webhook payload');
@@ -577,6 +595,14 @@ async function run() {
     && foundResolutionReplay.idempotent && foundResolutionReplay.reconciled
     && (await listCancellationResolutionEvents(alreadyCancelledFailure.id)).length === 1,
   'ήδη υπάρχον cancellation MARK αποθηκεύεται verified και audited με idempotent replay');
+  const creditEnvironment = process.env.MYDATA_ENV;
+  process.env.MYDATA_ENV = 'production';
+  let crossEnvironmentCreditBlocked = false;
+  try {
+    await createCreditDocument({ documentId: originalTpy.id, grossValue: 1, issueDate: '2025-07-16', reference: 'wrong-environment-credit' });
+  } catch (error) { crossEnvironmentCreditBlocked = error.status === 409; }
+  if (creditEnvironment === undefined) delete process.env.MYDATA_ENV; else process.env.MYDATA_ENV = creditEnvironment;
+  assert(crossEnvironmentCreditBlocked, 'production πιστωτικό δεν μπορεί να συσχετιστεί με sandbox MARK');
   let invalidCreditInputBlocked = 0;
   for (const input of [
     { grossValue: 1.001, issueDate: '2025-07-16', reference: 'bad-decimals' },
@@ -604,12 +630,27 @@ async function run() {
   console.log('\n🖨️  Test 13: Τελικό PDF μετά το MARK');
   const pdfBuffer = await renderFiscalDocumentPdf(originalTpy.id);
   assert(Buffer.isBuffer(pdfBuffer) && pdfBuffer.subarray(0, 4).toString() === '%PDF', 'παράγεται έγκυρο PDF για επιβεβαιωμένο παραστατικό');
+  const artifactBeforeBrandChange = await getFiscalPdfArtifact(originalTpy.id);
+  const pdfDataBeforeBrandChange = await buildFiscalDocumentPdfData(originalTpy.id);
   await handleUpdateCompany(securedCompany.id, {
     pdf_brand_name: 'TEST STAY', pdf_activity: 'ΕΝΟΙΚΙΑΖΟΜΕΝΑ ΔΩΜΑΤΙΑ',
     pdf_address: 'Θήρα 84700', pdf_tax_office: 'Θήρας', pdf_phone: '2286000000', pdf_email: 'billing@example.test',
   });
   const pdfData = await buildFiscalDocumentPdfData(originalTpy.id);
-  assert(pdfData.brandName === 'TEST STAY' && pdfData.issuer.address === 'Θήρα 84700', 'το PDF χρησιμοποιεί το branded προφίλ της εταιρείας');
+  const artifactAfterBrandChange = await getFiscalPdfArtifact(originalTpy.id);
+  let issuerVatMutationBlocked = false;
+  try { await handleUpdateCompany(securedCompany.id, { vat_number: '094524053' }); } catch (error) { issuerVatMutationBlocked = error.status === 409; }
+  assert(issuerVatMutationBlocked, 'το νομικό ΑΦΜ εταιρείας παγώνει μόλις υπάρχει fiscal history');
+  const reassignmentCompany = await handleCreateCompany({
+    company_name: 'Tenant Reassignment Guard', vat_number: '044800455',
+    aade_user_id: 'tenant_guard_user', aade_subscription_key: 'tenant_guard_key', invoice_series: 'TG', active: false,
+  });
+  let listingTenantMutationBlocked = false;
+  try { await handleUpdateListing(securedListing.id, { company_id: reassignmentCompany.id }); } catch (error) { listingTenantMutationBlocked = error.status === 409; }
+  assert(listingTenantMutationBlocked, 'κατάλυμα με reservation/fiscal history δεν μεταφέρεται σε άλλο tenant');
+  assert(pdfData.brandName === pdfDataBeforeBrandChange.brandName
+    && artifactAfterBrandChange.pdf_sha256 === artifactBeforeBrandChange.pdf_sha256
+    && (await renderFiscalDocumentPdf(originalTpy.id)).equals(pdfBuffer), 'το archived PDF/snapshot μένει byte-for-byte immutable μετά από αλλαγή branding');
   assert(pdfData.recipient.vat === 'IE9827384L', 'το ΤΠΥ PDF κρατά τον αντισυμβαλλόμενο του billing snapshot');
   assert(pdfData.creditTotal === 0 && pdfData.balance === Number(originalTpy.gross_value), 'το PDF δεν επινοεί εξόφληση όταν δεν υπάρχει πληροφορία πληρωμής');
   assert(pdfData.lines.every((line) => !Object.hasOwn(line, 'credit')), 'οι πραγματικές γραμμές PDF δεν προσθέτουν πλασματική πίστωση');
@@ -622,6 +663,13 @@ async function run() {
   await db('fiscal_documents').where({ id: seasonalTakkId }).update({
     status: 'sent', verification_status: 'verified', mydata_mark: '400000000099901', mydata_uid: 'UID-SEASONAL-TAKK',
   });
+  let missingArchiveBlocked = false;
+  try { await renderFiscalDocumentPdf(seasonalTakkId); } catch (error) { missingArchiveBlocked = error.status === 409; }
+  assert(missingArchiveBlocked, 'το GET PDF απορρίπτει verified παραστατικό χωρίς archived artifact');
+  const seasonalArchive = await archiveVerifiedFiscalDocumentPdf(seasonalTakkId);
+  const repeatedSeasonalArchive = await archiveVerifiedFiscalDocumentPdf(seasonalTakkId);
+  assert(seasonalArchive.pdf_sha256 === repeatedSeasonalArchive.pdf_sha256
+    && seasonalArchive.pdf_bytes.equals(repeatedSeasonalArchive.pdf_bytes), 'το PDF archive retry είναι idempotent και δεν αντικαθιστά το πρώτο artifact');
   const seasonalTakkPdf = await buildFiscalDocumentPdfData(seasonalTakkId);
   assert(seasonalTakkPdf.lines.map((line) => line.charge).join(',') === '2,0.5' && seasonalTakkPdf.total === 2.5, 'το ΤΑΚΚ PDF κρατά το πραγματικό υψηλό/χαμηλό ποσό κάθε νύχτας όταν αλλάζει περίοδος');
   await db('fiscal_documents').where({ reservation_id: 'res_SEASONAL_TAKK_PDF' }).update({ status: 'cancelled', cancellation_status: 'cancelled' });
@@ -768,6 +816,21 @@ async function run() {
     executor: async () => { schedulerExecutions += 1; return { status: 'completed' }; },
   });
   assert(schedulerExecutions === 2, 'νέα due κράτηση μετά από completed κλείσιμο ανοίγει ξανά την εκτέλεση');
+  const previousGuestyClientId = process.env.GUESTY_CLIENT_ID;
+  const previousGuestyClientSecret = process.env.GUESTY_CLIENT_SECRET;
+  process.env.GUESTY_CLIENT_ID = 'offline-scheduler-client';
+  process.env.GUESTY_CLIENT_SECRET = 'offline-scheduler-secret';
+  const failedReconciliationResults = await runScheduledDailyClose({
+    now: new Date('2025-07-15T20:59:00Z'), timeZone: 'Europe/Athens', closeTime: '23:55',
+    reconciler: async () => { throw new Error('offline reconciliation failure'); },
+    executor: async () => { schedulerExecutions += 1; return { status: 'completed' }; },
+  });
+  assert(schedulerExecutions === 2
+    && failedReconciliationResults.every((row) => row.status === 'error' && row.skipped)
+    && failedReconciliationResults[0].error.includes('offline reconciliation failure'),
+  'αποτυχία Guesty reconciliation μπλοκάρει όλο το scheduled close χωρίς stale sandbox/production αποστολή');
+  if (previousGuestyClientId === undefined) delete process.env.GUESTY_CLIENT_ID; else process.env.GUESTY_CLIENT_ID = previousGuestyClientId;
+  if (previousGuestyClientSecret === undefined) delete process.env.GUESTY_CLIENT_SECRET; else process.env.GUESTY_CLIENT_SECRET = previousGuestyClientSecret;
   const previousMyDataEnv = process.env.MYDATA_ENV;
   const previousProductionEnabled = process.env.MYDATA_PRODUCTION_ENABLED;
   process.env.MYDATA_ENV = 'production';
@@ -815,7 +878,13 @@ async function run() {
     listing_id: securedListing.id, platform_key: 'manual', source_key: 'manual', version: 1,
     status: 'approved', currency: 'EUR', strategy: 'folio_rules',
     line_rules: JSON.stringify([{ normalType: 'AF', action: 'include', allowBroad: true }]),
-    tolerance: 0, minimum_samples: 1, config_hash: 'c'.repeat(64), approved_by: 'smoke-test', approved_at: db.fn.now(),
+    tolerance: 0, minimum_samples: 3,
+    config_hash: profileConfigHash({
+      currency: 'EUR', strategy: 'folio_rules',
+      line_rules: [{ normalType: 'AF', action: 'include', allowBroad: true }],
+      tolerance: 0, minimum_samples: 3,
+    }),
+    approved_by: 'smoke-test', approved_at: db.fn.now(),
   });
   const stagedBaseCore = {
     ...queuedReservation,
@@ -897,6 +966,210 @@ async function run() {
   assert(cancelledPending.length === 2, 'ακύρωση πριν τη διαβίβαση ακυρώνει τα pending παραστατικά τοπικά');
   const resolvedCancellation = await resolveCancellationReview('res_STAGED001', { resolution: 'Guesty cancellation reviewed and all documents cancelled' });
   assert(!Boolean(resolvedCancellation.requires_review) && resolvedCancellation.reviewed_at, 'ακυρωμένη κράτηση κλείνει το review μόνο όταν όλα τα παραστατικά είναι cancelled');
+  const quarantineReservation = stagedAmount({ ...stagedBase, reservationId: 'res_CANCEL_QUARANTINE' }, 339);
+  await stageReservation(quarantineReservation, billingContext);
+  const quarantineDocuments = await prepareReservationDocuments(quarantineReservation, billingContext);
+  await db('reservation_snapshots').where({ reservation_id: quarantineReservation.reservationId }).update({ materialized_at: db.fn.now() });
+  await db('fiscal_documents').where({ id: quarantineDocuments.primary.document.id }).update({
+    status: 'sent', mydata_mark: '400000000009999', verification_status: 'verified',
+  });
+  const minimalCancellation = normalizeGuestyReservation({
+    _id: quarantineReservation.reservationId,
+    listingId: quarantineReservation.listingId,
+    status: 'cancelled',
+    checkInDateLocalized: quarantineReservation.checkIn,
+    checkOutDateLocalized: quarantineReservation.checkOut,
+    authoritativeCancellation: true,
+  });
+  const quarantinedSnapshot = await stageReservation(minimalCancellation, billingContext);
+  const quarantinedDocuments = await db('fiscal_documents').where({ reservation_id: quarantineReservation.reservationId });
+  assert(minimalCancellation.financials.amountSource === 'authoritative_cancellation'
+    && quarantinedDocuments.find((row) => row.id === quarantineDocuments.climate.document.id).status === 'cancelled'
+    && quarantinedDocuments.find((row) => row.id === quarantineDocuments.primary.document.id).status === 'sent'
+    && quarantinedDocuments.find((row) => row.id === quarantineDocuments.primary.document.id).cancellation_status === 'requested'
+    && Boolean(quarantinedSnapshot.requires_review)
+    && quarantinedSnapshot.last_error.includes('quarantined'),
+  'authoritative cancellation χωρίς Guest Folio ακυρώνει μόνο unsent docs και θέτει sent/in-flight παραστατικά σε review quarantine');
+  await db('fiscal_documents').where({ id: quarantineDocuments.primary.document.id }).update({
+    cancellation_status: 'failed', cancellation_retryable: false, cancellation_uncertain: true,
+    cancellation_error: 'Ambiguous cancellation retained for operator reconciliation',
+  });
+  const automaticCancellationReservation = stagedAmount({ ...stagedBase, reservationId: 'res_AUTO_CANCEL_MARKS' }, 339);
+  await stageReservation(automaticCancellationReservation, billingContext);
+  const automaticCancellationDocuments = await prepareReservationDocuments(automaticCancellationReservation, billingContext);
+  await db('reservation_snapshots').where({ reservation_id: automaticCancellationReservation.reservationId }).update({ materialized_at: db.fn.now() });
+  const automaticMarks = new Map([
+    [automaticCancellationDocuments.primary.document.id, '400000000010001'],
+    [automaticCancellationDocuments.climate.document.id, '400000000010002'],
+  ]);
+  for (const [documentId, mark] of automaticMarks) {
+    await db('fiscal_documents').where({ id: documentId }).update({
+      status: 'sent', mydata_mark: mark, mydata_environment: 'sandbox', verification_status: 'verified',
+    });
+  }
+  await stageReservation(normalizeGuestyReservation({
+    _id: automaticCancellationReservation.reservationId,
+    listingId: automaticCancellationReservation.listingId,
+    status: 'cancelled',
+    checkInDateLocalized: automaticCancellationReservation.checkIn,
+    checkOutDateLocalized: automaticCancellationReservation.checkOut,
+    authoritativeCancellation: true,
+  }), billingContext);
+  const queuedAutomaticCancellations = await db('fiscal_documents').where({ reservation_id: automaticCancellationReservation.reservationId });
+  assert(queuedAutomaticCancellations.length === 2
+    && queuedAutomaticCancellations.every((document) => document.status === 'sent' && document.cancellation_status === 'requested'),
+  'authoritative Guesty cancellation δημιουργεί durable cancellation work για ΑΠΥ/ΤΠΥ και ΤΑΚΚ που έχουν MARK');
+  const automaticCancellationCalls = [];
+  const cancellationMarkFor = (mark) => String(BigInt(mark) + 500000000000000n);
+  await executeDailyClose({
+    companyId: securedCompany.id,
+    businessDate: '2025-07-16',
+    materializer: async () => [],
+    sender: async () => { throw new Error('new invoice transmission must remain blocked during cancellation work'); },
+    cancellationSender: async (mark) => {
+      automaticCancellationCalls.push(String(mark));
+      return { cancellationMark: cancellationMarkFor(mark), raw: { statusCode: 'Success' } };
+    },
+    cancellationVerifier: async (mark) => ({
+      verified: true, invoiceMark: String(mark), cancellationMark: cancellationMarkFor(mark), raw: { verified: true },
+    }),
+  });
+  const automaticallyCancelled = await db('fiscal_documents').where({ reservation_id: automaticCancellationReservation.reservationId });
+  const automaticallyResolvedSnapshot = await db('reservation_snapshots').where({ reservation_id: automaticCancellationReservation.reservationId }).first();
+  assert(automaticCancellationCalls.length === 2
+    && automaticallyCancelled.every((document) => document.status === 'cancelled'
+      && document.cancellation_status === 'cancelled'
+      && document.cancellation_verification_status === 'verified')
+    && !Boolean(automaticallyResolvedSnapshot.requires_review),
+  'daily close καλεί CancelInvoice και RequestTransmittedDocs για κάθε MARK και κλείνει review μόνο μετά από πλήρη verification');
+  await executeDailyClose({
+    companyId: securedCompany.id,
+    businessDate: '2025-07-16',
+    materializer: async () => [],
+    sender: async () => { throw new Error('idempotent cancellation replay must not transmit'); },
+    cancellationSender: async () => { automaticCancellationCalls.push('duplicate'); throw new Error('duplicate CancelInvoice'); },
+    cancellationVerifier: async () => { throw new Error('duplicate cancellation verification'); },
+  });
+  assert(automaticCancellationCalls.length === 2, 'ολοκληρωμένο cancellation work δεν ξαναστέλνει CancelInvoice σε επόμενο close');
+
+  const lateMarkReservation = stagedAmount({ ...stagedBase, reservationId: 'res_CANCEL_LATE_MARK' }, 339);
+  await stageReservation(lateMarkReservation, billingContext);
+  const lateMarkDocuments = await prepareReservationDocuments(lateMarkReservation, billingContext);
+  await db('reservation_snapshots').where({ reservation_id: lateMarkReservation.reservationId }).update({ materialized_at: db.fn.now() });
+  await db('fiscal_documents').where({ id: lateMarkDocuments.primary.document.id }).update({
+    status: 'transmitting', transmission_token: 'late-mark-token', last_attempt_at: db.fn.now(),
+  });
+  await stageReservation(normalizeGuestyReservation({
+    _id: lateMarkReservation.reservationId,
+    listingId: lateMarkReservation.listingId,
+    status: 'cancelled',
+    checkInDateLocalized: lateMarkReservation.checkIn,
+    checkOutDateLocalized: lateMarkReservation.checkOut,
+    authoritativeCancellation: true,
+  }), billingContext);
+  const awaitingLateMark = await db('fiscal_documents').where({ id: lateMarkDocuments.primary.document.id }).first();
+  assert(awaitingLateMark.status === 'transmitting' && awaitingLateMark.cancellation_status === 'requested'
+    && Boolean((await db('reservation_snapshots').where({ reservation_id: lateMarkReservation.reservationId }).first()).requires_review),
+  'in-flight document κρατά durable cancellation request και review μέχρι να επιστρέψει late MARK');
+  await markDocumentSent(lateMarkDocuments.primary.document.id, { mark: '400000000010003', uid: 'late-uid' }, { attemptToken: 'late-mark-token' });
+  let lateMarkCancelCalls = 0;
+  await executeDailyClose({
+    companyId: securedCompany.id,
+    businessDate: '2025-07-17',
+    materializer: async () => [],
+    sender: async () => { throw new Error('late MARK cancellation must precede submissions'); },
+    cancellationSender: async (mark) => { lateMarkCancelCalls += 1; return { cancellationMark: cancellationMarkFor(mark) }; },
+    cancellationVerifier: async (mark) => ({ verified: true, invoiceMark: String(mark), cancellationMark: cancellationMarkFor(mark) }),
+  });
+  const resolvedLateMark = await db('fiscal_documents').where({ id: lateMarkDocuments.primary.document.id }).first();
+  assert(lateMarkCancelCalls === 1 && resolvedLateMark.status === 'cancelled'
+    && resolvedLateMark.cancellation_verification_status === 'verified'
+    && !Boolean((await db('reservation_snapshots').where({ reservation_id: lateMarkReservation.reservationId }).first()).requires_review),
+  'late MARK μετατρέπεται αυτόματα σε CancelInvoice work και επιβεβαιώνεται χωρίς blind resend');
+
+  const [collisionListing] = await db('listings').insert({
+    company_id: reassignmentCompany.id,
+    listing_id_guesty: 'lst_COLLISION_TENANT_B',
+    property_type: 'apartment', default_invoice_type: '11.2',
+    climate_fee_high: 10, climate_fee_low: 1.5,
+    climate_fee_high_category: 24, climate_fee_low_category: 10,
+    climate_fee_series: 'COLLISION-TAKK', payment_method_type: 1, active: true,
+  }).returning('*');
+  const collisionBillingContext = {
+    ...billingContext,
+    company_id: reassignmentCompany.id,
+    listing_id: collisionListing.id,
+    listing_id_guesty: collisionListing.listing_id_guesty,
+    vat_number: reassignmentCompany.vat_number,
+    default_invoice_type: '11.2',
+    invoice_series: reassignmentCompany.invoice_series,
+    climate_fee_high: collisionListing.climate_fee_high,
+    climate_fee_low: collisionListing.climate_fee_low,
+    climate_fee_high_category: collisionListing.climate_fee_high_category,
+    climate_fee_low_category: collisionListing.climate_fee_low_category,
+    climate_fee_series: collisionListing.climate_fee_series,
+  };
+  const ownedReservation = stagedAmount({ ...stagedBase, reservationId: 'res_TENANT_COLLISION' }, 226);
+  const ownedSnapshot = await stageReservation(ownedReservation, billingContext);
+  const ownedDocuments = await prepareReservationDocuments(ownedReservation, billingContext);
+  await db('reservation_snapshots').where({ id: ownedSnapshot.id }).update({ materialized_at: db.fn.now() });
+  let collisionBlocked = false;
+  try {
+    await stageReservation({
+      ...ownedReservation,
+      listingId: collisionListing.listing_id_guesty,
+      status: 'cancelled',
+    }, collisionBillingContext);
+  } catch (error) { collisionBlocked = error.status === 409 && error.code === 'RESERVATION_OWNERSHIP_COLLISION'; }
+  const unchangedOwnedSnapshot = await db('reservation_snapshots').where({ reservation_id: ownedReservation.reservationId }).first();
+  const unchangedOwnedDocuments = await db('fiscal_documents').where({ reservation_id: ownedReservation.reservationId });
+  let collisionReviewOperationsBlocked = 0;
+  try { await reopenForReissue(ownedReservation.reservationId, { resolution: 'Cross-tenant collision must not reopen' }); } catch (error) { if (error.status === 409) collisionReviewOperationsBlocked += 1; }
+  try { await resolveCancellationReview(ownedReservation.reservationId, { resolution: 'Cross-tenant collision must not resolve' }); } catch (error) { if (error.status === 409) collisionReviewOperationsBlocked += 1; }
+  assert(collisionBlocked
+    && Number(unchangedOwnedSnapshot.company_id) === Number(securedCompany.id)
+    && Number(unchangedOwnedSnapshot.listing_id) === Number(securedListing.id)
+    && Number(unchangedOwnedSnapshot.generation) === Number(ownedSnapshot.generation)
+    && unchangedOwnedDocuments.every((document) => document.status === 'pending')
+    && collisionReviewOperationsBlocked === 2,
+  'ίδιο reservation_id από άλλο tenant/listing απορρίπτεται χωρίς snapshot/doc mutation ή review/reissue hijack');
+
+  const tenantBReservation = {
+    ...ownedReservation,
+    reservationId: 'res_STALE_CANCEL_TENANT_B',
+    listingId: collisionListing.listing_id_guesty,
+  };
+  await stageReservation(tenantBReservation, collisionBillingContext);
+  const tenantBDocuments = await prepareReservationDocuments(tenantBReservation, collisionBillingContext);
+  const staleCancellationAt = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString().slice(0, 19).replace('T', ' ');
+  await db('fiscal_documents').where({ id: ownedDocuments.primary.document.id }).update({
+    status: 'sent', mydata_mark: '400000000010101', mydata_environment: 'sandbox',
+    cancellation_status: 'transmitting', cancellation_token: 'tenant-a-stale', cancellation_attempt_at: staleCancellationAt,
+  });
+  await db('fiscal_documents').where({ id: tenantBDocuments.primary.document.id }).update({
+    status: 'sent', mydata_mark: '400000000010102', mydata_environment: 'sandbox',
+    cancellation_status: 'transmitting', cancellation_token: 'tenant-b-stale', cancellation_attempt_at: staleCancellationAt,
+  });
+  await quarantineStaleCancellations(securedCompany.id, 1);
+  const sweptTenantA = await db('fiscal_documents').where({ id: ownedDocuments.primary.document.id }).first();
+  const untouchedTenantB = await db('fiscal_documents').where({ id: tenantBDocuments.primary.document.id }).first();
+  assert(sweptTenantA.cancellation_status === 'failed' && Boolean(sweptTenantA.cancellation_uncertain)
+    && untouchedTenantB.cancellation_status === 'transmitting' && !Boolean(untouchedTenantB.cancellation_uncertain),
+  'stale cancellation sweep περιορίζεται στην εταιρεία και δεν μεταβάλλει άλλο tenant');
+  await db('fiscal_documents').whereIn('id', [ownedDocuments.primary.document.id, tenantBDocuments.primary.document.id]).update({
+    status: 'cancelled', cancellation_status: 'cancelled', cancellation_uncertain: false, cancellation_token: null,
+  });
+  const inactiveAtClose = stagedAmount({ ...stagedBase, reservationId: 'res_INACTIVE_AT_CLOSE' }, 226);
+  await stageReservation(inactiveAtClose, billingContext);
+  await db('listings').where({ id: securedListing.id }).update({ active: false });
+  const inactiveAtCloseResults = await materializeDueReservations(securedCompany.id, '2025-07-15', { useGuestyRefresh: false });
+  await db('listings').where({ id: securedListing.id }).update({ active: true });
+  const inactiveAtCloseResult = inactiveAtCloseResults.find((row) => row.reservationId === inactiveAtClose.reservationId);
+  const inactiveAtCloseSnapshot = await db('reservation_snapshots').where({ reservation_id: inactiveAtClose.reservationId }).first();
+  assert(inactiveAtCloseResult?.error.includes('inactive')
+    && Boolean(inactiveAtCloseSnapshot.requires_review)
+    && (await db('fiscal_documents').where({ reservation_id: inactiveAtClose.reservationId })).length === 0,
+  'listing/company που απενεργοποιήθηκε μετά το staging μπλοκάρεται fail-closed στο materialization και μπαίνει σε review');
   const failedMaterializationRun = await executeDailyClose({
     companyId: securedCompany.id,
     businessDate: '2025-01-01',
@@ -1209,8 +1482,10 @@ async function run() {
     mydata_uid: 'UID-ACCEPTANCE-CREDIT', mydata_environment: 'sandbox',
     mydata_response: JSON.stringify({ statusCode: 'Success', invoiceMark: '710000000000001' }),
   });
+  await archiveVerifiedFiscalDocumentPdf(acceptanceCreditResult.document.id);
   const acceptanceCredit = await db('fiscal_documents').where({ id: acceptanceCreditResult.document.id }).first();
 
+  await db('companies').where({ id: reassignmentCompany.id }).update({ active: true });
   const anotherCompany = await db('companies').whereNot({ id: securedCompany.id }).where({ active: true }).first();
   let wrongCompanyBlocked = false;
   try {
@@ -1271,6 +1546,96 @@ async function run() {
   });
   assert(reconciliation.discovered === 1 && reconciliation.staged === 1 && await db('reservation_snapshots').where({ reservation_id: recoveredId }).first(), 'χαμένο webhook ανακαλύπτεται από lastUpdatedAt backfill και γίνεται stage');
   assert((await db('sync_cursors').where({ provider: 'guesty', cursor_key: 'reservations_last_updated' }).first()).cursor_value === '2026-07-31T00:00:00.000Z', 'ο Guesty cursor προχωρά μόνο μετά από πλήρη επιτυχία');
+  const successfulReconciliationEvidence = await db('integration_checks').where({ check_key: 'guesty:reservation_reconciliation' }).first();
+  assert(successfulReconciliationEvidence.status === 'success'
+    && JSON.parse(successfulReconciliationEvidence.message).successfulWatermark === '2026-07-31T00:00:00.000Z',
+  'η επιτυχής συμφωνία αποθηκεύει durable run evidence μαζί με το watermark');
+  let failedReconciliationRecorded = false;
+  try {
+    await runGuestyReconciliation({
+      from: '2026-07-31T00:00:00.000Z', to: '2026-08-01T00:00:00.000Z',
+      searcher: async () => ['res_FAILED_BACKFILL'],
+      fetcher: async () => { throw new Error('Guesty core unavailable'); },
+    });
+  } catch (error) { failedReconciliationRecorded = error.status === 502; }
+  const failedReconciliationEvidence = await db('integration_checks').where({ check_key: 'guesty:reservation_reconciliation' }).first();
+  assert(failedReconciliationRecorded
+    && failedReconciliationEvidence.status === 'failed'
+    && JSON.parse(failedReconciliationEvidence.message).priorSuccessfulWatermark === '2026-07-31T00:00:00.000Z'
+    && (await db('sync_cursors').where({ provider: 'guesty', cursor_key: 'reservations_last_updated' }).first()).cursor_value === '2026-07-31T00:00:00.000Z',
+  'αποτυχημένο backfill αφήνει το τελευταίο επιτυχές watermark ακίνητο και γράφει durable failure evidence');
+  const lateMappingReservationId = 'res_LATE_MAPPING';
+  const lateMappingListingId = 'lst_LATE_MAPPING';
+  const lateMappingPayload = {
+    _id: lateMappingReservationId, listingId: lateMappingListingId, status: 'confirmed',
+    checkInDateLocalized: '2026-07-30', checkOutDateLocalized: '2026-07-31', fiscalCurrency: 'EUR',
+    fiscalFolioOverview: {
+      reservationId: lateMappingReservationId, listingId: lateMappingListingId,
+      platform: 'manual', source: 'manual', currency: 'EUR', updatedAt: '2026-08-01T12:00:00.000Z',
+    },
+    fiscalInvoiceItems: [{
+      id: 'late-mapping-af', normalType: 'AF', title: 'Accommodation fare', totalPrice: 113,
+      listingId: lateMappingListingId, stayIndex: 0,
+    }],
+  };
+  const unresolvedRun = await runGuestyReconciliation({
+    from: '2026-08-01T00:00:00.000Z', to: '2026-08-02T00:00:00.000Z',
+    searcher: async () => [lateMappingReservationId],
+    fetcher: async () => lateMappingPayload,
+  });
+  const unresolvedInbox = await db('guesty_reconciliation_inbox').where({ reservation_id: lateMappingReservationId }).first();
+  assert(unresolvedRun.watermark === '2026-08-02T00:00:00.000Z'
+    && unresolvedInbox.status === 'unresolved'
+    && unresolvedInbox.reason === 'unmapped_listing'
+    && Number(unresolvedInbox.attempts) === 1,
+  'unmapped Guesty row αποθηκεύεται durable και ο cursor προχωρά χωρίς απώλεια');
+  await db('listings').insert({
+    company_id: securedCompany.id, listing_id_guesty: lateMappingListingId,
+    property_type: 'apartment', default_invoice_type: '11.2',
+    climate_fee_high: 10, climate_fee_low: 1.5,
+    climate_fee_high_category: 24, climate_fee_low_category: 10,
+    climate_fee_series: 'LATE-TAKK', payment_method_type: 1, active: true,
+  });
+  const resolvedRun = await runGuestyReconciliation({
+    from: '2026-08-02T00:00:00.000Z', to: '2026-08-03T00:00:00.000Z',
+    searcher: async () => [],
+    fetcher: async (reservationId) => {
+      if (reservationId !== lateMappingReservationId) throw new Error('unexpected DLQ retry id');
+      return lateMappingPayload;
+    },
+  });
+  const resolvedInbox = await db('guesty_reconciliation_inbox').where({ reservation_id: lateMappingReservationId }).first();
+  const idempotentEmptyRetry = await retryGuestyUnresolvedReservations({ fetcher: async () => { throw new Error('resolved rows must not be fetched'); } });
+  assert(resolvedRun.retried === 1
+    && resolvedInbox.status === 'resolved'
+    && resolvedInbox.resolved_at
+    && Number(resolvedInbox.attempts) === 2
+    && await db('reservation_snapshots').where({ reservation_id: lateMappingReservationId }).first()
+    && idempotentEmptyRetry.attempted === 0,
+  'μόλις προστεθεί mapping το unresolved row γίνεται retry/stage/resolved ακριβώς μία φορά');
+
+  const manualProfile = await getApprovedFinancialProfile(securedListing.id, 'manual', 'manual');
+  const profileRaceReservation = stagedAmount({
+    ...stagedBase,
+    reservationId: 'res_PROFILE_TOCTOU',
+    status: 'confirmed',
+  }, 226);
+  await stageReservation(profileRaceReservation, billingContext);
+  const profileRaceResults = await materializeDueReservations(securedCompany.id, '2026-08-04', {
+    useGuestyRefresh: false,
+    beforeMaterializationTransaction: async ({ reservation }) => {
+      if (reservation.reservationId === profileRaceReservation.reservationId) {
+        await db('financial_profiles').where({ id: manualProfile.id }).update({ status: 'suspended', updated_at: db.fn.now() });
+      }
+    },
+  });
+  await db('financial_profiles').where({ id: manualProfile.id }).update({ status: 'approved', updated_at: db.fn.now() });
+  const profileRaceResult = profileRaceResults.find((row) => row.reservationId === profileRaceReservation.reservationId);
+  const profileRaceSnapshot = await db('reservation_snapshots').where({ reservation_id: profileRaceReservation.reservationId }).first();
+  assert(profileRaceResult?.error.includes('Approved financial profile changed')
+    && Boolean(profileRaceSnapshot.requires_review)
+    && (await db('fiscal_documents').where({ reservation_id: profileRaceReservation.reservationId })).length === 0,
+  'profile που ανακλήθηκε μετά το calculation επανελέγχεται transactionally πριν δεσμευτούν ΑΑ/παραστατικά');
 
   // ── Results ──────────────────────────────────────────────────────────────
   console.log(`\n${'─'.repeat(45)}`);

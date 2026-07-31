@@ -25,6 +25,12 @@ async function createCreditDocument({ documentId, grossValue, issueDate, referen
   if (!['2.1', '11.2'].includes(original.document_type)) {
     const error = new Error('Credits are supported for original 2.1 or 11.2 documents'); error.status = 409; throw error;
   }
+  const currentEnvironment = process.env.MYDATA_ENV || 'sandbox';
+  if (original.mydata_environment !== currentEnvironment || original.target_environment !== currentEnvironment) {
+    const error = new Error(`Original document belongs to myDATA ${original.mydata_environment || original.target_environment || 'unknown'} and cannot receive a ${currentEnvironment} credit`);
+    error.status = 409;
+    throw error;
+  }
   const amount = Number(grossValue);
   if (!Number.isFinite(amount) || amount <= 0 || amount > Number(original.gross_value) || Math.abs(amount * 100 - Math.round(amount * 100)) > 1e-8) {
     const error = new Error('gross_value must have up to 2 decimals, be positive and not exceed the original gross value'); error.status = 400; throw error;
@@ -61,13 +67,16 @@ async function createCreditDocument({ documentId, grossValue, issueDate, referen
       const lockedOriginal = await lockedQuery.first();
       if (!lockedOriginal || lockedOriginal.status !== 'sent' || !lockedOriginal.mydata_mark
           || lockedOriginal.verification_status !== 'verified'
-          || !['none', null].includes(lockedOriginal.cancellation_status)) {
+          || !['none', null].includes(lockedOriginal.cancellation_status)
+          || lockedOriginal.mydata_environment !== currentEnvironment
+          || lockedOriginal.target_environment !== currentEnvironment) {
         const error = new Error('Original document is no longer eligible for a credit'); error.status = 409; throw error;
       }
       const existing = await trx('fiscal_documents').where({ document_key: documentKey }).first();
       if (existing) {
         if (Number(existing.gross_value) !== amount || String(existing.issue_date).slice(0, 10) !== issueDate
-            || Number(existing.related_document_id) !== Number(lockedOriginal.id)) {
+            || Number(existing.related_document_id) !== Number(lockedOriginal.id)
+            || existing.target_environment !== currentEnvironment) {
           const error = new Error('Credit reference already exists with a different amount, date, or original document'); error.status = 409; throw error;
         }
         return { document: existing, created: false };
@@ -101,7 +110,8 @@ async function createCreditDocument({ documentId, grossValue, issueDate, referen
     if (duplicate) {
       const existing = await findDocumentByKey(documentKey);
       if (existing && Number(existing.gross_value) === amount && String(existing.issue_date).slice(0, 10) === issueDate
-          && Number(existing.related_document_id) === Number(original.id)) return { document: existing, created: false };
+          && Number(existing.related_document_id) === Number(original.id)
+          && existing.target_environment === currentEnvironment) return { document: existing, created: false };
       if (existing) throw Object.assign(new Error('Credit reference already exists with different fiscal data'), { status: 409 });
     }
     throw error;

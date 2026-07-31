@@ -29,6 +29,23 @@ openssl rand -base64 32
 The first value can be used for `ADMIN_API_TOKEN`; the second is the
 `DATA_ENCRYPTION_KEY`.
 
+## External production prerequisites
+
+The repository does not provision or approve the external systems required for
+production. Before activation, the operator must have:
+
+- a Guesty Pro account with Open API access, the required reservation webhook
+  subscription, and representative real reservations for every active channel;
+- separate AADE myDATA credentials for every legal entity, tested first in the
+  correct sandbox and then in the correct production environment;
+- accountant-confirmed taxable gross and document policy for every exact
+  `listing/platform/source`, including Booking.com, Airbnb, each other OTA or
+  direct source, and the Guesty Booking Engine;
+- public DNS and TLS termination for the webhook, PostgreSQL 16, a platform
+  secret manager, encrypted off-site backups, and a tested restore procedure;
+- named operational and accounting owners for the review queue, reconciliation
+  inbox, uncertain transmissions/cancellations, and production activation.
+
 ## Render deployment
 
 1. Commit and push the reviewed repository to a private GitHub repository.
@@ -40,6 +57,8 @@ The first value can be used for `ADMIN_API_TOKEN`; the second is the
 5. Deploy manually. Automatic deploys are deliberately disabled.
 6. Confirm `GET https://<render-host>/health/ready` succeeds and inspect the
    startup logs for a successful PostgreSQL schema initialization.
+   This endpoint proves basic process/database availability only; fiscal
+   readiness is reported by the authenticated `/api/readiness` endpoint.
 7. Open `https://<render-host>/admin`, enter the bearer token, configure each
    company and listing, and run the Guesty and myDATA sandbox connection tests.
 8. Register this Guesty webhook URL and subscribe it to the required reservation
@@ -64,6 +83,10 @@ The first value can be used for `ADMIN_API_TOKEN`; the second is the
 11. Send a controlled reservation through sandbox, run daily close manually,
     verify the transmitted document through the API, review the MARK/UID and PDF,
     and obtain accountant approval.
+12. Inspect `GET /api/connections/guesty/reconciliation-inbox?status=unresolved`.
+    Correct every missing/inactive mapping and call
+    `POST /api/connections/guesty/reconciliation-inbox/retry` until the inbox is
+    empty. Do not delete or bypass unresolved entries.
 
 Do not expose the Render PostgreSQL public endpoint unless it is temporarily
 required for a controlled maintenance task. The Blueprint connects over the
@@ -96,6 +119,32 @@ The Compose template explicitly declares `DB_PRIVATE_NETWORK=true` because its
 PostgreSQL port is not published outside the private Docker bridge. Managed or
 remote PostgreSQL must instead use `DB_SSL=true` with certificate verification.
 
+## Runtime safety model
+
+- The scheduled close runs Guesty reconciliation before deciding what is due.
+  If reconciliation fails, every company execution for that tick is skipped and
+  no staged fiscal document is transmitted as if the Guesty view were complete.
+- Unmapped or inactive Guesty reservations are retained in the reconciliation
+  inbox while the successful watermark advances. The next reconciliation and
+  the explicit retry endpoint revisit those entries after configuration is fixed.
+  A general Guesty fetch/search outage still fails the run and keeps the prior
+  successful watermark unchanged.
+- Financial profiles are independent for every exact
+  `listing × platform × source`. No Booking.com, Airbnb, other OTA/direct, or
+  Guesty Booking Engine profile is inherited by another combination.
+- The production submission guard evaluates tenant-scoped readiness with
+  `GET /api/readiness?company_id=<id>`. A fiscal issue in another company does
+  not block this company's submissions; runtime-wide configuration remains a
+  global prerequisite.
+- A verified invoice MARK and its exact PDF bytes, SHA-256, issuer/recipient and
+  render snapshot are archived atomically. PDF download serves only this
+  MARK-bound artifact. Branding changes do not rewrite an issued PDF.
+- A successful `CancelInvoice` initially stores its cancellation MARK as pending
+  verification. Before the next daily close submits new invoices for that
+  company, it automatically verifies every due pending cancellation through
+  `RequestTransmittedDocs`. Failure blocks that company's close. The manual
+  reconcile endpoint remains available for uncertain or operator-driven recovery.
+
 ## Sandbox acceptance gate
 
 Before production activation, all of the following must be recorded:
@@ -113,7 +162,9 @@ Before production activation, all of the following must be recorded:
 5. Every observed active `listing/platform/source` covered by an approved,
    versioned financial profile with the required passing calibration samples.
 6. No unresolved reservation review items.
-7. `GET /api/readiness` reports sandbox ready.
+7. No unresolved Guesty reconciliation inbox entries after an explicit retry.
+8. `GET /api/readiness?company_id=<id>` reports sandbox ready for each company;
+   the unscoped endpoint is used as an overall operations view.
 
 ## Controlled production activation
 
@@ -127,10 +178,14 @@ Take a fresh database backup first. Then, in one maintenance window:
 4. Set `MYDATA_PRODUCTION_ENABLED=true` only after both previous values have
    been independently reviewed.
 5. Redeploy one instance and rerun every company connection test.
-6. Issue and immediately verify one controlled low-risk production document.
-7. Enable `DAILY_CLOSE_ENABLED=true` only after that document and its PDF have
+6. Run Guesty reconciliation, retry the unresolved inbox and verify that its
+   successful watermark covers the maintenance window before enabling sends.
+7. Issue and immediately verify one controlled low-risk production document.
+8. Confirm the document has one immutable PDF artifact and that repeated PDF
+   downloads match its archived SHA-256.
+9. Enable `DAILY_CLOSE_ENABLED=true` only after that document and its PDF have
    been approved. Redeploy and confirm the next scheduled business date.
-8. Restore or replay any Guesty deliveries received during the maintenance
+10. Restore or replay any Guesty deliveries received during the maintenance
    window and check the review queue.
 
 Never use a production AADE credential while `MYDATA_ENV=sandbox`, or a sandbox
@@ -159,6 +214,11 @@ has completed successfully. To restore, first stop the app and use a new empty
 database. The following operation overwrites database contents and therefore
 requires explicit approval and a verified backup:
 
+The database dump contains fiscal XML, Guesty-derived snapshots, recipient data,
+and the exact archived PDF bytes. Treat the dump as sensitive accounting and
+personal data both at rest and in transit; storage encryption is an external
+deployment responsibility.
+
 ```bash
 docker compose stop app
 docker compose exec -T postgres sh -c 'dropdb -U "$POSTGRES_USER" --if-exists "$POSTGRES_DB" && createdb -U "$POSTGRES_USER" "$POSTGRES_DB"'
@@ -166,8 +226,11 @@ docker compose exec -T postgres sh -c 'pg_restore -U "$POSTGRES_USER" -d "$POSTG
 docker compose start app
 ```
 
-After restoration, confirm readiness, document counts, MARK/UID records, recent
-daily-close runs, and connection checks before reopening webhook traffic.
+After restoration, confirm tenant-scoped readiness, document counts, MARK/UID
+records, one `fiscal_pdf_artifacts` row for every verified active fiscal document,
+artifact SHA-256 integrity, recent daily-close runs, the Guesty successful
+watermark, reconciliation inbox, and connection checks before reopening webhook
+traffic.
 
 ## Encryption-key escrow
 
@@ -215,3 +278,33 @@ curl --fail http://127.0.0.1:3001/health/ready
 
 Keep `MYDATA_PRODUCTION_ENABLED=false` during investigation unless continued
 production transmission is an explicit, reviewed decision.
+
+## Current operational gaps
+
+The following capabilities are not implemented by this repository and must not
+be assumed during production planning:
+
+- PDF email/Guesty-message delivery, a delivery outbox, recipient delivery audit,
+  bounce handling, and retry are absent. PDFs are archived and downloadable by
+  an authenticated admin only.
+- The admin API uses one shared bearer token. It does not provide per-user
+  identity, company membership, RBAC, MFA, or separation of accounting and
+  operational duties.
+- The scheduler runs inside the single web process with one global timezone and
+  close time. There is no external durable scheduler, per-company timezone, or
+  supported multi-replica leader election.
+- The Compose file supplies a local PostgreSQL volume but no automated backup,
+  off-site copy, retention enforcement, restore drill, or backup-age alert.
+- Schema initialization is performed by the application migration command/startup
+  code; there is no independently versioned rollback migration chain.
+- Logging is console-based. There is no bundled metrics/tracing/alerting stack or
+  automatic paging for reconciliation lag, unresolved inbox age, failed closes,
+  uncertain MARKs, backup age, or PDF archive corruption.
+- Fiscal retries do not provide a general exponential-backoff job queue or a
+  separately operated dead-letter queue. The Guesty reconciliation inbox is
+  specific to unresolved mapping/inactive-listing records and their retry errors;
+  it is not a universal job queue.
+
+Production deployment therefore requires external backup automation,
+monitoring/alerting, access-control compensating controls, and an explicit manual
+PDF delivery process until those application features are implemented.

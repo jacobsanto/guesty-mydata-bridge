@@ -94,13 +94,23 @@ router.post('/webhook/guesty-reservation', async (req, res) => {
   let reservation;
   try {
     reservation = normalizeGuestyReservation(req.body);
-    if ((!reservation.financials?.totalGross || !reservation.status) && process.env.GUESTY_CLIENT_ID) {
+    const cancellationRequiresAuthoritativeRefresh = ['cancelled', 'canceled'].includes(reservation.status);
+    const incompleteFiscalPayload = !reservation.financials?.totalGross || !reservation.status;
+    if (cancellationRequiresAuthoritativeRefresh || incompleteFiscalPayload) {
+      if (!process.env.GUESTY_CLIENT_ID || !process.env.GUESTY_CLIENT_SECRET) {
+        throw new Error('Guesty credentials are required for authoritative reservation enrichment');
+      }
       const full = await fetchReservation(reservation.reservationId);
       reservation = normalizeGuestyReservation(full);
     }
   } catch (error) {
-    const reservationId = req.body?.reservation?._id || req.body?._id || req.body?.reservationId;
-    if (!reservationId || !process.env.GUESTY_CLIENT_ID) {
+    const reservationId = req.body?.reservation?._id
+      || req.body?.reservation?.reservationId
+      || req.body?.reservation?.id
+      || req.body?._id
+      || req.body?.reservationId
+      || req.body?.id;
+    if (!reservationId || !process.env.GUESTY_CLIENT_ID || !process.env.GUESTY_CLIENT_SECRET) {
       return res.status(422).json({ error: `Invalid Guesty reservation payload: ${error.message}` });
     }
     try {

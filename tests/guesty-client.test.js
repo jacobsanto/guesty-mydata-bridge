@@ -63,3 +63,29 @@ test('Guesty fiscal fetch fails closed when the reservation keeps changing', asy
     /changed while its fiscal folio was being read/,
   );
 });
+
+test('Guesty cancellation ingestion uses only a stable authoritative reservation and never requires Guest Folio', async () => {
+  const reservationId = 'res-cancelled-without-folio';
+  let reservationReads = 0;
+  let folioReads = 0;
+  const get = (url) => {
+    if (url.endsWith('/reservations-v3')) {
+      reservationReads += 1;
+      return response([{
+        _id: reservationId,
+        listingId: 'listing-1',
+        status: 'cancelled',
+        checkInDateLocalized: '2026-07-30',
+        checkOutDateLocalized: '2026-07-31',
+        lastUpdatedAt: '2026-07-31T12:00:00Z',
+      }]);
+    }
+    folioReads += 1;
+    throw new Error('Guest Folio no longer exists');
+  };
+  const snapshot = await fetchConsistentReservationSnapshot(reservationId, { get });
+  assert.equal(snapshot.status, 'cancelled');
+  assert.equal(snapshot.authoritativeCancellation, true);
+  assert.equal(reservationReads, 2);
+  assert.equal(folioReads, 0);
+});

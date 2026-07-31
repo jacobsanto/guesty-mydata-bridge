@@ -5,6 +5,7 @@ const { getCompanyById } = require('../repositories/companies');
 const { getListingById } = require('../repositories/listings');
 const { createDocumentPdf } = require('../pdf/document-pdf');
 const { calculateClimateFeePerNight } = require('../mydata-xml');
+const { getFiscalPdfArtifact, insertFiscalPdfArtifactOnce } = require('../repositories/fiscal-pdf-artifacts');
 
 function displayDate(value) {
   const [year, month, day] = String(value || '').slice(0, 10).split('-');
@@ -48,16 +49,23 @@ function stayLines(document, source, listing) {
   });
 }
 
-async function buildFiscalDocumentPdfData(documentId) {
-  const document = await getDocumentById(documentId);
+function assertDocumentCanHavePdf(document, { allowPendingVerification = false, mark } = {}) {
   if (!document) { const error = new Error('Fiscal document not found'); error.status = 404; throw error; }
   if (document.status !== 'sent' || ![null, undefined, 'none'].includes(document.cancellation_status)) {
     const error = new Error('PDF is unavailable for unsent documents or while cancellation is unresolved'); error.status = 409; throw error;
   }
-  if (!document.mydata_mark || document.verification_status !== 'verified') {
+  const verified = document.verification_status === 'verified'
+    || (allowPendingVerification && mark && String(mark) === String(document.mydata_mark));
+  if (!document.mydata_mark || !verified) {
     const error = new Error('PDF is available only after myDATA MARK verification'); error.status = 409; throw error;
   }
+}
+
+async function buildLiveFiscalDocumentPdfData(document, evidence = {}) {
   const [company, listing] = await Promise.all([getCompanyById(document.company_id), getListingById(document.listing_id)]);
+  if (!company || !listing) {
+    const error = new Error('Fiscal PDF issuer or listing snapshot source is unavailable'); error.status = 409; throw error;
+  }
   const source = sourceOf(document);
   const guest = source.guest || {};
   const isB2B = ['2.1', '5.1'].includes(document.document_type);
@@ -95,8 +103,8 @@ async function buildFiscalDocumentPdfData(documentId) {
     number: document.aa,
     issueDate: displayDate(document.issue_date),
     mark: document.mydata_mark,
-    uid: document.mydata_uid,
-    qrUrl: document.mydata_qr_url,
+    uid: evidence.uid || document.mydata_uid,
+    qrUrl: evidence.qrUrl || document.mydata_qr_url,
     lines: stayLines(document, { ...source, listingId: listing.listing_id_guesty }, listing),
     netValue: Number(document.net_value),
     vatRate: 13,
@@ -107,8 +115,58 @@ async function buildFiscalDocumentPdfData(documentId) {
   };
 }
 
-async function renderFiscalDocumentPdf(documentId) {
-  return createDocumentPdf([await buildFiscalDocumentPdfData(documentId)]);
+async function prepareFiscalDocumentPdfArtifact(documentId, evidence = {}) {
+  const document = await getDocumentById(documentId);
+  assertDocumentCanHavePdf(document, {
+    allowPendingVerification: evidence.verified === true,
+    mark: evidence.mark,
+  });
+  const renderSnapshot = await buildLiveFiscalDocumentPdfData(document, evidence);
+  const pdfBytes = await createDocumentPdf([renderSnapshot]);
+  return {
+    documentId: document.id,
+    companyId: document.company_id,
+    mark: document.mydata_mark,
+    uid: evidence.uid || document.mydata_uid || null,
+    pdfBytes,
+    renderSnapshot,
+    renderVersion: 'fiscal-pdf-v1',
+  };
 }
 
-module.exports = { renderFiscalDocumentPdf, buildFiscalDocumentPdfData };
+async function archiveVerifiedFiscalDocumentPdf(documentId) {
+  const prepared = await prepareFiscalDocumentPdfArtifact(documentId);
+  return insertFiscalPdfArtifactOnce(prepared);
+}
+
+async function archivedArtifact(documentId) {
+  const document = await getDocumentById(documentId);
+  assertDocumentCanHavePdf(document);
+  const artifact = await getFiscalPdfArtifact(documentId);
+  if (!artifact) {
+    const error = new Error('PDF has not been archived yet'); error.status = 409; throw error;
+  }
+  if (Number(artifact.company_id) !== Number(document.company_id)
+      || String(artifact.mydata_mark) !== String(document.mydata_mark)) {
+    const error = new Error('Archived PDF fiscal identity does not match the document'); error.status = 409; throw error;
+  }
+  return artifact;
+}
+
+async function buildFiscalDocumentPdfData(documentId) {
+  const artifact = await archivedArtifact(documentId);
+  try { return JSON.parse(artifact.render_snapshot); } catch {
+    const error = new Error('Archived PDF render snapshot is invalid'); error.status = 500; throw error;
+  }
+}
+
+async function renderFiscalDocumentPdf(documentId) {
+  return (await archivedArtifact(documentId)).pdf_bytes;
+}
+
+module.exports = {
+  renderFiscalDocumentPdf,
+  buildFiscalDocumentPdfData,
+  prepareFiscalDocumentPdfArtifact,
+  archiveVerifiedFiscalDocumentPdf,
+};

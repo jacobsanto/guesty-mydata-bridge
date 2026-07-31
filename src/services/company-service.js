@@ -10,6 +10,7 @@ const {
 const { encryptSecret, decryptCompanySecret, companySecretContext } = require('../security/credentials');
 const { deleteIntegrationChecks } = require('../repositories/integration-checks');
 const { hasValidGreekVatChecksum, normalizeGreekVat } = require('../validation/fiscal-fields');
+const { db } = require('../database');
 
 function sanitizeVatNumber(value) {
   return normalizeGreekVat(value);
@@ -214,6 +215,12 @@ async function handleUpdateCompany(id, payload) {
   }
 
   if (normalized.vat_number && normalized.vat_number !== existing.vat_number) {
+    const fiscalHistory = await db('fiscal_documents').where({ company_id: existing.id }).first('id');
+    if (fiscalHistory) {
+      const error = new Error('Company VAT cannot change after fiscal document history exists; create a new company tenant instead');
+      error.status = 409;
+      throw error;
+    }
     const vatConflict = await getCompanyByVatNumber(normalized.vat_number);
     if (vatConflict && vatConflict.id !== existing.id) {
       const error = new Error(`Company with VAT ${normalized.vat_number} already exists`);
