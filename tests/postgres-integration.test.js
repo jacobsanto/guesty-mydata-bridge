@@ -33,13 +33,13 @@ if (process.env.POSTGRES_INTEGRATION_TEST !== 'true') {
     });
   }
 
-  async function insertFiscalDocument({ key, type = '11.2', series, aa }) {
+  async function insertFiscalDocument({ key, type = '11.2', series, aa, kind = 'service_receipt', retryable = true }) {
     await db('fiscal_documents').insert({
       document_key: key,
       company_id: company.id,
       listing_id: listing.id,
       reservation_id: key,
-      document_kind: 'service_receipt',
+      document_kind: kind,
       document_type: type,
       series,
       aa,
@@ -49,6 +49,7 @@ if (process.env.POSTGRES_INTEGRATION_TEST !== 'true') {
       other_taxes_amount: 0,
       gross_value: 113,
       status: 'pending',
+      retryable,
       xml_payload: `<invoice aa="${aa}"/>`,
       source_payload: '{}',
     });
@@ -204,7 +205,9 @@ if (process.env.POSTGRES_INTEGRATION_TEST !== 'true') {
   });
 
   test('late transmission responses never downgrade verified or cancelled fiscal state', async () => {
-    const document = await insertFiscalDocument({ key: 'pg-late-mark', series: 'PG-LATE', aa: 1 });
+    const document = await insertFiscalDocument({
+      key: 'pg-late-mark', series: 'PG-LATE', aa: 1, kind: 'credit_note', retryable: true,
+    });
     const attemptToken = await claimDocument(document.id);
     assert(attemptToken);
     await db('fiscal_documents').where({ id: document.id }).update({
@@ -310,6 +313,9 @@ if (process.env.POSTGRES_INTEGRATION_TEST !== 'true') {
     assert.equal(Number(partial.failed_count), 0);
 
     await db('fiscal_documents').where({ id: document.id }).update({ status: 'sent', mydata_mark: 'PG-LATE-MARK' });
+    await db('fiscal_documents').where({ company_id: company.id }).whereNot({ id: document.id }).update({
+      status: 'cancelled', cancellation_status: 'cancelled',
+    });
     const verificationRun = await beginRun(company.id, '2026-08-01', { leaseSeconds: 30 });
     await recordVerificationResult(verificationRun.id, document.id, 'PG-LATE-MARK', { verified: true }, verificationRun.lease_token);
     const completed = await finishRun(verificationRun.id, {}, verificationRun.lease_token);
