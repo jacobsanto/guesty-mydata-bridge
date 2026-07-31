@@ -1,5 +1,6 @@
 'use strict';
 
+const crypto = require('crypto');
 const { db } = require('../database');
 const { insertedId } = require('../database-utils');
 
@@ -131,6 +132,7 @@ async function listTransmittableDocuments(companyId, businessDate, maxAttempts =
 }
 
 async function claimDocument(id) {
+  const transmissionToken = crypto.randomUUID();
   const changed = await db('fiscal_documents')
     .where({ id })
     .whereIn('status', ['pending', 'failed'])
@@ -147,9 +149,10 @@ async function claimDocument(id) {
       attempt_count: db.raw('attempt_count + 1'),
       last_attempt_at: db.fn.now(),
       error_message: null,
+      transmission_token: transmissionToken,
       updated_at: db.fn.now(),
     });
-  return changed === 1;
+  return changed === 1 ? transmissionToken : null;
 }
 
 async function listBlockedDueDocuments(companyId, businessDate, maxAttempts = 5) {
@@ -175,20 +178,79 @@ async function listInFlightDocuments(companyId, businessDate) {
     .orderBy('id', 'asc');
 }
 
-async function markDocumentSent(id, response) {
-  await db('fiscal_documents').where({ id }).update({
-    status: 'sent',
-    mydata_mark: response.mark,
-    mydata_uid: response.uid || null,
-    mydata_qr_url: response.qrUrl || null,
-    mydata_response: JSON.stringify(response.raw || response),
-    mydata_environment: process.env.MYDATA_ENV || 'sandbox',
-    sent_at: db.fn.now(),
-    verification_status: 'pending',
-    verification_error: null,
-    retryable: false,
-    transmission_uncertain: false,
-    updated_at: db.fn.now(),
+async function hasDueFiscalWork(companyId, businessDate, client = db) {
+  const row = await client('fiscal_documents as d')
+    .leftJoin('reservation_snapshots as review', 'review.reservation_id', 'd.reservation_id')
+    .where({ 'd.company_id': companyId })
+    .where('d.issue_date', '<=', businessDate)
+    .where((due) => due
+      .whereIn('d.status', ['pending', 'failed', 'transmitting'])
+      .orWhere((sent) => sent.where({ 'd.status': 'sent' }).andWhere((verification) => verification
+        .whereNot({ 'd.verification_status': 'verified' })
+        .orWhereNull('d.verification_status')))
+      .orWhere({ 'review.requires_review': true }))
+    .first('d.id');
+  if (row) return true;
+  const snapshot = await client('reservation_snapshots')
+    .where({ company_id: companyId, requires_review: false })
+    .whereNull('materialized_at')
+    .where('check_out', '<=', businessDate)
+    .first('id');
+  return Boolean(snapshot);
+}
+
+async function markDocumentSent(id, response, { attemptToken = null, reconciled = false } = {}) {
+  if (!response?.mark) throw new Error('myDATA response MARK is required');
+  return db.transaction(async (trx) => {
+    const document = await trx('fiscal_documents').where({ id }).forUpdate().first();
+    if (!document) throw new Error('Fiscal document not found');
+    const incomingMark = String(response.mark);
+    const existingMark = document.mydata_mark == null ? null : String(document.mydata_mark);
+
+    // An identical late response is useful evidence, but it must never reset a
+    // verified or cancelled lifecycle back to sent/pending.
+    if (existingMark) {
+      if (existingMark !== incomingMark) {
+        const error = new Error(`Conflicting myDATA MARK for fiscal document ${id}`);
+        error.status = 409;
+        throw error;
+      }
+      if (document.status === 'sent' || document.status === 'cancelled') {
+        await trx('fiscal_documents').where({ id }).update({
+          mydata_uid: document.mydata_uid || response.uid || null,
+          mydata_qr_url: document.mydata_qr_url || response.qrUrl || null,
+          updated_at: trx.fn.now(),
+        });
+        return trx('fiscal_documents').where({ id }).first();
+      }
+    }
+
+    const ownsAttempt = attemptToken && document.transmission_token === attemptToken
+      && (document.status === 'transmitting'
+        || (document.status === 'failed' && Boolean(document.transmission_uncertain)));
+    const canReconcile = reconciled && Boolean(document.transmission_uncertain)
+      && ['failed', 'transmitting'].includes(document.status);
+    if (!ownsAttempt && !canReconcile) {
+      const error = new Error('Transmission attempt no longer owns this fiscal document');
+      error.status = 409;
+      throw error;
+    }
+    await trx('fiscal_documents').where({ id }).update({
+      status: 'sent',
+      mydata_mark: incomingMark,
+      mydata_uid: response.uid || null,
+      mydata_qr_url: response.qrUrl || null,
+      mydata_response: JSON.stringify(response.raw || response),
+      mydata_environment: process.env.MYDATA_ENV || 'sandbox',
+      sent_at: trx.fn.now(),
+      verification_status: 'pending',
+      verification_error: null,
+      retryable: false,
+      transmission_uncertain: false,
+      transmission_token: null,
+      updated_at: trx.fn.now(),
+    });
+    return trx('fiscal_documents').where({ id }).first();
   });
 }
 
@@ -219,14 +281,20 @@ async function markVerificationFailed(id, message) {
   });
 }
 
-async function markDocumentFailed(id, errorMessage, { retryable = false, transmissionUncertain = false } = {}) {
-  await db('fiscal_documents').where({ id }).update({
+async function markDocumentFailed(id, errorMessage, { retryable = false, transmissionUncertain = false, attemptToken } = {}) {
+  if (!attemptToken) throw new Error('Transmission attempt token is required to record failure');
+  const changed = await db('fiscal_documents').where({ id, status: 'transmitting', transmission_token: attemptToken }).update({
     status: 'failed',
     retryable: Boolean(retryable),
     transmission_uncertain: Boolean(transmissionUncertain),
     error_message: String(errorMessage).slice(0, 4000),
     updated_at: db.fn.now(),
   });
+  if (changed !== 1) {
+    const error = new Error('Transmission attempt no longer owns this fiscal document');
+    error.status = 409;
+    throw error;
+  }
 }
 
 async function quarantineStaleTransmissions(companyId, staleMinutes = 60) {
@@ -325,12 +393,12 @@ async function markDocumentCancelled(id, cancellationMark = null) {
   return getDocumentById(id);
 }
 
-async function cancelPendingReservationDocuments(reservationId) {
-  return db('fiscal_documents')
+async function cancelPendingReservationDocuments(reservationId, client = db) {
+  return client('fiscal_documents')
     .where({ reservation_id: reservationId })
     .whereIn('status', ['pending', 'failed'])
     .where({ transmission_uncertain: false })
-    .update({ status: 'cancelled', cancellation_status: 'cancelled', cancelled_at: db.fn.now(), updated_at: db.fn.now() });
+    .update({ status: 'cancelled', cancellation_status: 'cancelled', cancelled_at: client.fn.now(), updated_at: client.fn.now() });
 }
 
 module.exports = {
@@ -342,6 +410,7 @@ module.exports = {
   listTransmittableDocuments,
   listBlockedDueDocuments,
   listInFlightDocuments,
+  hasDueFiscalWork,
   claimDocument,
   markDocumentSent,
   markDocumentFailed,

@@ -44,7 +44,7 @@ function documentBase(reservation, billingContext) {
   };
 }
 
-async function prepareReservationDocuments(reservation, billingContext) {
+async function prepareReservationDocuments(reservation, billingContext, options = {}) {
   if (reservation.financialProfile?.status !== 'matched'
       || !reservation.financialProfile?.id
       || !reservation.financialProfile?.version
@@ -57,6 +57,7 @@ async function prepareReservationDocuments(reservation, billingContext) {
     billingContext.listing_id,
     reservation.platformKey || reservation.platform,
     reservation.sourceKey || reservation.source,
+    options.transaction || db,
   );
   const invoiceType = reservation.invoiceType || sourceRule?.invoice_type || billingContext.default_invoice_type;
   let effectiveContext = sourceRule ? {
@@ -114,7 +115,7 @@ async function prepareReservationDocuments(reservation, billingContext) {
   // Primary and TAKK are one fiscal materialization unit. If either XML or DB
   // insert fails, the transaction rolls back both documents and both sequence
   // increments, preventing a half-created stay from reaching daily close.
-  return db.transaction(async (trx) => {
+  const materialize = async (trx) => {
     if (trx.client.config.client === 'pg') {
       // Serialize every fiscal revision of one reservation across all app
       // instances. This turns concurrent webhook/backfill materialization into
@@ -148,7 +149,9 @@ async function prepareReservationDocuments(reservation, billingContext) {
       buildXml: (aa) => generateClimateFeeXML(reservation, { ...billingContext, climate_fee_series: climateSeries }, aa),
     });
     return { primary, climate: climateDocument };
-  });
+  };
+  if (options.transaction) return materialize(options.transaction);
+  return db.transaction(materialize);
 }
 
 module.exports = { prepareReservationDocuments, primaryAmounts, climateAmounts };

@@ -34,7 +34,11 @@ async function verifyOne(document, companyContext, verifier, run, counts, ensure
       throw new Error(`Verification result did not confirm MARK ${document.mydata_mark}`);
     }
     await ensureLease();
-    await recordVerificationResult(run.id, document.id, document.mydata_mark, { verified: true }, run.lease_token);
+    await recordVerificationResult(run.id, document.id, document.mydata_mark, {
+      verified: true,
+      uid: result.uid || null,
+      qrUrl: result.qrUrl || null,
+    }, run.lease_token);
     counts.sent += 1;
   } catch (error) {
     if (error.status === 409) throw error;
@@ -76,15 +80,24 @@ async function executeDailyClose({ companyId, businessDate, sender = sendToMyDat
     const materializationResults = await materializer(company.id, businessDate);
     await ensureLease();
     const materializationFailures = materializationResults.filter((result) => result.error).length;
-    const documents = await listTransmittableDocuments(company.id, businessDate, maxAttempts);
-    const awaitingVerification = await listUnverifiedDocuments(company.id, businessDate);
+    const listedDocuments = await listTransmittableDocuments(company.id, businessDate, maxAttempts);
+    const listedAwaitingVerification = await listUnverifiedDocuments(company.id, businessDate);
     const blockedDocuments = await listBlockedDueDocuments(company.id, businessDate, maxAttempts);
-    const inFlightDocuments = await listInFlightDocuments(company.id, businessDate);
+    const blockedIds = new Set(blockedDocuments.map((document) => Number(document.id)));
+    const inFlightDocuments = (await listInFlightDocuments(company.id, businessDate))
+      .filter((document) => !blockedIds.has(Number(document.id)));
+    const inFlightIds = new Set(inFlightDocuments.map((document) => Number(document.id)));
+    const awaitingVerification = listedAwaitingVerification
+      .filter((document) => !blockedIds.has(Number(document.id)) && !inFlightIds.has(Number(document.id)));
+    const awaitingIds = new Set(awaitingVerification.map((document) => Number(document.id)));
+    const documents = listedDocuments.filter((document) => !blockedIds.has(Number(document.id))
+      && !inFlightIds.has(Number(document.id)) && !awaitingIds.has(Number(document.id)));
     const counts = {
       total: documents.length + awaitingVerification.length + blockedDocuments.length + inFlightDocuments.length + materializationFailures,
       sent: 0,
       failed: materializationFailures + blockedDocuments.length,
       inFlight: inFlightDocuments.length,
+      materializationFailures,
     };
 
     for (const document of inFlightDocuments) {
@@ -104,13 +117,14 @@ async function executeDailyClose({ companyId, businessDate, sender = sendToMyDat
 
     for (const document of documents) {
       await ensureLease();
-      if (!await claimDocument(document.id)) continue;
+      const attemptToken = await claimDocument(document.id);
+      if (!attemptToken) continue;
       let markPersisted = false;
       try {
         const response = await sender(document.xml_payload, companyContext);
         // Persist a returned MARK even if the scheduler lease expired during
         // the network call; losing that response would create a duplicate risk.
-        await markDocumentSent(document.id, response);
+        await markDocumentSent(document.id, response, { attemptToken });
         markPersisted = true;
         await ensureLease();
         await verifyOne({ ...document, mydata_mark: response.mark, mydata_uid: response.uid || null }, companyContext, verifier, run, counts, ensureLease);
@@ -121,6 +135,7 @@ async function executeDailyClose({ companyId, businessDate, sender = sendToMyDat
         await markDocumentFailed(document.id, error.message, {
           retryable: error.retryable === true,
           transmissionUncertain: error.transmissionUncertain === true,
+          attemptToken,
         });
         await recordRunItem(run.id, document.id, 'failed', error.message, run.lease_token);
         counts.failed += 1;

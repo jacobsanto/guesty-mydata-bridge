@@ -5,6 +5,7 @@ const { getRun } = require('../repositories/daily-close');
 const { executeDailyClose } = require('./daily-close-service');
 const { testCompanyMyDataConnection, testConfiguredGuestyConnection } = require('./connection-service');
 const { runGuestyReconciliation } = require('./guesty-reconciliation-service');
+const { hasDueFiscalWork } = require('../repositories/fiscal-documents');
 
 function localParts(now, timeZone) {
   const parts = new Intl.DateTimeFormat('en-CA', {
@@ -37,19 +38,22 @@ async function runScheduledDailyClose({
   guestyConnectionTest = testConfiguredGuestyConnection,
   myDataConnectionTest = testCompanyMyDataConnection,
   reconciler = runGuestyReconciliation,
+  dueWorkLookup = hasDueFiscalWork,
 } = {}) {
   const businessDate = scheduledBusinessDate(now, timeZone, closeTime);
   const companies = (await listCompanies()).filter((company) => company.active);
   const results = [];
+  let reconciliationWarning = null;
+  // Reconcile before deciding that a completed close has no new work. A late
+  // webhook/backfill can stage a due reservation that has no fiscal row yet.
   if (companies.length && process.env.GUESTY_CLIENT_ID && process.env.GUESTY_CLIENT_SECRET) {
-    try { await reconciler(); } catch (error) {
-      return companies.map((company) => ({ companyId: company.id, businessDate, skipped: true, status: 'error', error: `Guesty reconciliation failed: ${error.message}` }));
-    }
+    try { await reconciler(); } catch (error) { reconciliationWarning = `Guesty reconciliation failed: ${error.message}`; }
   }
   let guestyChecked = false;
   for (const company of companies) {
     const existing = await runLookup(company.id, businessDate);
-    if (existing?.status === 'completed') {
+    const hasDueWork = existing?.status === 'completed' ? await dueWorkLookup(company.id, businessDate) : true;
+    if (existing?.status === 'completed' && !hasDueWork) {
       results.push({ companyId: company.id, businessDate, skipped: true, status: 'completed' });
       continue;
     }
@@ -59,7 +63,7 @@ async function runScheduledDailyClose({
         await myDataConnectionTest(company.id);
       }
       const run = await executor({ companyId: company.id, businessDate });
-      results.push({ companyId: company.id, businessDate, skipped: false, status: run.status });
+      results.push({ companyId: company.id, businessDate, skipped: false, status: run.status, ...(reconciliationWarning ? { warning: reconciliationWarning } : {}) });
     } catch (error) {
       results.push({ companyId: company.id, businessDate, skipped: false, status: 'error', error: error.message });
     }

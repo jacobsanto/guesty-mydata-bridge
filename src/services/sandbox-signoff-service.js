@@ -4,8 +4,13 @@ const crypto = require('crypto');
 const { db } = require('../database');
 const { getDocumentById } = require('../repositories/fiscal-documents');
 const { renderFiscalDocumentPdf } = require('./pdf-service');
+const { companyCredentialBinding } = require('../security/credentials');
 
 function bad(message, status = 400) { return Object.assign(new Error(message), { status }); }
+
+function sha256(value) {
+  return crypto.createHash('sha256').update(String(value)).digest('hex');
+}
 
 function assertSandboxDocument(document, kind, companyId, reservationId) {
   if (!document) throw bad(`${kind} document not found`, 404);
@@ -17,6 +22,12 @@ function assertSandboxDocument(document, kind, companyId, reservationId) {
   if (document.status !== 'sent' || document.verification_status !== 'verified' || !document.mydata_mark
       || document.mydata_environment !== 'sandbox') {
     throw bad(`${kind} document must be sent and verified in myDATA sandbox`, 409);
+  }
+  if (![null, undefined, 'none'].includes(document.cancellation_status)) {
+    throw bad(`${kind} document has an unresolved or completed cancellation`, 409);
+  }
+  if (!document.xml_payload || !document.mydata_response) {
+    throw bad(`${kind} document is missing XML or AADE response acceptance evidence`, 409);
   }
 }
 
@@ -33,12 +44,22 @@ async function createSandboxSignoff(payload) {
   assertSandboxDocument(primary, 'primary', companyId, reservationId);
   assertSandboxDocument(takk, 'TAKK', companyId, reservationId);
   const [primaryPdf, takkPdf] = await Promise.all([renderFiscalDocumentPdf(primary.id), renderFiscalDocumentPdf(takk.id)]);
+  const company = await db('companies').where({ id: companyId }).first();
+  if (!company) throw bad('Sandbox sign-off company not found', 404);
   const row = {
     company_id: companyId, reservation_id: reservationId,
+    issuer_vat: company.vat_number,
+    credential_binding_sha256: companyCredentialBinding(company),
     primary_document_id: primary.id, takk_document_id: takk.id,
     primary_mark: String(primary.mydata_mark), takk_mark: String(takk.mydata_mark),
     primary_pdf_sha256: crypto.createHash('sha256').update(primaryPdf).digest('hex'),
     takk_pdf_sha256: crypto.createHash('sha256').update(takkPdf).digest('hex'),
+    primary_xml_sha256: sha256(primary.xml_payload),
+    takk_xml_sha256: sha256(takk.xml_payload),
+    primary_response_sha256: sha256(primary.mydata_response),
+    takk_response_sha256: sha256(takk.mydata_response),
+    primary_uid_sha256: primary.mydata_uid ? sha256(primary.mydata_uid) : null,
+    takk_uid_sha256: takk.mydata_uid ? sha256(takk.mydata_uid) : null,
     approved_by: approvedBy,
     approval_notes: payload.approval_notes ? String(payload.approval_notes).slice(0, 4000) : null,
   };

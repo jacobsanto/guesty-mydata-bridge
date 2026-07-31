@@ -86,7 +86,12 @@ function assertSingleStayFiscalFolio(reservation) {
   const invoiceItems = reservation.fiscalInvoiceItems || reservation.financials?.invoiceItems;
   const itemListingIds = new Set((invoiceItems || []).map((item) => item.listingId).filter(Boolean).map(String));
   const stayIndexes = new Set((invoiceItems || []).map((item) => item.stayIndex).filter((value) => value !== null && value !== undefined).map(Number));
-  if (itemListingIds.size > 1 || [...itemListingIds].some((id) => id !== String(reservation.listingId)) || stayIndexes.size > 1) {
+  const stayEvidence = reservation.stayEvidence;
+  const affirmativeSingleStay = stayEvidence?.singleStayConfirmed === true
+    && String(stayEvidence.reservationListingId) === String(reservation.listingId)
+    && String(stayEvidence.folioListingId) === String(reservation.listingId);
+  if (!affirmativeSingleStay || itemListingIds.size > 1
+      || [...itemListingIds].some((id) => id !== String(reservation.listingId)) || stayIndexes.size > 1) {
     throw serviceError('Split, relocated, or multi-listing Guesty folio requires explicit per-stay allocation', 409);
   }
   return invoiceItems;

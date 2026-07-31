@@ -5,6 +5,16 @@ const { db } = require('../database');
 const { insertedId } = require('../database-utils');
 
 function fiscalHash(reservation) {
+  const fiscalLines = (reservation.fiscalInvoiceItems || reservation.financials?.invoiceItems || [])
+    .map((line) => ({
+      id: String(line.id || ''), normalType: String(line.normalType || ''),
+      origin: line.origin || null, title: line.title || null,
+      secondIdentifier: line.secondIdentifier || null,
+      totalPrice: Number(line.totalPrice), listingId: line.listingId || null,
+      stayIndex: line.stayIndex ?? null,
+      isDeducted: line.isDeducted ?? null, isDeductedV2: line.isDeductedV2 ?? null,
+    }))
+    .sort((left, right) => left.id.localeCompare(right.id));
   const core = {
     reservationId: reservation.reservationId,
     listingId: reservation.listingId,
@@ -16,6 +26,9 @@ function fiscalHash(reservation) {
     checkOut: reservation.checkOut,
     nights: reservation.nights,
     totalGross: reservation.financials?.totalGross,
+    guestStayStatus: reservation.guestStayStatus || null,
+    stayEvidence: reservation.stayEvidence || null,
+    fiscalLines,
     financialProfile: reservation.financialProfile ? {
       id: reservation.financialProfile.id,
       version: reservation.financialProfile.version,
@@ -52,8 +65,16 @@ function applySnapshotOverride(reservation, snapshot) {
   };
 }
 
-async function upsertReservationSnapshot(reservation, billingContext) {
-  const existing = await db('reservation_snapshots').where({ reservation_id: reservation.reservationId }).first();
+async function upsertReservationSnapshot(reservation, billingContext, options = {}) {
+  const execute = async (trx) => {
+  let existing = await trx('reservation_snapshots').where({ reservation_id: reservation.reservationId }).forUpdate().first();
+  if (options.expectedGeneration !== undefined
+      && Number(existing?.generation || 0) !== Number(options.expectedGeneration)) {
+    const error = new Error('Reservation changed while fiscal materialization was in progress');
+    error.status = 409;
+    error.code = 'RESERVATION_SNAPSHOT_CHANGED';
+    throw error;
+  }
   let effectiveReservation = applySnapshotOverride(reservation, existing);
   if (existing?.materialized_at && !effectiveReservation.financialProfile && existing.normalized_payload) {
     const previous = JSON.parse(existing.normalized_payload);
@@ -90,15 +111,39 @@ async function upsertReservationSnapshot(reservation, billingContext) {
       : null,
     financial_error: effectiveReservation.financialProfile?.error || null,
     last_error: null,
-    updated_at: db.fn.now(),
+    generation: Number(existing?.generation || 0) + 1,
+    updated_at: trx.fn.now(),
   };
   if (existing) {
-    data.requires_review = Boolean(existing.materialized_at && existing.payload_hash !== hash);
-    await db('reservation_snapshots').where({ id: existing.id }).update(data);
-    return db('reservation_snapshots').where({ id: existing.id }).first();
+    data.requires_review = existing.materialized_at
+      ? Boolean(existing.requires_review || existing.payload_hash !== hash)
+      : false;
+    const changed = await trx('reservation_snapshots')
+      .where({ id: existing.id, generation: Number(existing.generation || 1) })
+      .update(data);
+    if (changed !== 1) {
+      const error = new Error('Reservation changed while snapshot update was in progress');
+      error.status = 409;
+      error.code = 'RESERVATION_SNAPSHOT_CHANGED';
+      throw error;
+    }
+    return trx('reservation_snapshots').where({ id: existing.id }).first();
   }
-  const id = insertedId(await db('reservation_snapshots').insert({ reservation_id: reservation.reservationId, ...data }).returning('id'));
-  return db('reservation_snapshots').where({ id }).first();
+  const inserted = await trx('reservation_snapshots')
+    .insert({ reservation_id: reservation.reservationId, ...data })
+    .onConflict('reservation_id')
+    .ignore()
+    .returning('id');
+  const id = insertedId(inserted);
+  if (id) return trx('reservation_snapshots').where({ id }).first();
+  existing = await trx('reservation_snapshots').where({ reservation_id: reservation.reservationId }).forUpdate().first();
+  const error = new Error('Reservation snapshot was created concurrently; retry with the current generation');
+  error.status = 409;
+  error.code = 'RESERVATION_SNAPSHOT_CHANGED';
+  throw error;
+  };
+  if (options.transaction) return execute(options.transaction);
+  return db.transaction(execute);
 }
 
 async function listDueReservationSnapshots(companyId, businessDate) {
@@ -119,7 +164,7 @@ async function listReservationSnapshots(filters = {}) {
     'financial_profile_hash', 'financial_error',
     'invoice_type_override', 'invoice_series_override', 'counterpart_vat_override',
     'counterpart_country_override', 'counterpart_name_override',
-    'fiscal_revision', 'review_resolution', 'reviewed_at',
+    'fiscal_revision', 'review_resolution', 'reviewed_at', 'generation',
     'requires_review', 'last_error', 'created_at', 'updated_at'
   ).orderBy('updated_at', 'desc');
   if (filters.companyId) query.where({ company_id: filters.companyId });
@@ -152,6 +197,7 @@ async function setFiscalOverride(reservationId, override) {
     requires_review: false,
     last_error: null,
     updated_at: db.fn.now(),
+    generation: db.raw('generation + 1'),
   });
   return db('reservation_snapshots').where({ id: existing.id }).first();
 }
@@ -177,6 +223,7 @@ async function clearFiscalOverride(reservationId) {
     normalized_payload: JSON.stringify(reservation),
     payload_hash: fiscalHash(reservation),
     updated_at: db.fn.now(),
+    generation: db.raw('generation + 1'),
   });
   return db('reservation_snapshots').where({ id: existing.id }).first();
 }
@@ -210,6 +257,7 @@ async function reopenSnapshotForReissue(reservationId, resolution) {
       reviewed_at: trx.fn.now(),
       last_error: null,
       updated_at: trx.fn.now(),
+      generation: trx.raw('generation + 1'),
     });
     return trx('reservation_snapshots').where({ id: snapshot.id }).first();
   });
@@ -234,21 +282,35 @@ async function resolveCancelledSnapshot(reservationId, resolution) {
       reviewed_at: trx.fn.now(),
       last_error: null,
       updated_at: trx.fn.now(),
+      generation: trx.raw('generation + 1'),
     });
     return trx('reservation_snapshots').where({ id: snapshot.id }).first();
   });
 }
 
-async function markSnapshotMaterialized(id) {
-  await db('reservation_snapshots').where({ id }).update({ materialized_at: db.fn.now(), requires_review: false, last_error: null, updated_at: db.fn.now() });
+async function markSnapshotMaterialized(id, expectedGeneration, options = {}) {
+  const client = options.transaction || db;
+  const changed = await client('reservation_snapshots').where({ id, generation: expectedGeneration }).update({
+    materialized_at: client.fn.now(), requires_review: false, last_error: null,
+    generation: client.raw('generation + 1'), updated_at: client.fn.now(),
+  });
+  if (changed !== 1) {
+    const error = new Error('Reservation changed before materialization could be committed');
+    error.status = 409;
+    error.code = 'RESERVATION_SNAPSHOT_CHANGED';
+    throw error;
+  }
 }
 
-async function markSnapshotError(id, error) {
-  await db('reservation_snapshots').where({ id }).update({
+async function markSnapshotError(id, error, expectedGeneration) {
+  let query = db('reservation_snapshots').where({ id });
+  if (expectedGeneration !== undefined) query = query.where({ generation: expectedGeneration });
+  await query.update({
     requires_review: true,
     financial_status: 'review',
     financial_error: String(error).slice(0, 4000),
     last_error: String(error).slice(0, 4000),
+    generation: db.raw('generation + 1'),
     updated_at: db.fn.now(),
   });
 }

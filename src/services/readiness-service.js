@@ -1,7 +1,7 @@
 'use strict';
 
 const { db } = require('../database');
-const { isEncrypted, isContextBound } = require('../security/credentials');
+const { isEncrypted, isContextBound, companyCredentialBinding } = require('../security/credentials');
 const { listIntegrationChecks } = require('../repositories/integration-checks');
 const { normalizeAndValidateGreekVat, normalizeCounterpart, normalizeSeries, validateAccommodationClimatePair } = require('../validation/fiscal-fields');
 
@@ -29,7 +29,7 @@ async function getReadiness() {
     db('fiscal_documents').where({ transmission_uncertain: true }).count({ count: '*' }).first(),
     db('fiscal_documents').where({ cancellation_uncertain: true }).count({ count: '*' }).first(),
     listIntegrationChecks(),
-    db('sandbox_signoffs').select('company_id', 'reservation_id', 'primary_mark', 'takk_mark', 'approved_by', 'approved_at'),
+    db('sandbox_signoffs').select('company_id', 'reservation_id', 'issuer_vat', 'credential_binding_sha256', 'primary_mark', 'takk_mark', 'approved_by', 'approved_at'),
   ]);
   const issues = [];
   const freshAfter = Date.now() - 24 * 60 * 60 * 1000;
@@ -144,7 +144,9 @@ async function getReadiness() {
   if ((process.env.DB_CLIENT || 'better-sqlite3') !== 'pg') productionIssues.push(issue('production_database', 'Για production απαιτείται PostgreSQL'));
   if (process.env.DAILY_CLOSE_ENABLED !== 'true') productionIssues.push(issue('daily_close_disabled', 'Για production απαιτείται DAILY_CLOSE_ENABLED=true'));
   for (const company of companies) {
-    if (!sandboxSignoffs.some((signoff) => Number(signoff.company_id) === Number(company.id))) {
+    if (!sandboxSignoffs.some((signoff) => Number(signoff.company_id) === Number(company.id)
+      && signoff.issuer_vat === company.vat_number
+      && signoff.credential_binding_sha256 === companyCredentialBinding(company))) {
       productionIssues.push(issue('sandbox_signoff', `${company.company_name}: λείπει λογιστικά εγκεκριμένο sandbox ζεύγος ΑΠΥ/ΤΠΥ + ΤΑΚΚ`, `company:${company.id}`));
     }
   }

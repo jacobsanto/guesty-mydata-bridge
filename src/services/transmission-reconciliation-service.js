@@ -39,7 +39,7 @@ async function reconcileUncertainTransmission({ documentId, mark, verifier = ver
     uid: result.uid || result.raw.uid || null,
     qrUrl: result.raw.qrUrl || null,
     raw: { reconciledFromRequestTransmittedDocs: true, invoice: result.raw },
-  });
+  }, { reconciled: true });
   await markDocumentVerified(document.id);
   return getDocumentById(document.id);
 }

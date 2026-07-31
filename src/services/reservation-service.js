@@ -8,6 +8,7 @@ const { fetchReservation } = require('../guesty/client');
 const { normalizeGuestyReservation } = require('../guesty/normalizer');
 const { normalizeCounterpart, normalizeSeries } = require('../validation/fiscal-fields');
 const { applyFinancialProfile } = require('./financial-profile-service');
+const { db } = require('../database');
 
 const CANCELLED_STATUSES = new Set(['cancelled', 'canceled']);
 
@@ -81,18 +82,36 @@ async function materializeDueReservations(companyId, businessDate, {
       const billingContext = await getCompanyAndListingByGuestyListingId(reservation.listingId);
       if (!billingContext || billingContext.company_id !== companyId) throw new Error('Latest Guesty listing has no matching company configuration');
       if (CANCELLED_STATUSES.has(String(reservation.status).toLowerCase())) {
-        await stageReservation(reservation, billingContext);
+        await db.transaction(async (trx) => {
+          await upsertReservationSnapshot(reservation, billingContext, {
+            transaction: trx,
+            expectedGeneration: snapshot.generation,
+          });
+          await cancelPendingReservationDocuments(reservation.reservationId, trx);
+        });
         results.push({ reservationId: snapshot.reservation_id, skipped: true, reason: 'cancelled' });
         continue;
       }
       reservation = await applyFinancialProfile(reservation, billingContext);
-      await upsertReservationSnapshot(reservation, billingContext);
-      const documents = await prepareReservationDocuments(reservation, billingContext);
-      await markSnapshotMaterialized(snapshot.id);
+      const documents = await db.transaction(async (trx) => {
+        const current = await upsertReservationSnapshot(reservation, billingContext, {
+          transaction: trx,
+          expectedGeneration: snapshot.generation,
+        });
+        const created = await prepareReservationDocuments(reservation, billingContext, { transaction: trx });
+        await markSnapshotMaterialized(snapshot.id, current.generation, { transaction: trx });
+        return created;
+      });
       results.push({ reservationId: snapshot.reservation_id, skipped: false, documentIds: [documents.primary, documents.climate].filter(Boolean).map((item) => item.document.id) });
     } catch (error) {
-      await markSnapshotError(snapshot.id, error.message);
-      results.push({ reservationId: snapshot.reservation_id, skipped: true, error: error.message });
+      if (error.code !== 'RESERVATION_SNAPSHOT_CHANGED') {
+        await markSnapshotError(snapshot.id, error.message, snapshot.generation);
+      }
+      results.push({
+        reservationId: snapshot.reservation_id,
+        skipped: true,
+        ...(error.code === 'RESERVATION_SNAPSHOT_CHANGED' ? { reason: 'changed_during_materialization' } : { error: error.message }),
+      });
     }
   }
   return results;

@@ -149,17 +149,35 @@ async function ensureSyncCursorsTable() {
 }
 
 async function ensureSandboxSignoffsTable() {
-  if (await db.schema.hasTable('sandbox_signoffs')) return;
+  if (await db.schema.hasTable('sandbox_signoffs')) {
+    await ensureColumn('sandbox_signoffs', 'issuer_vat', (t) => t.string('issuer_vat', 9).nullable());
+    await ensureColumn('sandbox_signoffs', 'credential_binding_sha256', (t) => t.string('credential_binding_sha256', 64).nullable());
+    await ensureColumn('sandbox_signoffs', 'primary_xml_sha256', (t) => t.string('primary_xml_sha256', 64).nullable());
+    await ensureColumn('sandbox_signoffs', 'takk_xml_sha256', (t) => t.string('takk_xml_sha256', 64).nullable());
+    await ensureColumn('sandbox_signoffs', 'primary_response_sha256', (t) => t.string('primary_response_sha256', 64).nullable());
+    await ensureColumn('sandbox_signoffs', 'takk_response_sha256', (t) => t.string('takk_response_sha256', 64).nullable());
+    await ensureColumn('sandbox_signoffs', 'primary_uid_sha256', (t) => t.string('primary_uid_sha256', 64).nullable());
+    await ensureColumn('sandbox_signoffs', 'takk_uid_sha256', (t) => t.string('takk_uid_sha256', 64).nullable());
+    return;
+  }
   await db.schema.createTable('sandbox_signoffs', (t) => {
     t.increments('id').primary();
     t.integer('company_id').unsigned().notNullable();
     t.string('reservation_id', 120).notNullable();
+    t.string('issuer_vat', 9).notNullable();
+    t.string('credential_binding_sha256', 64).notNullable();
     t.integer('primary_document_id').unsigned().notNullable();
     t.integer('takk_document_id').unsigned().notNullable();
     t.string('primary_mark', 30).notNullable();
     t.string('takk_mark', 30).notNullable();
     t.string('primary_pdf_sha256', 64).notNullable();
     t.string('takk_pdf_sha256', 64).notNullable();
+    t.string('primary_xml_sha256', 64).notNullable();
+    t.string('takk_xml_sha256', 64).notNullable();
+    t.string('primary_response_sha256', 64).notNullable();
+    t.string('takk_response_sha256', 64).notNullable();
+    t.string('primary_uid_sha256', 64).nullable();
+    t.string('takk_uid_sha256', 64).nullable();
     t.string('approved_by', 200).notNullable();
     t.text('approval_notes').nullable();
     t.timestamp('approved_at').notNullable().defaultTo(db.fn.now());
@@ -218,6 +236,7 @@ async function ensureReservationSnapshotsTable() {
     await ensureColumn('reservation_snapshots', 'financial_profile_hash', (t) => t.string('financial_profile_hash', 64).nullable());
     await ensureColumn('reservation_snapshots', 'financial_evidence', (t) => t.text('financial_evidence').nullable());
     await ensureColumn('reservation_snapshots', 'financial_error', (t) => t.text('financial_error').nullable());
+    await ensureColumn('reservation_snapshots', 'generation', (t) => t.integer('generation').notNullable().defaultTo(1));
     return;
   }
   await db.schema.createTable('reservation_snapshots', (t) => {
@@ -248,6 +267,7 @@ async function ensureReservationSnapshotsTable() {
     t.string('financial_profile_hash', 64).nullable();
     t.text('financial_evidence').nullable();
     t.text('financial_error').nullable();
+    t.integer('generation').notNullable().defaultTo(1);
     t.timestamp('materialized_at').nullable();
     t.boolean('requires_review').notNullable().defaultTo(false);
     t.text('last_error').nullable();
@@ -486,6 +506,7 @@ async function ensureFiscalDocumentsTable() {
     await ensureColumn('fiscal_documents', 'verification_error', (t) => t.text('verification_error').nullable());
     await ensureColumn('fiscal_documents', 'retryable', (t) => t.boolean('retryable').notNullable().defaultTo(true));
     await ensureColumn('fiscal_documents', 'transmission_uncertain', (t) => t.boolean('transmission_uncertain').notNullable().defaultTo(false));
+    await ensureColumn('fiscal_documents', 'transmission_token', (t) => t.string('transmission_token', 64).nullable());
     await ensureColumn('fiscal_documents', 'mydata_environment', (t) => t.string('mydata_environment', 20).nullable());
     await ensureColumn('fiscal_documents', 'cancellation_retryable', (t) => t.boolean('cancellation_retryable').notNullable().defaultTo(true));
     await ensureColumn('fiscal_documents', 'cancellation_uncertain', (t) => t.boolean('cancellation_uncertain').notNullable().defaultTo(false));
@@ -531,6 +552,7 @@ async function ensureFiscalDocumentsTable() {
     t.integer('attempt_count').notNullable().defaultTo(0);
     t.boolean('retryable').notNullable().defaultTo(true);
     t.boolean('transmission_uncertain').notNullable().defaultTo(false);
+    t.string('transmission_token', 64).nullable();
     t.timestamp('last_attempt_at').nullable();
     t.timestamp('sent_at').nullable();
     t.timestamps(true, true);
@@ -569,6 +591,7 @@ async function ensureDailyCloseTables() {
       t.integer('document_count').notNullable().defaultTo(0);
       t.integer('sent_count').notNullable().defaultTo(0);
       t.integer('failed_count').notNullable().defaultTo(0);
+      t.integer('materialization_failure_count').notNullable().defaultTo(0);
       t.timestamp('started_at').notNullable().defaultTo(db.fn.now());
       t.timestamp('completed_at').nullable();
       t.string('lease_token', 64).nullable();
@@ -583,6 +606,7 @@ async function ensureDailyCloseTables() {
     await ensureColumn('daily_close_runs', 'lease_token', (t) => t.string('lease_token', 64).nullable());
     await ensureColumn('daily_close_runs', 'lease_expires_at', (t) => t.timestamp('lease_expires_at').nullable());
     await ensureColumn('daily_close_runs', 'lease_expires_at_ms', (t) => t.bigInteger('lease_expires_at_ms').nullable());
+    await ensureColumn('daily_close_runs', 'materialization_failure_count', (t) => t.integer('materialization_failure_count').notNullable().defaultTo(0));
   }
 
   if (!await db.schema.hasTable('daily_close_items')) {

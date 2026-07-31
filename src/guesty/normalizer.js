@@ -165,15 +165,26 @@ function normalizeGuestyReservation(payload) {
   if (normalizedIdentifierKey(rawPlatform) === null || normalizedIdentifierKey(rawSource) === null) {
     throw new Error('Guesty authoritative Guest Folio platform and source are required');
   }
-  if (raw.fiscalFolioOverview.reservationId
-      && String(raw.fiscalFolioOverview.reservationId) !== String(reservationId)) {
+  if (!raw.fiscalFolioOverview.reservationId || !raw.fiscalFolioOverview.listingId) {
+    throw new Error('Guesty authoritative Guest Folio reservation and listing ids are required');
+  }
+  if (String(raw.fiscalFolioOverview.reservationId) !== String(reservationId)) {
     throw new Error('Guesty authoritative Guest Folio reservation id does not match');
   }
-  if (raw.fiscalFolioOverview.listingId
-      && String(raw.fiscalFolioOverview.listingId) !== String(listingId)) {
+  if (String(raw.fiscalFolioOverview.listingId) !== String(listingId)) {
     throw new Error('Guesty authoritative Guest Folio listing id does not match');
   }
   const financials = guestyFinancials(raw);
+  const lineListingIds = [...new Set(financials.invoiceItems
+    .map((item) => item.listingId).filter(Boolean).map(String))];
+  const stayIndexes = [...new Set(financials.invoiceItems
+    .map((item) => item.stayIndex).filter((value) => value !== null).map(Number))];
+  const allLinesAllocated = financials.invoiceItems.every((item) => item.listingId
+    && Number.isInteger(item.stayIndex));
+  const singleStayConfirmed = allLinesAllocated
+    && lineListingIds.length === 1
+    && lineListingIds[0] === String(listingId)
+    && stayIndexes.length === 1;
   const derivedNights = nightsBetween(checkIn, checkOut);
   if (raw.nights !== undefined && raw.nights !== null && Number(raw.nights) !== derivedNights) {
     throw new Error('Guesty nights do not match localized check-in/check-out dates');
@@ -195,9 +206,17 @@ function normalizeGuestyReservation(payload) {
     platformKey: normalizedIdentifierKey(rawPlatform),
     sourceKey: normalizedIdentifierKey(rawSource),
     guestStayStatus: raw.guestStay?.status ? String(raw.guestStay.status).trim().toLowerCase() : null,
+    stayEvidence: {
+      reservationListingId: String(listingId),
+      folioListingId: String(raw.fiscalFolioOverview.listingId),
+      lineListingIds,
+      stayIndexes,
+      allLinesAllocated,
+      singleStayConfirmed,
+    },
     folioOverview: {
-      reservationId: String(raw.fiscalFolioOverview.reservationId || reservationId),
-      listingId: String(raw.fiscalFolioOverview.listingId || listingId),
+      reservationId: String(raw.fiscalFolioOverview.reservationId),
+      listingId: String(raw.fiscalFolioOverview.listingId),
       currency: String(raw.fiscalFolioOverview.currency),
       platform: String(rawPlatform),
       source: String(rawSource),

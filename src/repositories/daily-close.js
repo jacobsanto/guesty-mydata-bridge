@@ -34,6 +34,7 @@ async function beginRun(companyId, businessDate, { leaseSeconds = 300 } = {}) {
       document_count: 0,
       sent_count: 0,
       failed_count: 0,
+      materialization_failure_count: 0,
       started_at: db.fn.now(),
       completed_at: null,
       lease_token: leaseToken,
@@ -124,7 +125,12 @@ async function recordVerificationResult(runId, documentId, mark, outcome, leaseT
       throw error;
     }
     const documentUpdate = verified
-      ? { verification_status: 'verified', verification_error: null, verified_at: trx.fn.now(), updated_at: trx.fn.now() }
+      ? {
+          verification_status: 'verified', verification_error: null,
+          ...(outcome.uid ? { mydata_uid: String(outcome.uid) } : {}),
+          ...(outcome.qrUrl ? { mydata_qr_url: String(outcome.qrUrl) } : {}),
+          verified_at: trx.fn.now(), updated_at: trx.fn.now(),
+        }
       : { verification_status: 'failed', verification_error: String(outcome.error || 'Verification failed').slice(0, 4000), updated_at: trx.fn.now() };
     const changed = await trx('fiscal_documents')
       .where({ id: documentId, status: 'sent', mydata_mark: String(mark) })
@@ -152,25 +158,68 @@ async function recordVerificationResult(runId, documentId, mark, outcome, leaseT
 
 async function finishRun(runId, counts, leaseToken) {
   if (!leaseToken) throw new Error('Daily close lease token is required to finish a run');
-  const status = counts.inFlight > 0 ? 'partial' : (counts.failed > 0 ? (counts.sent > 0 ? 'partial' : 'failed') : 'completed');
-  const changed = await db('daily_close_runs').where({ id: runId, status: 'running', lease_token: leaseToken })
-    .where('lease_expires_at_ms', '>=', Date.now()).update({
-    status,
-    document_count: counts.total,
-    sent_count: counts.sent,
-    failed_count: counts.failed,
-    completed_at: db.fn.now(),
-    lease_token: null,
-    lease_expires_at: null,
-    lease_expires_at_ms: null,
-    updated_at: db.fn.now(),
+  const materializationFailures = Math.max(0, Number(counts.materializationFailures || 0));
+  return db.transaction(async (trx) => {
+    const run = await trx('daily_close_runs')
+      .where({ id: runId, status: 'running', lease_token: leaseToken })
+      .where('lease_expires_at_ms', '>=', Date.now())
+      .forUpdate()
+      .first();
+    if (!run) {
+      const error = new Error('Daily close lease was lost before completion');
+      error.status = 409;
+      throw error;
+    }
+
+    // Lock every due transmission whose lifecycle is not settled. This makes
+    // `completed` impossible while a late MARK or verification is outstanding.
+    const dueDocuments = await trx('fiscal_documents as d')
+      .where({ 'd.company_id': run.company_id })
+      .where('d.issue_date', '<=', run.business_date)
+      .where((query) => query
+        .whereIn('d.status', ['pending', 'failed', 'transmitting'])
+        .orWhere((sent) => sent.where({ 'd.status': 'sent' }).andWhere((verification) => verification
+          .whereNot({ 'd.verification_status': 'verified' })
+          .orWhereNull('d.verification_status')))
+        .orWhereExists(trx('reservation_snapshots as review')
+          .select(trx.raw('1'))
+          .whereRaw('review.reservation_id = d.reservation_id')
+          .where({ 'review.requires_review': true })))
+      .forUpdate()
+      .select(
+        'd.id', 'd.status', 'd.verification_status',
+        trx.raw('EXISTS (SELECT 1 FROM reservation_snapshots review_state WHERE review_state.reservation_id = d.reservation_id AND review_state.requires_review = ?) AS requires_review', [true]),
+      );
+    const items = await trx('daily_close_items').where({ run_id: runId }).select('document_id', 'result');
+    const verifiedCount = items.filter((item) => item.result === 'verified').length;
+    const failedItemCount = items.filter((item) => ['failed', 'blocked', 'verification_failed'].includes(item.result)).length;
+    const inFlightCount = items.filter((item) => item.result === 'in_flight').length;
+    const failedCount = failedItemCount + materializationFailures;
+    const itemsByDocument = new Map(items.map((item) => [Number(item.document_id), item.result]));
+    const hasUnsettled = inFlightCount > 0 || dueDocuments.some((document) => {
+      const result = itemsByDocument.get(Number(document.id));
+      if (!result) return true;
+      if (result === 'in_flight') return true;
+      if (result === 'verified') {
+        return document.status !== 'sent' || document.verification_status !== 'verified' || Boolean(document.requires_review);
+      }
+      return false;
+    });
+    const status = hasUnsettled ? 'partial' : (failedCount > 0 ? (verifiedCount > 0 ? 'partial' : 'failed') : 'completed');
+    await trx('daily_close_runs').where({ id: runId }).update({
+      status,
+      document_count: items.length,
+      sent_count: verifiedCount,
+      failed_count: failedCount,
+      materialization_failure_count: materializationFailures,
+      completed_at: trx.fn.now(),
+      lease_token: null,
+      lease_expires_at: null,
+      lease_expires_at_ms: null,
+      updated_at: trx.fn.now(),
+    });
+    return trx('daily_close_runs').where({ id: runId }).first();
   });
-  if (changed !== 1) {
-    const error = new Error('Daily close lease was lost before completion');
-    error.status = 409;
-    throw error;
-  }
-  return db('daily_close_runs').where({ id: runId }).first();
 }
 
 module.exports = { beginRun, heartbeatRun, getRun, listRuns, listRunItems, recordRunItem, recordVerificationResult, finishRun };

@@ -309,7 +309,15 @@ async function run() {
     climate_fee_low_category: securedListing.climate_fee_low_category,
     climate_fee_series: securedListing.climate_fee_series,
   };
-  const queuedReservation = { ...MOCK_RESERVATION, reservationId: 'res_QUEUE001', listingId: 'lst_QUEUE_TEST' };
+  const queuedReservation = {
+    ...MOCK_RESERVATION,
+    reservationId: 'res_QUEUE001',
+    listingId: 'lst_QUEUE_TEST',
+    stayEvidence: {
+      reservationListingId: 'lst_QUEUE_TEST', folioListingId: 'lst_QUEUE_TEST',
+      lineListingIds: [], stayIndexes: [], singleStayConfirmed: true,
+    },
+  };
   await stageReservation(queuedReservation, billingContext);
   const firstQueue = await prepareReservationDocuments(queuedReservation, billingContext);
   const secondQueue = await prepareReservationDocuments(queuedReservation, billingContext);
@@ -383,9 +391,9 @@ async function run() {
       fiscalCurrency: 'EUR',
       fiscalFolioOverview: { reservationId: '65f2d1599824d7e6ff852881', listingId: 'lst_QUEUE_TEST', platform: 'airbnb2', source: 'airbnb2', currency: 'EUR' },
       fiscalInvoiceItems: [
-        { id: 'af-webhook', normalType: 'AF', title: 'Accommodation fare', totalPrice: 246.02 },
-        { id: 'vat-webhook', normalType: 'VAT', title: 'VAT', totalPrice: 31.98 },
-        { id: 'ct-webhook', normalType: 'CT', title: 'LOCAL_TAX', totalPrice: 4 },
+        { id: 'af-webhook', normalType: 'AF', title: 'Accommodation fare', totalPrice: 246.02, listingId: 'lst_QUEUE_TEST', stayIndex: 0 },
+        { id: 'vat-webhook', normalType: 'VAT', title: 'VAT', totalPrice: 31.98, listingId: 'lst_QUEUE_TEST', stayIndex: 0 },
+        { id: 'ct-webhook', normalType: 'CT', title: 'LOCAL_TAX', totalPrice: 4, listingId: 'lst_QUEUE_TEST', stayIndex: 0 },
       ],
       money: {
         currency: 'EUR',
@@ -399,6 +407,7 @@ async function run() {
   });
   assert(normalizedGuesty.nights === 2, 'οι νύχτες προκύπτουν από localized ημερομηνίες');
   assert(normalizedGuesty.financials.totalGross === 278, 'το φορολογητέο gross περιλαμβάνει ΦΠΑ αλλά όχι το χωριστό ΤΑΚΚ');
+  assert(normalizedGuesty.stayEvidence.singleStayConfirmed === true, 'reservation, folio και line evidence επιβεβαιώνουν ρητά ένα fiscal stay');
   const normalizedWhitespaceChannel = normalizeGuestyReservation({
     ...normalizedGuesty,
     _id: 'res_CHANNEL_SPACE',
@@ -523,7 +532,7 @@ async function run() {
     sender: creditSender,
     verifier: async (mark) => ({ verified: false, mark }),
   });
-  assert(failedVerificationRun.status === 'failed' && creditSendCalls === 1, 'αποτυχία verification καταγράφεται χωρίς απώλεια του MARK');
+  assert(failedVerificationRun.status === 'failed' && failedVerificationRun.failed_count === 1 && creditSendCalls === 1, 'αποτυχία verification κρατά το κλείσιμο ανοικτό χωρίς απώλεια του MARK');
   await executeDailyClose({
     companyId: securedCompany.id,
     businessDate: '2025-07-16',
@@ -638,9 +647,17 @@ async function run() {
   await runScheduledDailyClose({
     now: new Date('2025-07-15T20:57:00Z'), timeZone: 'Europe/Athens', closeTime: '23:55',
     runLookup: async () => ({ status: 'completed' }),
+    dueWorkLookup: async () => false,
     executor: async () => { schedulerExecutions += 1; return { status: 'completed' }; },
   });
   assert(schedulerExecutions === 1, 'ολοκληρωμένο ημερήσιο κλείσιμο δεν επανεκτελείται');
+  await runScheduledDailyClose({
+    now: new Date('2025-07-15T20:58:00Z'), timeZone: 'Europe/Athens', closeTime: '23:55',
+    runLookup: async () => ({ status: 'completed' }),
+    dueWorkLookup: async () => true,
+    executor: async () => { schedulerExecutions += 1; return { status: 'completed' }; },
+  });
+  assert(schedulerExecutions === 2, 'νέα due κράτηση μετά από completed κλείσιμο ανοίγει ξανά την εκτέλεση');
   const previousMyDataEnv = process.env.MYDATA_ENV;
   const previousProductionEnabled = process.env.MYDATA_PRODUCTION_ENABLED;
   process.env.MYDATA_ENV = 'production';
@@ -700,8 +717,20 @@ async function run() {
     status: 'confirmed',
   };
   const stagedAmount = (base, totalGross) => {
-    const invoiceItems = [{ id: `${base.reservationId}-af`, normalType: 'AF', totalPrice: totalGross }];
-    return { ...base, fiscalInvoiceItems: invoiceItems, financials: { totalGross, invoiceItems } };
+    const invoiceItems = [{
+      id: `${base.reservationId}-af`, normalType: 'AF', totalPrice: totalGross,
+      listingId: base.listingId, stayIndex: 0,
+    }];
+    return {
+      ...base,
+      fiscalInvoiceItems: invoiceItems,
+      financials: { totalGross, invoiceItems },
+      stayEvidence: {
+        reservationListingId: base.listingId, folioListingId: base.listingId,
+        lineListingIds: [base.listingId], stayIndexes: [0],
+        allLinesAllocated: true, singleStayConfirmed: true,
+      },
+    };
   };
   const stagedBase = stagedAmount(stagedBaseCore, 200);
   await stageReservation(stagedBase, billingContext);
@@ -749,6 +778,10 @@ async function run() {
   assert(allRevisionDocuments.length === 4 && oldRevisionDocuments.every((old) => allRevisionDocuments.find((row) => row.id === old.id).status === 'cancelled') && newRevisionPrimary?.gross_value === 360, 'μετά την ακύρωση παλιών παραστατικών η νέα revision παίρνει νέους ΑΑ και το διορθωμένο ποσό');
   const reviewedSnapshot = await stageReservation(stagedAmount(stagedBase, 339), billingContext);
   assert(Boolean(reviewedSnapshot.requires_review), 'μεταβολή μετά το materialization επισημαίνεται για έλεγχο');
+  const sameTotalNoShow = await stageReservation({
+    ...stagedAmount(stagedBase, 339), guestStayStatus: 'no_show',
+  }, billingContext);
+  assert(Boolean(sameTotalNoShow.requires_review), 'ίδιο ποσό με μεταβολή Guesty σε no-show παραμένει μπλοκαρισμένο για έλεγχο');
   await stageReservation(stagedAmount({ ...stagedBase, status: 'canceled' }, 339), billingContext);
   const cancelledPending = await db('fiscal_documents').where({ reservation_id: 'res_STAGED001', status: 'cancelled' });
   assert(cancelledPending.length === 2, 'ακύρωση πριν τη διαβίβαση ακυρώνει τα pending παραστατικά τοπικά');
@@ -929,6 +962,11 @@ async function run() {
     platform: 'bookingcom', platformKey: 'bookingcom', source: 'booking.com', sourceKey: 'booking.com',
     financials: { invoiceItems: [{ id: 'guard-af', normalType: 'AF', title: 'Room charge', totalPrice: 485.90 }] },
     fiscalInvoiceItems: [{ id: 'guard-af', normalType: 'AF', title: 'Room charge', totalPrice: 485.90 }],
+    stayEvidence: {
+      reservationListingId: securedListing.listing_id_guesty,
+      folioListingId: securedListing.listing_id_guesty,
+      lineListingIds: [], stayIndexes: [], singleStayConfirmed: true,
+    },
   };
   let noShowBlocked = false;
   try { await applyFinancialProfile({ ...bookingProfileReservation, guestStayStatus: 'no_show' }, billingContext); } catch (error) { noShowBlocked = error.status === 409; }
@@ -941,6 +979,7 @@ async function run() {
         { id: 'guard-af-a', normalType: 'AF', totalPrice: 242.95, listingId: securedListing.listing_id_guesty, stayIndex: 0 },
         { id: 'guard-af-b', normalType: 'AF', totalPrice: 242.95, listingId: 'another-listing', stayIndex: 1 },
       ],
+      stayEvidence: { ...bookingProfileReservation.stayEvidence, singleStayConfirmed: false },
     }, billingContext);
   } catch (error) { splitStayBlocked = error.status === 409; }
   assert(splitStayBlocked, 'split/relocated Guesty folio απαιτεί ρητή κατανομή ανά stay και δεν αθροίζεται αυτόματα');
@@ -982,7 +1021,7 @@ async function run() {
     companyId: securedCompany.id, businessDate: uncertainBusinessDate,
     sender: uncertainSender, verifier: async () => ({ verified: false }), materializer: async () => [],
   });
-  assert(uncertainSendCalls === callsBeforeRetry && blockedUncertainRun.status === 'failed', 'επόμενο κλείσιμο δεν ξαναστέλνει αβέβαιη μετάδοση ούτε δηλώνει ψευδώς completed');
+  assert(uncertainSendCalls === callsBeforeRetry && ['failed', 'partial'].includes(blockedUncertainRun.status), 'επόμενο κλείσιμο δεν ξαναστέλνει αβέβαιη μετάδοση ούτε δηλώνει ψευδώς completed');
   for (let index = 0; index < uncertainDocuments.length; index += 1) {
     const document = uncertainDocuments[index];
     const mark = String(700000000000000n + BigInt(index + 1));
@@ -1005,7 +1044,13 @@ async function run() {
     takk_document_id: reconciledPair.find((row) => row.document_type === '8.2').id,
     approved_by: 'Smoke Test Accountant', approval_notes: 'Verified pair and PDFs',
   });
-  assert(signoff.primary_mark && signoff.takk_mark && signoff.primary_pdf_sha256.length === 64 && signoff.takk_pdf_sha256.length === 64, 'sandbox sign-off απαιτεί verified κύριο+ΤΑΚΚ και αποθηκεύει hashes των PDF');
+  assert(signoff.primary_mark && signoff.takk_mark && signoff.issuer_vat === securedCompany.vat_number
+    && signoff.credential_binding_sha256.length === 64
+    && signoff.primary_pdf_sha256.length === 64 && signoff.takk_pdf_sha256.length === 64
+    && signoff.primary_xml_sha256.length === 64 && signoff.takk_xml_sha256.length === 64
+    && signoff.primary_response_sha256.length === 64 && signoff.takk_response_sha256.length === 64
+    && signoff.primary_uid_sha256.length === 64 && signoff.takk_uid_sha256.length === 64,
+  'sandbox sign-off απαιτεί verified κύριο+ΤΑΚΚ και δεσμεύεται στο τρέχον ΑΦΜ/credentials');
   const cancellationTarget = reconciledPair.find((row) => row.document_type === '8.2');
   let cancellationUncertain = false;
   try {

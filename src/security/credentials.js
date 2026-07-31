@@ -5,6 +5,17 @@ const crypto = require('crypto');
 const PREFIX_V1 = 'enc:v1';
 const PREFIX_V2 = 'enc:v2';
 
+function companyCredentialBinding(company) {
+  return crypto.createHash('sha256').update(JSON.stringify({
+    vatNumber: String(company?.vat_number || ''),
+    // Bind acceptance to credential identity, not randomized ciphertext, so a
+    // DATA_ENCRYPTION_KEY rewrap does not invalidate an otherwise identical
+    // accountant-approved sandbox run.
+    aadeUser: String(decryptCompanySecret(company, 'aade_user_id') || ''),
+    aadeKey: String(decryptCompanySecret(company, 'aade_subscription_key') || ''),
+  })).digest('hex');
+}
+
 function parseEncryptionKey(configured, name) {
   if (!configured) {
     throw new Error(`${name} is required before storing or using integration secrets`);
@@ -114,6 +125,7 @@ function decryptCompanySecret(company, field) {
 }
 
 module.exports = {
+  companyCredentialBinding,
   encryptSecret,
   decryptSecret,
   reencryptSecret,

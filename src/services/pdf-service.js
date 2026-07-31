@@ -51,8 +51,8 @@ function stayLines(document, source, listing) {
 async function buildFiscalDocumentPdfData(documentId) {
   const document = await getDocumentById(documentId);
   if (!document) { const error = new Error('Fiscal document not found'); error.status = 404; throw error; }
-  if (document.status !== 'sent' || document.cancellation_status === 'cancelled') {
-    const error = new Error('PDF is unavailable for unsent or cancelled fiscal documents'); error.status = 409; throw error;
+  if (document.status !== 'sent' || ![null, undefined, 'none'].includes(document.cancellation_status)) {
+    const error = new Error('PDF is unavailable for unsent documents or while cancellation is unresolved'); error.status = 409; throw error;
   }
   if (!document.mydata_mark || document.verification_status !== 'verified') {
     const error = new Error('PDF is available only after myDATA MARK verification'); error.status = 409; throw error;

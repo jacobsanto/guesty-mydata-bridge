@@ -17,7 +17,8 @@ if (process.env.POSTGRES_INTEGRATION_TEST !== 'true') {
   const execFileAsync = promisify(execFile);
   const projectRoot = path.resolve(__dirname, '..');
   const { db, initSchema } = require('../src/database');
-  const { createDocumentOnce } = require('../src/repositories/fiscal-documents');
+  const { createDocumentOnce, claimDocument, markDocumentSent } = require('../src/repositories/fiscal-documents');
+  const { upsertReservationSnapshot } = require('../src/repositories/reservation-snapshots');
   const { prepareReservationDocuments } = require('../src/services/document-service');
   const { beginRun, heartbeatRun, recordRunItem, recordVerificationResult, finishRun } = require('../src/repositories/daily-close');
 
@@ -51,6 +52,7 @@ if (process.env.POSTGRES_INTEGRATION_TEST !== 'true') {
       xml_payload: `<invoice aa="${aa}"/>`,
       source_payload: '{}',
     });
+    return db('fiscal_documents').where({ document_key: key }).first();
   }
 
   test.before(async () => {
@@ -181,6 +183,48 @@ if (process.env.POSTGRES_INTEGRATION_TEST !== 'true') {
     };
   }
 
+  test('snapshot generation CAS prevents stale Guesty data from resurrecting a cancellation', async () => {
+    const currentReservation = reservation('pg-snapshot-cas');
+    const staged = await upsertReservationSnapshot(currentReservation, billingContext());
+    const cancelled = await upsertReservationSnapshot({ ...currentReservation, status: 'cancelled' }, billingContext());
+    assert(Number(cancelled.generation) > Number(staged.generation));
+    await assert.rejects(
+      db.transaction(async (trx) => {
+        await upsertReservationSnapshot(currentReservation, billingContext(), {
+          transaction: trx,
+          expectedGeneration: staged.generation,
+        });
+        await prepareReservationDocuments(currentReservation, billingContext(), { transaction: trx });
+      }),
+      (error) => error.code === 'RESERVATION_SNAPSHOT_CHANGED',
+    );
+    const finalSnapshot = await db('reservation_snapshots').where({ reservation_id: currentReservation.reservationId }).first();
+    assert.equal(finalSnapshot.status, 'cancelled');
+    assert.equal(Number((await db('fiscal_documents').where({ reservation_id: currentReservation.reservationId }).count({ count: '*' }).first()).count), 0);
+  });
+
+  test('late transmission responses never downgrade verified or cancelled fiscal state', async () => {
+    const document = await insertFiscalDocument({ key: 'pg-late-mark', series: 'PG-LATE', aa: 1 });
+    const attemptToken = await claimDocument(document.id);
+    assert(attemptToken);
+    await db('fiscal_documents').where({ id: document.id }).update({
+      status: 'failed', transmission_uncertain: true,
+    });
+    await markDocumentSent(document.id, { mark: 'PG-MARK-MONOTONIC', uid: 'PG-UID' }, { attemptToken });
+    await db('fiscal_documents').where({ id: document.id }).update({
+      verification_status: 'verified', status: 'cancelled', cancellation_status: 'cancelled',
+    });
+    await markDocumentSent(document.id, { mark: 'PG-MARK-MONOTONIC', uid: 'LATE-UID' }, { attemptToken });
+    const unchanged = await db('fiscal_documents').where({ id: document.id }).first();
+    assert.equal(unchanged.status, 'cancelled');
+    assert.equal(unchanged.verification_status, 'verified');
+    assert.equal(unchanged.mydata_mark, 'PG-MARK-MONOTONIC');
+    await assert.rejects(
+      markDocumentSent(document.id, { mark: 'PG-CONFLICTING-MARK' }, { attemptToken }),
+      (error) => error.status === 409,
+    );
+  });
+
   test('primary and TAKK rollback atomically, including both sequence increments', async () => {
     const failedReservation = reservation('pg-atomic-rollback');
     await assert.rejects(
@@ -249,5 +293,29 @@ if (process.env.POSTGRES_INTEGRATION_TEST !== 'true') {
     assert.equal((await db('fiscal_documents').where({ id: document.id }).first()).verification_status, 'verified');
     const finished = await finishRun(recovered.id, { total: 0, sent: 0, failed: 0 }, recovered.lease_token);
     assert.equal(finished.status, 'completed');
+    assert.equal(Number(finished.document_count), 1);
+    assert.equal(Number(finished.sent_count), 1);
+    assert.equal(Number(finished.failed_count), 0);
+
+    await db('fiscal_documents').where({ id: document.id }).update({
+      issue_date: '2026-08-01', status: 'transmitting', mydata_mark: null,
+      verification_status: 'pending', verified_at: null,
+    });
+    const inFlightRun = await beginRun(company.id, '2026-08-01', { leaseSeconds: 30 });
+    await recordRunItem(inFlightRun.id, document.id, 'in_flight', 'waiting for MARK', inFlightRun.lease_token);
+    const partial = await finishRun(inFlightRun.id, {}, inFlightRun.lease_token);
+    assert.equal(partial.status, 'partial');
+    assert.equal(Number(partial.document_count), 1);
+    assert.equal(Number(partial.sent_count), 0);
+    assert.equal(Number(partial.failed_count), 0);
+
+    await db('fiscal_documents').where({ id: document.id }).update({ status: 'sent', mydata_mark: 'PG-LATE-MARK' });
+    const verificationRun = await beginRun(company.id, '2026-08-01', { leaseSeconds: 30 });
+    await recordVerificationResult(verificationRun.id, document.id, 'PG-LATE-MARK', { verified: true }, verificationRun.lease_token);
+    const completed = await finishRun(verificationRun.id, {}, verificationRun.lease_token);
+    assert.equal(completed.status, 'completed');
+    assert.equal(Number(completed.document_count), 1);
+    assert.equal(Number(completed.sent_count), 1);
+    assert.equal(Number(completed.failed_count), 0);
   });
 }

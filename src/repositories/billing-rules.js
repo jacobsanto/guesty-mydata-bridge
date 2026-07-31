@@ -15,11 +15,11 @@ async function listBillingRules(listingId) {
   return query;
 }
 
-async function getBillingRule(listingId, guestyPlatform, guestySource) {
+async function getBillingRule(listingId, guestyPlatform, guestySource, client = db) {
   const platform = normalizeSource(guestyPlatform);
   const source = normalizeSource(guestySource);
   if (!platform || !source) return null;
-  return db(TABLE).where({ listing_id: listingId, guesty_platform: platform, guesty_source: source, active: true }).first();
+  return client(TABLE).where({ listing_id: listingId, guesty_platform: platform, guesty_source: source, active: true }).first();
 }
 
 async function createBillingRule(data) {
