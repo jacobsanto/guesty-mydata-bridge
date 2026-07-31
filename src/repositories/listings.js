@@ -1,6 +1,7 @@
 'use strict';
 
 const { db } = require('../database');
+const { insertedId } = require('../database-utils');
 
 async function listListings() {
   return db('listings as l')
@@ -9,6 +10,17 @@ async function listListings() {
       'l.id',
       'l.listing_id_guesty',
       'l.property_type',
+      'l.default_invoice_type',
+      'l.invoice_counterpart_vat_number',
+      'l.invoice_counterpart_country',
+      'l.invoice_counterpart_name',
+      'l.climate_fee_high',
+      'l.climate_fee_low',
+      'l.climate_fee_high_category',
+      'l.climate_fee_low_category',
+      'l.climate_fee_series',
+      'l.payment_method_type',
+      'l.payment_method_info',
       'l.active',
       'l.company_id',
       'c.company_name',
@@ -33,21 +45,32 @@ async function getCompanyAndListingByGuestyListingId(listingIdGuesty) {
       'l.id as listing_id',
       'l.listing_id_guesty',
       'l.property_type',
+      'l.default_invoice_type',
+      'l.invoice_counterpart_vat_number',
+      'l.invoice_counterpart_country',
+      'l.invoice_counterpart_name',
+      'l.climate_fee_high',
+      'l.climate_fee_low',
+      'l.climate_fee_high_category',
+      'l.climate_fee_low_category',
+      'l.climate_fee_series',
+      'l.payment_method_type',
+      'l.payment_method_info',
       'l.active as listing_active',
       'c.id as company_id',
       'c.company_name',
       'c.vat_number',
-      'c.aade_user_id',
-      'c.aade_subscription_key',
       'c.invoice_series',
       'c.invoice_counter',
       'c.active as company_active'
     )
     .first();
+
+  return row || null;
 }
 
 async function createListing(data) {
-  const [id] = await db('listings').insert(data);
+  const id = insertedId(await db('listings').insert(data).returning('id'));
   return getListingById(id);
 }
 

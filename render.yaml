@@ -1,0 +1,71 @@
+services:
+  - type: web
+    name: guesty-mydata-bridge
+    runtime: docker
+    region: frankfurt
+    plan: starter
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    autoDeploy: false
+    numInstances: 1
+    healthCheckPath: /health/ready
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: "3001"
+      - key: DB_CLIENT
+        value: pg
+      - key: DB_HOST
+        fromDatabase:
+          name: guesty-mydata-db
+          property: host
+      - key: DB_PORT
+        fromDatabase:
+          name: guesty-mydata-db
+          property: port
+      - key: DB_NAME
+        fromDatabase:
+          name: guesty-mydata-db
+          property: database
+      - key: DB_USER
+        fromDatabase:
+          name: guesty-mydata-db
+          property: user
+      - key: DB_PASSWORD
+        fromDatabase:
+          name: guesty-mydata-db
+          property: password
+      - key: DB_SSL
+        value: "true"
+      - key: MYDATA_ENV
+        value: sandbox
+      - key: MYDATA_PRODUCTION_ENABLED
+        value: "false"
+      - key: MYDATA_TIMEOUT_MS
+        value: "15000"
+      - key: DAILY_CLOSE_ENABLED
+        value: "false"
+      - key: DAILY_CLOSE_TIME
+        value: "23:55"
+      - key: DAILY_CLOSE_TIMEZONE
+        value: Europe/Athens
+      - key: ADMIN_API_TOKEN
+        sync: false
+      - key: DATA_ENCRYPTION_KEY
+        sync: false
+      - key: GUESTY_CLIENT_ID
+        sync: false
+      - key: GUESTY_CLIENT_SECRET
+        sync: false
+      - key: GUESTY_WEBHOOK_SECRET
+        sync: false
+
+databases:
+  - name: guesty-mydata-db
+    databaseName: guesty_mydata
+    user: guesty_mydata
+    region: frankfurt
+    plan: basic-256mb
+    postgresMajorVersion: "16"
+    ipAllowList: []
