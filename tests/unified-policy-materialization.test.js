@@ -138,6 +138,8 @@ test('enforced unified policy blocks no-policy issue and overrides cannot change
   assert.doesNotMatch(primary.xml_payload, /<counterpart>/);
   const frozen = JSON.parse(primary.source_payload);
   assert.equal(frozen.billingSnapshot.unified_channel_policy.policy_hash.length, 64);
+  assert.equal(frozen.billingSnapshot.unified_channel_policy.vat_category, 2);
+  assert.equal(frozen.billingSnapshot.unified_channel_policy.classification_type, 'E3_561_003');
   const takk = await db('fiscal_documents').where({ reservation_id: 'res-locked-route', document_type: '8.2' }).first();
   assert.equal(takk.series, 'T-2026');
   assert.equal(takk.gross_value, 8);

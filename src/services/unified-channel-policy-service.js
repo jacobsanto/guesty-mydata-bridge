@@ -75,6 +75,14 @@ function validateRoute(policy) {
   throw policyError('Unified policy recipient model, counterpart and document type are inconsistent', 409, 'UNIFIED_CHANNEL_RECIPIENT_INVALID');
 }
 
+function validateFiscalClassification(policy) {
+  const expectedType = policy.document_type === '11.2' ? 'E3_561_003' : 'E3_561_007';
+  if (Number(policy.vat_category) !== 2 || policy.classification_category !== 'category1_3'
+      || policy.classification_type !== expectedType) {
+    throw policyError('Unified policy VAT category and E3 classification are inconsistent with its document route', 409, 'UNIFIED_CHANNEL_CLASSIFICATION_INVALID');
+  }
+}
+
 async function approvalsAndSamplesValid(policy, executor) {
   const [samples, approvals] = await Promise.all([
     executor('channel_policy_samples as s')
@@ -116,6 +124,7 @@ async function resolveApprovedUnifiedChannelPolicy({ reservation, billingContext
   if (policy.gross_strategy !== 'folio_items_sum') throw policyError(`Unsupported unified gross strategy ${policy.gross_strategy}`);
   try { policy.line_rules = validateLineRules(policy.line_rules); } catch (error) { throw policyError(`Unified policy line rules are invalid: ${error.message}`); }
   const counterpart = validateRoute(policy);
+  validateFiscalClassification(policy);
   await approvalsAndSamplesValid(policy, executor);
   return { policy, counterpart, platformKey, sourceKey, currency };
 }
@@ -148,6 +157,7 @@ async function applyUnifiedChannelPolicy(reservation, billingContext, options = 
       currency: resolved.currency, documentType: resolved.policy.document_type, series: resolved.policy.series,
       recipientModel: resolved.policy.recipient_model, counterpart: resolved.counterpart || null,
       classificationType: resolved.policy.classification_type, classificationCategory: resolved.policy.classification_category,
+      vatCategory: Number(resolved.policy.vat_category),
       evidenceHash: crypto.createHash('sha256').update(stableJson(result.evidence)).digest('hex'),
     },
   };

@@ -70,10 +70,18 @@ function generateMyDataXML(reservation, billingContext, invoiceAA) {
         }
       : null
   )) : null;
-  const classificationType = invoiceType === '11.2' ? 'E3_561_003' : 'E3_561_007';
+  const unifiedPolicy = reservation.unifiedChannelPolicy || null;
+  const expectedClassificationType = invoiceType === '11.2' ? 'E3_561_003' : 'E3_561_007';
+  const vatCategory = unifiedPolicy ? Number(unifiedPolicy.vatCategory) : 2;
+  const classificationType = unifiedPolicy?.classificationType || expectedClassificationType;
+  const classificationCategory = unifiedPolicy?.classificationCategory || 'category1_3';
 
   if (!['11.2', '2.1'].includes(invoiceType)) {
     throw new Error('A listing default_invoice_type or reservation.invoiceType of 11.2 or 2.1 is required');
+  }
+  if (!Number.isInteger(vatCategory) || vatCategory !== 2 || classificationCategory !== 'category1_3'
+      || classificationType !== expectedClassificationType) {
+    throw new Error('Unified channel policy VAT/E3 classification is inconsistent with the selected primary document type');
   }
 
   if (invoiceType === '2.1' && (!counterpart?.vatNumber || !counterpart?.country)) {
@@ -126,13 +134,13 @@ function generateMyDataXML(reservation, billingContext, invoiceAA) {
   invoice.ele('invoiceDetails')
         .ele('lineNumber').txt('1').up()
         .ele('netValue').txt(netValue.toFixed(2)).up()
-        .ele('vatCategory').txt('2').up()          // 2 = 13% ΦΠΑ
+        .ele('vatCategory').txt(String(vatCategory)).up()          // 2 = 13% ΦΠΑ
         .ele('vatAmount').txt(vatAmount.toFixed(2)).up()
         .ele('discountOption').txt('false').up()
         // Retail/private: E3_561_003. Approved B2B route: E3_561_007.
         .ele('incomeClassification')
           .ele('icls:classificationType').txt(classificationType).up()
-          .ele('icls:classificationCategory').txt('category1_3').up()
+          .ele('icls:classificationCategory').txt(classificationCategory).up()
           .ele('icls:amount').txt(netValue.toFixed(2)).up()
         .up()
       .up();
@@ -150,7 +158,7 @@ function generateMyDataXML(reservation, billingContext, invoiceAA) {
         // Summary income classification
         .ele('incomeClassification')
           .ele('icls:classificationType').txt(classificationType).up()
-          .ele('icls:classificationCategory').txt('category1_3').up()
+          .ele('icls:classificationCategory').txt(classificationCategory).up()
           .ele('icls:amount').txt(netValue.toFixed(2)).up()
         .up()
       .up();

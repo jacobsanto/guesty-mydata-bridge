@@ -104,6 +104,8 @@ async function prepareReservationDocuments(reservation, billingContext, options 
       unified_channel_policy: unifiedPolicy ? {
         id: unifiedPolicy.id, version: unifiedPolicy.version, policy_hash: unifiedPolicy.policyHash,
         guesty_account_id: unifiedPolicy.guestyAccountId, platform_key: unifiedPolicy.platformKey, source_key: unifiedPolicy.sourceKey,
+        document_type: unifiedPolicy.documentType, vat_category: unifiedPolicy.vatCategory,
+        classification_type: unifiedPolicy.classificationType, classification_category: unifiedPolicy.classificationCategory,
       } : null,
       vat_number: effectiveContext.vat_number,
       invoice_series: series,
