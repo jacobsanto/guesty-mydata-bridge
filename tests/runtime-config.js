@@ -38,14 +38,14 @@ assert.throws(() => validateRuntimeConfig({
 assert.strictEqual(validateRuntimeConfig({
   NODE_ENV: 'production', DB_CLIENT: 'pg', DATABASE_URL: 'postgres://db/app', DB_SSL: 'verify-full',
   ADMIN_API_TOKEN: 'x'.repeat(32), DATA_ENCRYPTION_KEY: Buffer.alloc(32).toString('base64'),
-  GUESTY_WEBHOOK_SECRET: 'x', GUESTY_CLIENT_ID: 'x', GUESTY_CLIENT_SECRET: 'x',
+  GUESTY_WEBHOOK_SECRET: 'x', GUESTY_CLIENT_ID: 'x', GUESTY_CLIENT_SECRET: 'x', GUESTY_ACCOUNT_ID: 'account-x',
 }), true);
 
 assert.throws(() => validateRuntimeConfig({
   NODE_ENV: 'production', DB_CLIENT: 'pg', DATABASE_URL: 'postgres://db/app', DB_SSL: 'verify-full',
   ADMIN_API_TOKEN: 'x'.repeat(32), DATA_ENCRYPTION_KEY: Buffer.alloc(32).toString('base64'),
   DATA_ENCRYPTION_KEY_PREVIOUS: Buffer.alloc(32).toString('base64'),
-  GUESTY_WEBHOOK_SECRET: 'x', GUESTY_CLIENT_ID: 'x', GUESTY_CLIENT_SECRET: 'x',
+  GUESTY_WEBHOOK_SECRET: 'x', GUESTY_CLIENT_ID: 'x', GUESTY_CLIENT_SECRET: 'x', GUESTY_ACCOUNT_ID: 'account-x',
 }), /must differ/);
 
 assert.throws(() => validateRuntimeConfig({

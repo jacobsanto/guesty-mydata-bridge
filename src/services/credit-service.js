@@ -54,6 +54,9 @@ async function createCreditDocument({ documentId, grossValue, issueDate, referen
     const error = new Error('reference must be 1-80 printable characters'); error.status = 400; throw error;
   }
   const source = JSON.parse(original.source_payload || '{}');
+  if (currentEnvironment === 'production' && !source?.billingSnapshot?.unified_channel_policy?.policy_hash) {
+    const error = new Error('Production credit requires an original document frozen with a unified channel policy'); error.status = 409; throw error;
+  }
   const currentBillingContext = await getCompanyAndListingByGuestyListingId(source.listingId);
   const billingContext = source.billingSnapshot
     ? { ...currentBillingContext, ...source.billingSnapshot }

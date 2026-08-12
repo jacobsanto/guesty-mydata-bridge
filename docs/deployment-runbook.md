@@ -11,8 +11,8 @@ Never put them in Git, a ticket, chat, image, log, or database backup note.
 
 - `ADMIN_API_TOKEN`: a unique high-entropy bearer token for the admin API.
 - `DATA_ENCRYPTION_KEY`: exactly 32 random bytes, base64 encoded.
-- `GUESTY_CLIENT_ID`, `GUESTY_CLIENT_SECRET`, and
-  `GUESTY_WEBHOOK_SECRET` from Guesty.
+- `GUESTY_CLIENT_ID`, `GUESTY_CLIENT_SECRET`, `GUESTY_WEBHOOK_SECRET`, and the
+  stable `GUESTY_ACCOUNT_ID` from the connected Guesty account.
 - PostgreSQL host, port, database, user, and a unique password.
 - `DB_POOL_MAX` at least `2` (`10` is the deployment default), because schema
   initialization holds a dedicated PostgreSQL advisory-lock connection.

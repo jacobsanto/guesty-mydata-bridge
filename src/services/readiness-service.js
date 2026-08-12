@@ -5,6 +5,8 @@ const { isEncrypted, isContextBound } = require('../security/credentials');
 const { listIntegrationChecks } = require('../repositories/integration-checks');
 const { normalizeAndValidateGreekVat, normalizeCounterpart, normalizeSeries, validateAccommodationClimatePair } = require('../validation/fiscal-fields');
 const { getAcceptanceMatrices } = require('./sandbox-acceptance-service');
+const { takkPolicyHash } = require('./takk-policy-service');
+const { channelPolicyHash } = require('./unified-channel-policy-service');
 
 function issue(code, message, scope = 'runtime') {
   return { code, message, scope };
@@ -39,6 +41,12 @@ async function getReadiness({ companyId = null } = {}) {
   const financialProfilesQuery = db('financial_profiles as p')
     .join('listings as l', 'l.id', 'p.listing_id')
     .select('p.id', 'p.listing_id', 'p.platform_key', 'p.source_key', 'p.version', 'p.status', 'p.line_rules', 'p.minimum_samples');
+  const channelPoliciesQuery = db('channel_policy_versions as p')
+    .join('listings as l', 'l.id', 'p.listing_id')
+    .select('p.*');
+  const takkPoliciesQuery = db('takk_policy_versions as p')
+    .join('listings as l', 'l.id', 'p.listing_id')
+    .select('p.*');
   const observedChannelsQuery = db('reservation_snapshots')
       .whereIn('status', ['confirmed', 'checked_out'])
       .whereNull('materialized_at')
@@ -56,6 +64,10 @@ async function getReadiness({ companyId = null } = {}) {
       .where((query) => query.whereNull('target_environment').orWhereNot({ target_environment: 'production' }))
       .select('company_id', 'target_environment')
       .groupBy('company_id', 'target_environment');
+  const pendingProductionDocumentsQuery = db('fiscal_documents')
+    .where({ target_environment: 'production' })
+    .whereIn('status', ['pending', 'failed', 'transmitting'])
+    .select('id', 'company_id', 'document_type', 'source_payload');
 
   if (scopedCompanyId !== null) {
     companiesQuery.where({ id: scopedCompanyId });
@@ -63,26 +75,32 @@ async function getReadiness({ companyId = null } = {}) {
     rulesQuery.where({ 'l.company_id': scopedCompanyId });
     legacyRulesQuery.where({ 'l.company_id': scopedCompanyId });
     financialProfilesQuery.where({ 'l.company_id': scopedCompanyId });
+    channelPoliciesQuery.where({ 'l.company_id': scopedCompanyId });
+    takkPoliciesQuery.where({ 'l.company_id': scopedCompanyId });
     observedChannelsQuery.where({ company_id: scopedCompanyId });
     reviewCountQuery.where({ company_id: scopedCompanyId });
     uncertainCountQuery.where({ company_id: scopedCompanyId });
     cancellationUncertainCountQuery.where({ company_id: scopedCompanyId });
     cancellationUnverifiedCountQuery.where({ company_id: scopedCompanyId });
     environmentMismatchQuery.where({ company_id: scopedCompanyId });
+    pendingProductionDocumentsQuery.where({ company_id: scopedCompanyId });
   }
 
-  const [companies, listings, rules, legacyRuleCountRow, financialProfiles, observedChannels, reviewCountRow, uncertainCountRow, cancellationUncertainCountRow, cancellationUnverifiedCountRow, environmentMismatchRows, allChecks] = await Promise.all([
+  const [companies, listings, rules, legacyRuleCountRow, financialProfiles, channelPolicies, takkPolicies, observedChannels, reviewCountRow, uncertainCountRow, cancellationUncertainCountRow, cancellationUnverifiedCountRow, environmentMismatchRows, pendingProductionDocuments, allChecks] = await Promise.all([
     companiesQuery,
     listingsQuery,
     rulesQuery,
     legacyRulesQuery,
     financialProfilesQuery,
+    channelPoliciesQuery,
+    takkPoliciesQuery,
     observedChannelsQuery,
     reviewCountQuery,
     uncertainCountQuery,
     cancellationUncertainCountQuery,
     cancellationUnverifiedCountQuery,
     environmentMismatchQuery,
+    pendingProductionDocumentsQuery,
     listIntegrationChecks(scopedCompanyId === null ? undefined : { companyId: scopedCompanyId }),
   ]);
   const checks = allChecks;
@@ -103,6 +121,7 @@ async function getReadiness({ companyId = null } = {}) {
   }
   const activeCompanyIds = new Set(companies.map((company) => Number(company.id)));
   const activeListingIds = new Set(listings.map((listing) => Number(listing.id)));
+  const today = new Date().toISOString().slice(0, 10);
 
   for (const company of companies) {
     const scope = `company:${company.id}`;
@@ -147,6 +166,34 @@ async function getReadiness({ companyId = null } = {}) {
       branch: listing.invoice_counterpart_branch,
     }, { required: listing.default_invoice_type === '2.1', label: 'invoice_counterpart' }));
     if (counterpartError) issues.push(issue('default_tpy_counterpart', `${listing.listing_id_guesty}: ${counterpartError}`, scope));
+
+    const activeTakk = takkPolicies.filter((policy) => Number(policy.listing_id) === Number(listing.id)
+      && policy.status === 'approved' && String(policy.valid_from) <= today && (!policy.valid_to || String(policy.valid_to) >= today));
+    if (activeTakk.length !== 1) {
+      issues.push(issue('takk_policy_missing', `${listing.listing_id_guesty}: απαιτείται ακριβώς μία εγκεκριμένη TAKK policy για την τρέχουσα περίοδο`, scope));
+    }
+  }
+
+  for (const policy of takkPolicies.filter((row) => row.status === 'approved')) {
+    const scope = `takk-policy:${policy.id}`;
+    try {
+      if (takkPolicyHash(policy) !== policy.policy_hash) throw new Error('policy hash does not match configuration');
+    } catch (error) {
+      issues.push(issue('takk_policy_hash', `TAKK policy ${policy.id}: ${error.message}`, scope));
+      continue;
+    }
+    const [samples, approvals] = await Promise.all([
+      db('takk_calibration_samples').where({ policy_id: policy.id, passed: true }).select('scenario'),
+      db('policy_approvals').where({ takk_policy_id: policy.id, policy_hash: policy.policy_hash }).select('approval_role'),
+    ]);
+    const scenarios = new Set(samples.map((sample) => sample.scenario));
+    const roles = new Set(approvals.map((approval) => approval.approval_role));
+    if (!scenarios.has('low') || !scenarios.has('high') || !scenarios.has('boundary')) {
+      issues.push(issue('takk_policy_calibration', `TAKK policy ${policy.id}: λείπουν approved low/high/boundary samples`, scope));
+    }
+    if (!roles.has('accounting') || !roles.has('technical')) {
+      issues.push(issue('takk_policy_approvals', `TAKK policy ${policy.id}: λείπει λογιστική ή τεχνική έγκριση`, scope));
+    }
   }
   for (const rule of rules) {
     const scope = `rule:${rule.id}`;
@@ -189,6 +236,30 @@ async function getReadiness({ companyId = null } = {}) {
     if (!approvedFinancialKeys.has(key)) {
       issues.push(issue('financial_profile_missing', `${channel.listing_id_guesty}: λείπει εγκεκριμένο profile ποσών για ${channel.platform_key} / ${channel.source_key}`, scope));
     }
+    const channelPoliciesForTuple = channelPolicies.filter((policy) => Number(policy.listing_id) === Number(channel.listing_id)
+      && policy.status === 'approved' && policy.platform_key === channel.platform_key && policy.source_key === channel.source_key
+      && String(policy.guesty_account_id) === String(process.env.GUESTY_ACCOUNT_ID || '')
+      && String(policy.currency || 'EUR') === 'EUR'
+      && (!policy.valid_from || String(policy.valid_from) <= today) && (!policy.valid_to || String(policy.valid_to) >= today));
+    if (channelPoliciesForTuple.length !== 1) {
+      issues.push(issue('unified_channel_policy_missing', `${channel.listing_id_guesty}: απαιτείται ακριβώς μία εγκεκριμένη unified policy για ${channel.platform_key} / ${channel.source_key}`, scope));
+      continue;
+    }
+    const policy = channelPoliciesForTuple[0];
+    try {
+      if (channelPolicyHash(policy) !== policy.policy_hash) throw new Error('policy hash does not match configuration');
+      const [samples, approvals] = await Promise.all([
+        db('channel_policy_samples as s').join('fiscal_evidence_captures as e', 'e.id', 's.evidence_capture_id')
+          .where({ 's.policy_id': policy.id, 's.policy_hash': policy.policy_hash, 's.passed': true, 's.stale': false })
+          .whereNotNull('s.historical_mark').select('e.reservation_id'),
+        db('policy_approvals').where({ channel_policy_id: policy.id, policy_hash: policy.policy_hash }).select('approval_role'),
+      ]);
+      if (new Set(samples.map((sample) => String(sample.reservation_id))).size < 3) throw new Error('requires 3 distinct finalized samples');
+      const roles = new Set(approvals.map((approval) => approval.approval_role));
+      if (!roles.has('accounting') || !roles.has('technical')) throw new Error('requires accounting and technical approvals');
+    } catch (error) {
+      issues.push(issue('unified_channel_policy_invalid', `Unified policy ${policy.id}: ${error.message}`, `channel-policy:${policy.id}`));
+    }
   }
   const guestyCheck = checks.find((row) => row.check_key === 'guesty');
   if (!isFreshSuccess(guestyCheck)) issues.push(issue('guesty_connection_check', 'Λείπει πρόσφατη (24ωρο) επιτυχής σύνδεση Guesty'));
@@ -211,6 +282,18 @@ async function getReadiness({ companyId = null } = {}) {
       'fiscal_target_environment',
       `Υπάρχουν μη ολοκληρωμένα παραστατικά ${row.target_environment || 'legacy/άγνωστου'} περιβάλλοντος· ακυρώστε τα ή επανεκδώστε τα πριν από production`,
       `company:${row.company_id}`,
+    ));
+  }
+  for (const document of pendingProductionDocuments) {
+    let source = {};
+    try { source = JSON.parse(document.source_payload || '{}'); } catch { /* reported below */ }
+    const hasChannel = Boolean(source?.billingSnapshot?.unified_channel_policy?.policy_hash);
+    const hasTakk = Boolean(source?.climateSnapshot?.unified_takk_policy?.policy_hash);
+    const valid = document.document_type === '8.2' ? hasTakk : hasChannel;
+    if (!valid) productionIssues.push(issue(
+      'unified_policy_provenance',
+      `Το production παραστατικό ${document.id} (${document.document_type}) δεν έχει frozen unified policy provenance και δεν επιτρέπεται να σταλεί`,
+      `company:${document.company_id}`,
     ));
   }
   for (const company of companies) {
@@ -247,6 +330,8 @@ async function getReadiness({ companyId = null } = {}) {
       uncertainCancellations: cancellationUncertainCount,
       unverifiedCancellations: cancellationUnverifiedCount,
       financialProfiles: financialProfiles.length,
+      unifiedChannelPolicies: channelPolicies.length,
+      takkPolicies: takkPolicies.length,
       observedFinancialChannels: observedChannels.length,
       sandboxAcceptedCapabilities: acceptance.reduce((sum, matrix) => sum + matrix.accepted.length, 0),
     },

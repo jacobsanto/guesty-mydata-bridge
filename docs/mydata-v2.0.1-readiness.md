@@ -25,6 +25,7 @@
 ## Runtime safety controls
 
 - Production calls require `MYDATA_PRODUCTION_ENABLED=true`; `MYDATA_ENV=production` alone is not enough.
+- Production runtime also requires `GUESTY_ACCOUNT_ID`. A policy is keyed by that stable account together with company, listing, platform and source; a missing account identity blocks materialization.
 - Admin APIs require `ADMIN_API_TOKEN` in production.
 - New or updated AADE credentials require `DATA_ENCRYPTION_KEY`, an AES-256-GCM 32-byte base64 key. Keep it in a secret manager, not in Git.
 - Legacy plaintext credentials are rejected in production. Migrate them through a controlled credential rotation before go-live.

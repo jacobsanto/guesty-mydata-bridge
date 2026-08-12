@@ -13,6 +13,7 @@ process.env.DATA_ENCRYPTION_KEY = Buffer.alloc(32, 31).toString('base64');
 process.env.GUESTY_CLIENT_ID = 'scope-client';
 process.env.GUESTY_CLIENT_SECRET = 'scope-secret';
 process.env.GUESTY_WEBHOOK_SECRET = 'scope-webhook-secret';
+process.env.GUESTY_ACCOUNT_ID = 'scope-account';
 process.env.MYDATA_ENV = 'production';
 process.env.MYDATA_PRODUCTION_ENABLED = 'true';
 process.env.DAILY_CLOSE_ENABLED = 'true';
@@ -23,6 +24,7 @@ const { recordIntegrationCheck } = require('../src/repositories/integration-chec
 const { getReadiness } = require('../src/services/readiness-service');
 const { assertProductionTransmissionEnabled } = require('../src/security/production-guard');
 const { ACCEPTANCE_CONTRACT_VERSION, CAPABILITIES } = require('../src/services/sandbox-acceptance-service');
+const { takkPolicyHash } = require('../src/services/takk-policy-service');
 
 function companyCredentials(vatNumber, user, key) {
   const company = { vat_number: vatNumber };
@@ -69,6 +71,25 @@ async function insertReadyAcceptance(company, listing) {
       evidence_json: '{}',
     });
   }
+}
+
+async function insertReadyTakkPolicy(company, listing) {
+  const base = {
+    company_id: company.id, listing_id: listing.id, version: 1, status: 'approved', property_type: 'apartment',
+    licensed_category: 'readiness-test', valid_from: '2020-01-01', valid_to: '2099-12-31',
+    high_category: 24, low_category: 10, high_rate_cents: 800, low_rate_cents: 200,
+    season_rules_json: JSON.stringify({ high: { from: '04-01', to: '10-31' } }), series: 'READY-TAKK',
+    calculator_version: 'takk-v1', created_by: 'readiness-test',
+  };
+  const [policyId] = await db('takk_policy_versions').insert({ ...base, policy_hash: takkPolicyHash(base) });
+  for (const [scenario, checkIn, checkOut, cents, hash] of [
+    ['low', '2026-01-01', '2026-01-02', 200, 'a'], ['high', '2026-07-01', '2026-07-02', 800, 'b'], ['boundary', '2026-04-01', '2026-04-02', 800, 'c'],
+  ]) await db('takk_calibration_samples').insert({ policy_id: policyId, scenario, check_in: checkIn, check_out: checkOut, expected_cents: cents, computed_cents: cents, delta_cents: 0, passed: true, evidence_sha256: hash.repeat(64) });
+  const policy = await db('takk_policy_versions').where({ id: policyId }).first();
+  await db('policy_approvals').insert([
+    { takk_policy_id: policyId, policy_hash: policy.policy_hash, approval_role: 'accounting', actor_id: 'accountant:test' },
+    { takk_policy_id: policyId, policy_hash: policy.policy_hash, approval_role: 'technical', actor_id: 'engineer:test' },
+  ]);
 }
 
 test.before(async () => {
@@ -137,6 +158,7 @@ test('SQLite readiness and production submission guard isolate one broken compan
   });
 
   await insertReadyAcceptance(readyCompany, readyListing);
+  await insertReadyTakkPolicy(readyCompany, readyListing);
   await recordIntegrationCheck('guesty', 'success', 'guesty');
   await recordIntegrationCheck(`mydata:${readyCompany.id}:sandbox`, 'success', 'sandbox');
   await recordIntegrationCheck(`mydata:${readyCompany.id}:production`, 'success', 'production');

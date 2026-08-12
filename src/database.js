@@ -489,6 +489,8 @@ async function ensureUnifiedPolicyTables() {
       t.foreign('listing_id').references('listings.id').onDelete('RESTRICT');
     });
     console.log('✅ Δημιουργήθηκε πίνακας: channel_policy_versions');
+  } else {
+    await ensureColumn('channel_policy_versions', 'currency', (t) => t.string('currency', 3).notNullable().defaultTo('EUR'));
   }
 
   if (!await db.schema.hasTable('fiscal_evidence_captures')) {
@@ -515,6 +517,10 @@ async function ensureUnifiedPolicyTables() {
       t.unique(['company_id', 'listing_id', 'reservation_id', 'payload_sha256']);
     });
     console.log('✅ Δημιουργήθηκε πίνακας: fiscal_evidence_captures');
+  } else {
+    await ensureColumn('fiscal_evidence_captures', 'guesty_account_id', (t) => t.string('guesty_account_id', 120).notNullable().defaultTo('legacy-unbound'));
+    await ensureColumn('fiscal_evidence_captures', 'currency', (t) => t.string('currency', 3).notNullable().defaultTo('EUR'));
+    await ensureColumn('fiscal_evidence_captures', 'previous_capture_id', (t) => t.integer('previous_capture_id').unsigned().nullable());
   }
 
   if (!await db.schema.hasTable('channel_policy_samples')) {
@@ -545,6 +551,9 @@ async function ensureUnifiedPolicyTables() {
       t.foreign('evidence_capture_id').references('fiscal_evidence_captures.id').onDelete('RESTRICT');
     });
     console.log('✅ Δημιουργήθηκε πίνακας: channel_policy_samples');
+  } else {
+    await ensureColumn('channel_policy_samples', 'policy_hash', (t) => t.string('policy_hash', 64).nullable());
+    await ensureColumn('channel_policy_samples', 'evidence_sha256', (t) => t.string('evidence_sha256', 64).nullable());
   }
 
   if (!await db.schema.hasTable('takk_policy_versions')) {
@@ -593,6 +602,9 @@ async function ensureUnifiedPolicyTables() {
       t.foreign('takk_policy_id').references('takk_policy_versions.id').onDelete('RESTRICT');
     });
     console.log('✅ Δημιουργήθηκε πίνακας: policy_approvals');
+  } else {
+    await ensureColumn('policy_approvals', 'channel_policy_id', (t) => t.integer('channel_policy_id').unsigned().nullable());
+    await ensureColumn('policy_approvals', 'takk_policy_id', (t) => t.integer('takk_policy_id').unsigned().nullable());
   }
 
   if (!await db.schema.hasTable('takk_calibration_samples')) {

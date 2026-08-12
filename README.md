@@ -197,7 +197,7 @@ npm run test:xsd
 
 ## Πριν από production
 
-Διάβασε και ολοκλήρωσε το [myDATA v2.0.1 readiness baseline](docs/mydata-v2.0.1-readiness.md). Το production circuit breaker απαιτεί ρητά `MYDATA_PRODUCTION_ENABLED=true`, πέρα από `MYDATA_ENV=production`.
+Διάβασε και ολοκλήρωσε το [myDATA v2.0.1 readiness baseline](docs/mydata-v2.0.1-readiness.md). Το production circuit breaker απαιτεί ρητά `MYDATA_PRODUCTION_ENABLED=true`, πέρα από `MYDATA_ENV=production`, και σταθερό `GUESTY_ACCOUNT_ID` ώστε κάθε approved policy να είναι δεμένη με το σωστό Guesty account.
 
 ### Εξωτερικές προϋποθέσεις και σημερινά όρια
 

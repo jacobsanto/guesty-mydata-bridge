@@ -41,6 +41,7 @@ if (process.env.POSTGRES_INTEGRATION_TEST !== 'true') {
   const {
     ACCEPTANCE_CONTRACT_VERSION, CAPABILITIES,
   } = require('../src/services/sandbox-acceptance-service');
+  const { takkPolicyHash } = require('../src/services/takk-policy-service');
 
   let company;
   let listing;
@@ -90,6 +91,26 @@ if (process.env.POSTGRES_INTEGRATION_TEST !== 'true') {
       renderSnapshot: { documentType: document.document_type, series: document.series, number: document.aa, mark },
       renderVersion: 'test-v1',
     };
+  }
+
+  async function insertReadyTakkPolicy(companyRow, listingRow) {
+    const base = {
+      company_id: companyRow.id, listing_id: listingRow.id, version: 1, status: 'approved', property_type: 'apartment',
+      licensed_category: 'postgres-test', valid_from: '2020-01-01', valid_to: '2099-12-31',
+      high_category: 24, low_category: 10, high_rate_cents: 800, low_rate_cents: 200,
+      season_rules_json: JSON.stringify({ high: { from: '04-01', to: '10-31' } }), series: 'PG-READY-TAKK',
+      calculator_version: 'takk-v1', created_by: 'postgres-test',
+    };
+    const [policy] = await db('takk_policy_versions').insert({ ...base, policy_hash: takkPolicyHash(base) }).returning('*');
+    await db('takk_calibration_samples').insert([
+      { policy_id: policy.id, scenario: 'low', check_in: '2026-01-01', check_out: '2026-01-02', expected_cents: 200, computed_cents: 200, delta_cents: 0, passed: true, evidence_sha256: 'a'.repeat(64) },
+      { policy_id: policy.id, scenario: 'high', check_in: '2026-07-01', check_out: '2026-07-02', expected_cents: 800, computed_cents: 800, delta_cents: 0, passed: true, evidence_sha256: 'b'.repeat(64) },
+      { policy_id: policy.id, scenario: 'boundary', check_in: '2026-04-01', check_out: '2026-04-02', expected_cents: 800, computed_cents: 800, delta_cents: 0, passed: true, evidence_sha256: 'c'.repeat(64) },
+    ]);
+    await db('policy_approvals').insert([
+      { takk_policy_id: policy.id, policy_hash: policy.policy_hash, approval_role: 'accounting', actor_id: 'accountant:test' },
+      { takk_policy_id: policy.id, policy_hash: policy.policy_hash, approval_role: 'technical', actor_id: 'engineer:test' },
+    ]);
   }
 
   test.before(async () => {
@@ -150,6 +171,7 @@ if (process.env.POSTGRES_INTEGRATION_TEST !== 'true') {
         GUESTY_CLIENT_ID: 'pg-scope-client',
         GUESTY_CLIENT_SECRET: 'pg-scope-secret',
         GUESTY_WEBHOOK_SECRET: 'pg-scope-webhook',
+        GUESTY_ACCOUNT_ID: 'pg-scope-account',
         MYDATA_ENV: 'production',
         MYDATA_PRODUCTION_ENABLED: 'true',
         DAILY_CLOSE_ENABLED: 'true',
@@ -203,6 +225,8 @@ if (process.env.POSTGRES_INTEGRATION_TEST !== 'true') {
         payment_method_type: 1,
         active: true,
       });
+
+      await insertReadyTakkPolicy(readyCompany, readyListing);
       const [evidence] = await db('fiscal_documents').insert({
         document_key: `pg-readiness-evidence-${readyCompany.id}`,
         company_id: readyCompany.id,

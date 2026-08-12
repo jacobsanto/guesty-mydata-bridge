@@ -9,6 +9,8 @@ const { normalizeGuestyReservation } = require('../guesty/normalizer');
 const { normalizeCounterpart, normalizeSeries } = require('../validation/fiscal-fields');
 const { applyFinancialProfile } = require('./financial-profile-service');
 const { assertApprovedFinancialProfileBinding } = require('../repositories/financial-profiles');
+const { applyUnifiedChannelPolicy, assertApprovedUnifiedChannelPolicyBinding } = require('./unified-channel-policy-service');
+const { applyTakkPolicy, assertApprovedTakkPolicyBinding } = require('./takk-policy-service');
 const { db } = require('../database');
 
 const CANCELLED_STATUSES = new Set(['cancelled', 'canceled']);
@@ -97,6 +99,7 @@ async function materializeDueReservations(companyId, businessDate, {
   fetcher = fetchReservation,
   useGuestyRefresh = Boolean(process.env.GUESTY_CLIENT_ID && process.env.GUESTY_CLIENT_SECRET),
   beforeMaterializationTransaction = null,
+  enforceUnifiedPolicy = process.env.MYDATA_ENV === 'production',
 } = {}) {
   const snapshots = await listDueReservationSnapshots(companyId, businessDate);
   const results = [];
@@ -122,16 +125,24 @@ async function materializeDueReservations(companyId, businessDate, {
         results.push({ reservationId: snapshot.reservation_id, skipped: true, reason: 'cancelled' });
         continue;
       }
-      reservation = await applyFinancialProfile(reservation, billingContext);
+      reservation = enforceUnifiedPolicy
+        ? await applyUnifiedChannelPolicy(reservation, billingContext)
+        : await applyFinancialProfile(reservation, billingContext);
+      if (enforceUnifiedPolicy) reservation = await applyTakkPolicy(reservation, billingContext);
       if (beforeMaterializationTransaction) await beforeMaterializationTransaction({ reservation, billingContext, snapshot });
       const documents = await db.transaction(async (trx) => {
-        await assertApprovedFinancialProfileBinding(
-          reservation.financialProfile,
-          billingContext.listing_id,
-          reservation.platformKey,
-          reservation.sourceKey,
-          trx,
-        );
+        if (enforceUnifiedPolicy) {
+          await assertApprovedUnifiedChannelPolicyBinding(reservation.unifiedChannelPolicy, reservation, billingContext, trx);
+          await assertApprovedTakkPolicyBinding(reservation.unifiedTakkPolicy, reservation, billingContext, trx);
+        } else {
+          await assertApprovedFinancialProfileBinding(
+            reservation.financialProfile,
+            billingContext.listing_id,
+            reservation.platformKey,
+            reservation.sourceKey,
+            trx,
+          );
+        }
         const current = await upsertReservationSnapshot(reservation, billingContext, {
           transaction: trx,
           expectedGeneration: snapshot.generation,

@@ -104,7 +104,7 @@ function validateRuntimeConfig(env = process.env) {
   }
 
   if (env.NODE_ENV === 'production') {
-    for (const name of ['ADMIN_API_TOKEN', 'DATA_ENCRYPTION_KEY', 'GUESTY_WEBHOOK_SECRET', 'GUESTY_CLIENT_ID', 'GUESTY_CLIENT_SECRET']) required(name);
+    for (const name of ['ADMIN_API_TOKEN', 'DATA_ENCRYPTION_KEY', 'GUESTY_WEBHOOK_SECRET', 'GUESTY_CLIENT_ID', 'GUESTY_CLIENT_SECRET', 'GUESTY_ACCOUNT_ID']) required(name);
     if ((env.DB_CLIENT || 'better-sqlite3') !== 'pg') errors.push('DB_CLIENT=pg is required in production');
     if (!env.DATABASE_URL) {
       for (const name of ['DB_HOST', 'DB_NAME', 'DB_USER', 'DB_PASSWORD']) required(name);

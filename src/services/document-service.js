@@ -18,6 +18,11 @@ function primaryAmounts(reservation) {
 }
 
 function climateAmounts(reservation, billingContext) {
+  if (Array.isArray(reservation.climateFeeLines)) {
+    const cents = reservation.climateFeeLines.reduce((sum, line) => sum + Number(line.cents), 0);
+    if (!Number.isSafeInteger(cents) || cents <= 0) throw new Error('Frozen TAKK policy fee lines must have a positive integer cents total');
+    return { netValue: 0, vatAmount: 0, otherTaxesAmount: money(cents / 100), grossValue: money(cents / 100) };
+  }
   const nights = Number(reservation.nights);
   if (!Number.isInteger(nights) || nights <= 0) throw new Error('nights must be a positive integer');
   const start = new Date(`${reservation.checkIn.slice(0, 10)}T12:00:00Z`);
@@ -45,21 +50,22 @@ function documentBase(reservation, billingContext) {
 }
 
 async function prepareReservationDocuments(reservation, billingContext, options = {}) {
-  if (reservation.financialProfile?.status !== 'matched'
+  const unifiedPolicy = reservation.unifiedChannelPolicy;
+  if (!unifiedPolicy && (reservation.financialProfile?.status !== 'matched'
       || !reservation.financialProfile?.id
       || !reservation.financialProfile?.version
-      || !reservation.financialProfile?.configHash) {
+      || !reservation.financialProfile?.configHash)) {
     throw new Error('An approved and calibrated channel financial profile is required before fiscal document creation');
   }
   const base = documentBase(reservation, billingContext);
   const revisionSuffix = Number(reservation.fiscalRevision || 0) > 0 ? `:r${Number(reservation.fiscalRevision)}` : '';
-  const sourceRule = await getBillingRule(
+  const sourceRule = unifiedPolicy ? null : await getBillingRule(
     billingContext.listing_id,
     reservation.platformKey || reservation.platform,
     reservation.sourceKey || reservation.source,
     options.transaction || db,
   );
-  const invoiceType = reservation.invoiceType || sourceRule?.invoice_type || billingContext.default_invoice_type;
+  const invoiceType = unifiedPolicy?.documentType || reservation.invoiceType || sourceRule?.invoice_type || billingContext.default_invoice_type;
   let effectiveContext = sourceRule ? {
     ...billingContext,
     default_invoice_type: sourceRule.invoice_type,
@@ -91,10 +97,14 @@ async function prepareReservationDocuments(reservation, billingContext, options 
     invoice_counterpart_name: counterpart.name,
     invoice_counterpart_branch: counterpart.branch,
   };
-  const series = normalizeSeries(reservation.invoiceSeries || sourceRule?.series || billingContext.invoice_series || 'A', { required: true });
+  const series = normalizeSeries(unifiedPolicy?.series || reservation.invoiceSeries || sourceRule?.series || billingContext.invoice_series || 'A', { required: true });
   const sourcePayload = {
     ...reservation,
     billingSnapshot: {
+      unified_channel_policy: unifiedPolicy ? {
+        id: unifiedPolicy.id, version: unifiedPolicy.version, policy_hash: unifiedPolicy.policyHash,
+        guesty_account_id: unifiedPolicy.guestyAccountId, platform_key: unifiedPolicy.platformKey, source_key: unifiedPolicy.sourceKey,
+      } : null,
       vat_number: effectiveContext.vat_number,
       invoice_series: series,
       invoice_counterpart_vat_number: effectiveContext.invoice_counterpart_vat_number || null,
@@ -105,6 +115,11 @@ async function prepareReservationDocuments(reservation, billingContext, options 
       payment_method_info: effectiveContext.payment_method_info || null,
     },
     climateSnapshot: {
+      unified_takk_policy: reservation.unifiedTakkPolicy ? {
+        id: reservation.unifiedTakkPolicy.id, version: reservation.unifiedTakkPolicy.version,
+        policy_hash: reservation.unifiedTakkPolicy.policyHash, licensed_category: reservation.unifiedTakkPolicy.licensedCategory,
+        fee_lines: reservation.unifiedTakkPolicy.feeLines,
+      } : null,
       property_type: billingContext.property_type,
       climate_fee_high: billingContext.climate_fee_high,
       climate_fee_low: billingContext.climate_fee_low,
@@ -114,7 +129,7 @@ async function prepareReservationDocuments(reservation, billingContext, options 
   };
   const climate = climateAmounts(reservation, billingContext);
   const climateSeries = climate.grossValue > 0
-    ? normalizeSeries(billingContext.climate_fee_series || 'TAKK', { fieldName: 'climate_fee_series', required: true })
+    ? normalizeSeries(reservation.unifiedTakkPolicy?.series || billingContext.climate_fee_series || 'TAKK', { fieldName: 'climate_fee_series', required: true })
     : null;
 
   // Primary and TAKK are one fiscal materialization unit. If either XML or DB

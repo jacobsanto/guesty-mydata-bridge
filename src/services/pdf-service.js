@@ -22,7 +22,13 @@ function stayLines(document, source, listing) {
   const prefix = room ? `${room} - ` : '';
   if (document.document_type === '8.2') {
     const climateConfig = source.climateSnapshot || listing;
-    const lines = Array.from({ length: nights }, (_, index) => {
+    const frozenLines = climateConfig?.unified_takk_policy?.fee_lines;
+    const lines = Array.isArray(frozenLines) ? frozenLines.map((line) => {
+      const shown = displayDate(line.date);
+      const amount = Number(line.amount ?? (Number(line.cents) / 100));
+      if (!Number.isFinite(amount) || amount <= 0) throw new Error('Frozen TAKK PDF fee line is invalid');
+      return { date: shown, description: `${prefix}Τέλος ανθεκτικότητας ${shown}`, charge: amount };
+    }) : Array.from({ length: nights }, (_, index) => {
       const date = new Date(`${source.checkIn}T12:00:00Z`);
       date.setUTCDate(date.getUTCDate() + index);
       const shown = displayDate(date.toISOString());

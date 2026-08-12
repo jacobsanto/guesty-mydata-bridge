@@ -228,4 +228,5 @@ module.exports = {
   approveProfile,
   suspendProfile,
   listObservedChannels,
+  assertSingleStayFiscalFolio,
 };

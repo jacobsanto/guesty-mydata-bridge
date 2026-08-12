@@ -205,11 +205,19 @@ function generateClimateFeeXML(reservation, billingContext, invoiceAA) {
   }
 
   const dates = stayDates(reservation.checkIn, reservation.nights);
-  const feeLines = dates.map((date) => ({
-    date,
-    amount: Number(calculateClimateFeePerNight(date, billingContext).toFixed(2)),
-    category: climateFeeCategory(date, billingContext),
-  }));
+  const feeLines = Array.isArray(reservation.climateFeeLines)
+    ? reservation.climateFeeLines.map((line) => ({
+      date: String(line.date), amount: Number(line.amount ?? (Number(line.cents) / 100)), category: Number(line.category),
+    }))
+    : dates.map((date) => ({
+      date,
+      amount: Number(calculateClimateFeePerNight(date, billingContext).toFixed(2)),
+      category: climateFeeCategory(date, billingContext),
+    }));
+  if (feeLines.length !== dates.length || feeLines.some((line, index) => line.date !== dates[index]
+      || !Number.isFinite(line.amount) || line.amount <= 0 || !Number.isInteger(line.category) || line.category <= 0)) {
+    throw new Error('Frozen TAKK fee lines must exactly cover each stay night with valid amount and AADE category');
+  }
   const totalFee = feeLines.reduce((sum, line) => sum + line.amount, 0);
   const invoiceDate = reservation.checkOut.slice(0, 10);
   const series = normalizeSeries(billingContext.climate_fee_series || billingContext.invoice_series || 'A', { fieldName: 'climate_fee_series', required: true });
