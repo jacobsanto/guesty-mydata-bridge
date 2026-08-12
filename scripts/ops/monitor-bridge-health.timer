@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Guesty myDATA operational monitor every five minutes
+
+[Timer]
+OnBootSec=3m
+OnUnitActiveSec=5m
+Persistent=true
+RandomizedDelaySec=45s
+
+[Install]
+WantedBy=timers.target

@@ -1,20 +1,27 @@
 {
   "name": "guesty-mydata-bridge",
   "version": "1.0.0",
-  "description": "Multitenant Guesty → ΑΑΔΕ myDATA bridge — αυτόματη έκδοση παραστατικών βραχυχρόνιας μίσθωσης",
+  "description": "Multitenant Guesty → ΑΑΔΕ myDATA bridge για τουριστικά καταλύματα με ΦΠΑ",
   "main": "src/server.js",
   "scripts": {
     "start": "node src/server.js",
     "dev": "nodemon src/server.js",
     "migrate": "node migrations/run.js",
-    "test": "node tests/smoke.js"
+    "test": "node --test tests/*.test.js && node tests/smoke.js",
+    "test:postgres": "node --test tests/postgres-integration.test.js",
+    "test:runtime": "node tests/runtime-config.js && node tests/runtime-server.js",
+    "test:xsd": "node scripts/validate-aade-xsd.js",
+    "pdf:example": "node scripts/create-pdf-example.js"
   },
   "dependencies": {
     "axios": "^1.6.0",
+    "better-sqlite3": "^9.4.3",
     "dotenv": "^16.3.1",
     "express": "^4.18.2",
     "knex": "^3.1.0",
-    "better-sqlite3": "^9.4.3",
+    "pdfkit": "^0.19.1",
+    "pg": "^8.22.0",
+    "qrcode": "^1.5.4",
     "xml2js": "^0.6.2",
     "xmlbuilder2": "^3.1.1"
   },
@@ -22,6 +29,6 @@
     "nodemon": "^3.0.2"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=20.0.0 <23.0.0"
   }
 }
