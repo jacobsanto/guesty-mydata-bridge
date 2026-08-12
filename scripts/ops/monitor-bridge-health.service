@@ -1,0 +1,17 @@
+[Unit]
+Description=Guesty myDATA health, backup and restore-drill monitor
+Wants=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/srv/guesty-mydata-bridge
+EnvironmentFile=/etc/guesty-mydata/backup.env
+ExecStart=/srv/guesty-mydata-bridge/scripts/ops/monitor-bridge-health.sh
+User=guesty-ops
+Group=guesty-ops
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/srv/guesty-mydata-backups

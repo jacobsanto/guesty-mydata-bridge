@@ -25,6 +25,7 @@ install -d -m 700 "$backup_dir"
 timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
 dump_path="${backup_dir}/bridge-${timestamp}.dump"
 checksum_path="${dump_path}.sha256"
+receipt_path="${backup_dir}/last-successful-backup.json"
 cleanup() { rm -f "$dump_path" "$checksum_path"; }
 trap cleanup EXIT
 
@@ -37,5 +38,12 @@ sha256sum "$dump_path" > "$checksum_path"
 
 restic backup --tag guesty-mydata --tag postgres --tag "backup-${timestamp}" "$dump_path" "$checksum_path"
 restic forget --tag guesty-mydata --keep-daily "$retention_days" --prune
+
+# This small receipt is deliberately written only after the dump was readable,
+# copied to restic and retention completed. The monitoring timer checks its age
+# without needing database, AADE or Guesty credentials.
+receipt_tmp="$(mktemp "${backup_dir}/.backup-receipt.XXXXXX")"
+printf '{"completed_at":"%s","dump_sha256":"%s"}\n' "$timestamp" "$(cut -d ' ' -f1 "$checksum_path")" > "$receipt_tmp"
+mv -f "$receipt_tmp" "$receipt_path"
 
 echo "Backup completed and verified: ${timestamp}"

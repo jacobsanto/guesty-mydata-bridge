@@ -153,6 +153,12 @@ RESTIC_REPOSITORY=s3:https://<encrypted-offsite-bucket>/guesty-mydata
 RESTIC_PASSWORD_FILE=/etc/guesty-mydata/restic-password
 GUESTY_BRIDGE_BACKUP_DIR=/srv/guesty-mydata-backups
 GUESTY_BRIDGE_BACKUP_RETENTION_DAYS=35
+GUESTY_BRIDGE_HEALTH_URL=http://127.0.0.1:3001/health/ready
+GUESTY_BRIDGE_BACKUP_MAX_AGE_HOURS=26
+GUESTY_BRIDGE_RESTORE_DRILL_MAX_AGE_DAYS=35
+# Optional endpoint controlled by the operator; receives only a short plain-text
+# operational alert, never XML, PDFs, credentials, reservation data or MARKs.
+GUESTY_BRIDGE_ALERT_WEBHOOK_URL=https://<your-monitoring-receiver>/guesty-mydata
 ```
 
 Initialize the empty restic repository once under controlled access, then copy
@@ -179,7 +185,24 @@ scripts/ops/restore-drill-postgres.sh /srv/guesty-mydata-backups/VERIFIED.dump
 
 Record the restic snapshot ID, dump SHA-256, restore-drill timestamp, reviewer
 and result in the operations register. An absent or failed drill is a production
-readiness failure.
+readiness failure. The script writes an immutable-age monitor receipt only after
+the temporary-database verification passes. Then enable the five-minute monitor:
+
+```bash
+sudo install -m 755 scripts/ops/monitor-bridge-health.sh /srv/guesty-mydata-bridge/scripts/ops/
+sudo install -m 644 scripts/ops/monitor-bridge-health.service /etc/systemd/system/
+sudo install -m 644 scripts/ops/monitor-bridge-health.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now monitor-bridge-health.timer
+sudo systemctl start monitor-bridge-health.service
+sudo systemctl status monitor-bridge-health.service --no-pager
+```
+
+The monitor fails its systemd run (and posts the terse configured alert) if the
+local app health endpoint fails, the last verified encrypted backup is older
+than 26 hours, or the last successful restore drill is older than 35 days.
+Connect systemd service failures and the optional webhook to the operator's
+monitoring/paging receiver before production activation.
 
 ## Runtime safety model
 
@@ -349,20 +372,22 @@ be assumed during production planning:
 - PDF email/Guesty-message delivery, a delivery outbox, recipient delivery audit,
   bounce handling, and retry are absent. PDFs are archived and downloadable by
   an authenticated admin only.
-- The admin API uses one shared bearer token. It does not provide per-user
-  identity, company membership, RBAC, MFA, or separation of accounting and
-  operational duties.
+- The admin API remains a shared operational bearer credential and does not
+  provide per-user identity, company membership, MFA or a full RBAC product.
+  Policy activation is nevertheless separately protected by named accounting
+  and technical approval credentials.
 - The scheduler runs inside the single web process with one global timezone and
   close time. There is no external durable scheduler, per-company timezone, or
   supported multi-replica leader election.
-- The supplied systemd/restic backup workflow still requires host installation,
-  a configured encrypted off-site repository, a protected password file and an
-  external alert when a timer run or restore drill is overdue.
+- The supplied backup, restore-drill and five-minute monitor workflows still
+  require host installation, a configured encrypted off-site repository,
+  protected password file and a connected external alert receiver.
 - Schema initialization is performed by the application migration command/startup
   code; there is no independently versioned rollback migration chain.
-- Logging is console-based. There is no bundled metrics/tracing/alerting stack or
-  automatic paging for reconciliation lag, unresolved inbox age, failed closes,
-  uncertain MARKs, backup age, or PDF archive corruption.
+- Logging is console-based. The bundled monitor covers app health, backup age
+  and restore-drill age, but there is no full metrics/tracing stack or automatic
+  paging for reconciliation lag, unresolved inbox age, failed closes, uncertain
+  MARKs or PDF archive corruption.
 - Fiscal retries do not provide a general exponential-backoff job queue or a
   separately operated dead-letter queue. The Guesty reconciliation inbox is
   specific to unresolved mapping/inactive-listing records and their retry errors;

@@ -5,9 +5,11 @@ set -euo pipefail
 
 dump_path="${1:-}"
 compose_bin="${DOCKER_COMPOSE_BIN:-docker compose}"
+backup_dir="${GUESTY_BRIDGE_BACKUP_DIR:-/srv/guesty-mydata-backups}"
 
 [[ -n "$dump_path" && -f "$dump_path" ]] || { echo "Usage: $0 /absolute/path/to/bridge.dump" >&2; exit 64; }
 [[ "$dump_path" = /* ]] || { echo "The dump path must be absolute" >&2; exit 64; }
+[[ "$backup_dir" = /* && "$backup_dir" != "/" ]] || { echo "GUESTY_BRIDGE_BACKUP_DIR must be a specific absolute directory" >&2; exit 64; }
 for required in POSTGRES_DB POSTGRES_USER; do
   [[ -n "${!required:-}" ]] || { echo "${required} is required" >&2; exit 64; }
 done
@@ -33,5 +35,10 @@ ${compose_bin} exec -T postgres sh -ceu '
       AND table_name IN ('\''companies'\'', '\''fiscal_documents'\'', '\''fiscal_pdf_artifacts'\'', '\''sync_cursors'\'')
   " | grep -qx 1
 ' -- "$drill_db"
+
+install -d -m 700 "$backup_dir"
+receipt_tmp="$(mktemp "${backup_dir}/.restore-drill-receipt.XXXXXX")"
+printf '{"completed_at":"%s","dump_path":"%s","dump_sha256":"%s"}\n' "$(date -u +%Y%m%dT%H%M%SZ)" "$dump_path" "$(sha256sum "$dump_path" | cut -d ' ' -f1)" > "$receipt_tmp"
+mv -f "$receipt_tmp" "${backup_dir}/last-successful-restore-drill.json"
 
 echo "Restore drill passed in temporary database: ${drill_db}"
