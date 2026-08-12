@@ -25,6 +25,8 @@ const { getReadiness } = require('../src/services/readiness-service');
 const { assertProductionTransmissionEnabled } = require('../src/security/production-guard');
 const { ACCEPTANCE_CONTRACT_VERSION, CAPABILITIES } = require('../src/services/sandbox-acceptance-service');
 const { takkPolicyHash } = require('../src/services/takk-policy-service');
+const { channelPolicyHash } = require('../src/services/unified-channel-policy-service');
+const { stageReservation } = require('../src/services/reservation-service');
 
 function companyCredentials(vatNumber, user, key) {
   const company = { vat_number: vatNumber };
@@ -82,9 +84,12 @@ async function insertReadyTakkPolicy(company, listing) {
     calculator_version: 'takk-v1', created_by: 'readiness-test',
   };
   const [policyId] = await db('takk_policy_versions').insert({ ...base, policy_hash: takkPolicyHash(base) });
-  for (const [scenario, checkIn, checkOut, cents, hash] of [
-    ['low', '2026-01-01', '2026-01-02', 200, 'a'], ['high', '2026-07-01', '2026-07-02', 800, 'b'], ['boundary', '2026-04-01', '2026-04-02', 800, 'c'],
-  ]) await db('takk_calibration_samples').insert({ policy_id: policyId, scenario, check_in: checkIn, check_out: checkOut, expected_cents: cents, computed_cents: cents, delta_cents: 0, passed: true, evidence_sha256: hash.repeat(64) });
+  for (const [scenario, checkIn, checkOut, cents, hash, mark] of [
+    ['low', '2026-01-01', '2026-01-02', 200, 'a', '4000000000011'], ['high', '2026-07-01', '2026-07-02', 800, 'b', '4000000000012'], ['boundary', '2026-04-01', '2026-04-02', 800, 'c', '4000000000013'],
+  ]) await db('takk_calibration_samples').insert({
+    policy_id: policyId, scenario, check_in: checkIn, check_out: checkOut, expected_cents: cents, computed_cents: cents, delta_cents: 0, passed: true, evidence_sha256: hash.repeat(64),
+    reservation_id: `takk-${scenario}`, historical_mark: mark, historical_document_type: '8.2', historical_series: 'READY-TAKK', historical_pdf_sha256: hash.repeat(64),
+  });
   const policy = await db('takk_policy_versions').where({ id: policyId }).first();
   await db('policy_approvals').insert([
     { takk_policy_id: policyId, policy_hash: policy.policy_hash, approval_role: 'accounting', actor_id: 'accountant:test' },
@@ -93,6 +98,45 @@ async function insertReadyTakkPolicy(company, listing) {
   await db('policy_decision_events').insert({
     takk_policy_id: policyId, policy_hash: policy.policy_hash, decision: 'approved', idempotency_key: `fixture-ready-takk-${policyId}`, actor_id: 'policy-authority:test', reason: 'fixture approval',
   });
+}
+
+async function insertReadyChannelPolicyAndObservedReservation(company, listing) {
+  const base = {
+    company_id: company.id, listing_id: listing.id, guesty_account_id: process.env.GUESTY_ACCOUNT_ID,
+    platform_key: 'airbnb2', source_key: 'airbnb2', currency: 'EUR', version: 1, status: 'draft',
+    recipient_model: 'private_guest', document_type: '11.2', series: 'READY-APY', counterpart_json: null,
+    vat_category: 2, classification_category: 'category1_3', classification_type: 'E3_561_003',
+    gross_strategy: 'folio_items_sum', gross_strategy_config_json: '{}', line_rules_json: JSON.stringify([{ normalType: 'AF', action: 'include', allowBroad: true }]),
+    tolerance_cents: 0, normalizer_version: 'fixture-v1', calculator_version: 'fixture-v1', valid_from: '2020-01-01', valid_to: '2099-12-31', created_by: 'readiness-test',
+  };
+  const [policyId] = await db('channel_policy_versions').insert({ ...base, policy_hash: channelPolicyHash(base) });
+  const policy = await db('channel_policy_versions').where({ id: policyId }).first();
+  for (const [index, reservationId, hash, mark] of [
+    [1, 'channel-sample-a', 'd', '4000000000021'], [2, 'channel-sample-b', 'e', '4000000000022'], [3, 'channel-sample-c', 'f', '4000000000023'],
+  ]) {
+    const payloadSha = hash.repeat(64);
+    const [captureId] = await db('fiscal_evidence_captures').insert({
+      company_id: company.id, listing_id: listing.id, reservation_id: reservationId, platform_key: 'airbnb2', source_key: 'airbnb2', guesty_account_id: process.env.GUESTY_ACCOUNT_ID, currency: 'EUR',
+      normalized_payload_json: JSON.stringify({ reservationId, fixture: true }), payload_sha256: payloadSha, capture_method: 'fixture', guesty_contract_version: 'reservations-v3',
+    });
+    await db('channel_policy_samples').insert({
+      policy_id: policyId, evidence_capture_id: captureId, policy_hash: policy.policy_hash, evidence_sha256: payloadSha, scenario: 'normal', historical_document_type: '11.2', historical_series: 'READY-APY',
+      historical_mark: mark, historical_pdf_sha256: payloadSha, historical_primary_cents: 11300, historical_takk_cents: 200, candidate_source_values_json: '{}', computed_primary_cents: 11300, delta_cents: 0, passed: true, stale: false,
+    });
+  }
+  await db('policy_approvals').insert([
+    { channel_policy_id: policyId, policy_hash: policy.policy_hash, approval_role: 'accounting', actor_id: 'accountant:test' },
+    { channel_policy_id: policyId, policy_hash: policy.policy_hash, approval_role: 'technical', actor_id: 'engineer:test' },
+  ]);
+  await db('policy_decision_events').insert({
+    channel_policy_id: policyId, policy_hash: policy.policy_hash, decision: 'approved', idempotency_key: `fixture-ready-channel-${policyId}`, actor_id: 'policy-authority:test', reason: 'fixture approval',
+  });
+  const invoiceItems = [{ id: 'ready-observed-af', normalType: 'AF', title: 'Accommodation', totalPrice: 113, listingId: listing.listing_id_guesty, stayIndex: 0 }];
+  await stageReservation({
+    reservationId: 'ready-observed', listingId: listing.listing_id_guesty, status: 'confirmed', checkIn: '2026-07-01', checkOut: '2026-07-02', nights: 1,
+    platform: 'airbnb2', platformKey: 'airbnb2', source: 'airbnb2', sourceKey: 'airbnb2', fiscalCurrency: 'EUR', fiscalInvoiceItems: invoiceItems,
+    financials: { totalGross: 113, currency: 'EUR', invoiceItems }, stayEvidence: { reservationListingId: listing.listing_id_guesty, folioListingId: listing.listing_id_guesty, singleStayConfirmed: true },
+  }, { company_id: company.id, listing_id: listing.id, company_active: true, listing_active: true });
 }
 
 test.before(async () => {
@@ -162,6 +206,7 @@ test('SQLite readiness and production submission guard isolate one broken compan
 
   await insertReadyAcceptance(readyCompany, readyListing);
   await insertReadyTakkPolicy(readyCompany, readyListing);
+  await insertReadyChannelPolicyAndObservedReservation(readyCompany, readyListing);
   await recordIntegrationCheck('guesty', 'success', 'guesty');
   await recordIntegrationCheck(`mydata:${readyCompany.id}:sandbox`, 'success', 'sandbox');
   await recordIntegrationCheck(`mydata:${readyCompany.id}:production`, 'success', 'production');
@@ -175,6 +220,8 @@ test('SQLite readiness and production submission guard isolate one broken compan
   const aggregate = await getReadiness();
 
   assert.equal(ready.productionReady, true);
+  assert.equal(ready.counts.observedFinancialChannels, 1);
+  assert.equal(ready.issues.some((item) => item.code === 'financial_profile_missing'), false);
   assert.equal(ready.counts.companies, 1);
   assert.equal(ready.counts.listings, 1);
   assert(ready.checks.every((check) => check.key === 'guesty' || check.key.startsWith(`mydata:${readyCompany.id}:`)));

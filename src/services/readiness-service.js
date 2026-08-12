@@ -111,6 +111,7 @@ async function getReadiness({ companyId = null } = {}) {
   ]);
   const acceptance = await getAcceptanceMatrices(companies);
   const issues = [];
+  const migrationWarnings = [];
   const freshAfter = Date.now() - 24 * 60 * 60 * 1000;
   const isFreshSuccess = (row) => row?.status === 'success' && Date.parse(row.checked_at) >= freshAfter;
   if (!process.env.GUESTY_CLIENT_ID || !process.env.GUESTY_CLIENT_SECRET) issues.push(issue('guesty_credentials', 'Λείπουν Guesty OAuth credentials'));
@@ -122,10 +123,10 @@ async function getReadiness({ companyId = null } = {}) {
   if (listings.length === 0) issues.push(issue('listings', 'Δεν υπάρχει ενεργό κατάλυμα'));
   const legacyRuleCount = Number(legacyRuleCountRow?.count || 0);
   if (legacyRuleCount > 0) {
-    issues.push(issue('legacy_billing_rules', `${legacyRuleCount} παλιοί κανόνες μόνο ανά source πρέπει να αντικατασταθούν με ακριβείς platform/source κανόνες`));
+    migrationWarnings.push(issue('legacy_billing_rules', `${legacyRuleCount} παλιοί κανόνες μόνο ανά source παραμένουν για ιστορική συμβατότητα και δεν χρησιμοποιούνται στην production έκδοση`));
   }
+  if (rules.length > 0) migrationWarnings.push(issue('legacy_channel_rules', `${rules.length} παλιοί κανόνες platform/source παραμένουν μόνο για sandbox/ιστορική αναφορά· η production έκδοση χρησιμοποιεί αποκλειστικά unified policies`));
   const activeCompanyIds = new Set(companies.map((company) => Number(company.id)));
-  const activeListingIds = new Set(listings.map((listing) => Number(listing.id)));
   const today = new Date().toISOString().slice(0, 10);
 
   for (const company of companies) {
@@ -188,10 +189,16 @@ async function getReadiness({ companyId = null } = {}) {
       continue;
     }
     const [samples, approvals] = await Promise.all([
-      db('takk_calibration_samples').where({ policy_id: policy.id, passed: true }).select('scenario'),
+      db('takk_calibration_samples').where({ policy_id: policy.id, passed: true }).select(
+        'scenario', 'expected_cents', 'computed_cents', 'delta_cents', 'historical_mark', 'historical_document_type', 'historical_series', 'historical_pdf_sha256',
+      ),
       db('policy_approvals').where({ takk_policy_id: policy.id, policy_hash: policy.policy_hash }).select('approval_role'),
     ]);
-    const scenarios = new Set(samples.map((sample) => sample.scenario));
+    const exactSamples = samples.filter((sample) => Number(sample.expected_cents) === Number(sample.computed_cents)
+      && Number(sample.delta_cents) === 0 && /^\d{1,30}$/.test(String(sample.historical_mark || ''))
+      && sample.historical_document_type === '8.2' && sample.historical_series === policy.series
+      && /^[a-f0-9]{64}$/.test(String(sample.historical_pdf_sha256 || '')));
+    const scenarios = new Set(exactSamples.map((sample) => sample.scenario));
     const roles = new Set(approvals.map((approval) => approval.approval_role));
     if (!scenarios.has('low') || !scenarios.has('high') || !scenarios.has('boundary')) {
       issues.push(issue('takk_policy_calibration', `TAKK policy ${policy.id}: λείπουν approved low/high/boundary samples`, scope));
@@ -200,46 +207,15 @@ async function getReadiness({ companyId = null } = {}) {
       issues.push(issue('takk_policy_approvals', `TAKK policy ${policy.id}: λείπει λογιστική ή τεχνική έγκριση`, scope));
     }
   }
-  for (const rule of rules) {
-    const scope = `rule:${rule.id}`;
-    if (!activeListingIds.has(Number(rule.listing_id))) issues.push(issue('inactive_listing', `Billing rule ${rule.id}: το συνδεδεμένο κατάλυμα δεν είναι ενεργό`, scope));
-    const seriesError = validationError(() => normalizeSeries(rule.series));
-    if (seriesError) issues.push(issue('rule_series', `Billing rule ${rule.id}: ${seriesError}`, scope));
-    const counterpartError = validationError(() => normalizeCounterpart({
-      vatNumber: rule.counterpart_vat_number,
-      country: rule.counterpart_country,
-      name: rule.counterpart_name,
-      branch: rule.counterpart_branch,
-    }, { required: rule.invoice_type === '2.1', label: 'counterpart' }));
-    if (counterpartError) issues.push(issue('rule_tpy_counterpart', `Billing rule ${rule.id}: ${counterpartError}`, scope));
-  }
-  const approvedFinancialKeys = new Set(financialProfiles
-    .filter((profile) => profile.status === 'approved')
-    .map((profile) => `${profile.listing_id}\u0000${profile.platform_key}\u0000${profile.source_key}`));
-  for (const profile of financialProfiles.filter((row) => row.status === 'approved')) {
-    const scope = `financial-profile:${profile.id}`;
-    let lineRules = [];
-    try { lineRules = JSON.parse(profile.line_rules || '[]'); } catch { /* handled below */ }
-    if (!Array.isArray(lineRules) || lineRules.length === 0) {
-      issues.push(issue('financial_profile_rules', `Profile ${profile.id}: λείπουν έγκυροι line rules`, scope));
-      continue;
-    }
-    const hasBroadInclude = lineRules.some((rule) => {
-      const decision = rule.decision || rule.action || (rule.include === true ? 'include' : 'exclude');
-      return decision === 'include' && !['origin', 'title', 'secondIdentifier', 'isDeducted', 'isDeductedV2'].some((field) => rule[field] !== undefined);
-    });
-    if (hasBroadInclude) issues.push(issue('financial_profile_broad_include', `Profile ${profile.id}: broad include χωρίς σταθερό Guesty discriminator`, scope));
-    if (Number(profile.minimum_samples) < 3) issues.push(issue('financial_profile_samples', `Profile ${profile.id}: απαιτούνται τουλάχιστον 3 calibration samples`, scope));
-  }
+  if (financialProfiles.length > 0) migrationWarnings.push(issue(
+    'legacy_financial_profiles',
+    `${financialProfiles.length} παλιά financial profiles παραμένουν για audit/sandbox αναφορά· δεν μπορούν να καλύψουν production issuance`,
+  ));
   for (const channel of observedChannels) {
     const scope = `listing:${channel.listing_id}`;
     if (!channel.platform_key || !channel.source_key) {
       issues.push(issue('financial_channel_unidentified', `${channel.listing_id_guesty}: δεν έχει αναγνωριστεί ακόμη platform/source από Guesty`, scope));
       continue;
-    }
-    const key = `${channel.listing_id}\u0000${channel.platform_key}\u0000${channel.source_key}`;
-    if (!approvedFinancialKeys.has(key)) {
-      issues.push(issue('financial_profile_missing', `${channel.listing_id_guesty}: λείπει εγκεκριμένο profile ποσών για ${channel.platform_key} / ${channel.source_key}`, scope));
     }
     const channelPoliciesForTuple = channelPolicies.filter((policy) => Number(policy.listing_id) === Number(channel.listing_id)
       && approvedChannelPolicyIds.has(Number(policy.id)) && policy.platform_key === channel.platform_key && policy.source_key === channel.source_key
@@ -256,10 +232,17 @@ async function getReadiness({ companyId = null } = {}) {
       const [samples, approvals] = await Promise.all([
         db('channel_policy_samples as s').join('fiscal_evidence_captures as e', 'e.id', 's.evidence_capture_id')
           .where({ 's.policy_id': policy.id, 's.policy_hash': policy.policy_hash, 's.passed': true, 's.stale': false })
-          .whereNotNull('s.historical_mark').select('e.reservation_id'),
+          .select(
+            'e.reservation_id', 's.historical_document_type', 's.historical_series', 's.historical_mark', 's.historical_pdf_sha256',
+            's.historical_primary_cents', 's.computed_primary_cents', 's.delta_cents',
+          ),
         db('policy_approvals').where({ channel_policy_id: policy.id, policy_hash: policy.policy_hash }).select('approval_role'),
       ]);
-      if (new Set(samples.map((sample) => String(sample.reservation_id))).size < 3) throw new Error('requires 3 distinct finalized samples');
+      const exactSamples = samples.filter((sample) => sample.historical_document_type === policy.document_type
+        && sample.historical_series === policy.series && /^\d{1,30}$/.test(String(sample.historical_mark || ''))
+        && /^[a-f0-9]{64}$/.test(String(sample.historical_pdf_sha256 || ''))
+        && Number(sample.historical_primary_cents) === Number(sample.computed_primary_cents) && Number(sample.delta_cents) === 0);
+      if (new Set(exactSamples.map((sample) => String(sample.reservation_id))).size < 3) throw new Error('requires 3 distinct finalized samples with exact document type, series, MARK, PDF hash and Guesty amount');
       const roles = new Set(approvals.map((approval) => approval.approval_role));
       if (!roles.has('accounting') || !roles.has('technical')) throw new Error('requires accounting and technical approvals');
     } catch (error) {
@@ -326,6 +309,7 @@ async function getReadiness({ companyId = null } = {}) {
     issues,
     productionIssues,
     acceptance,
+    migrationWarnings,
     checks: checks.map((row) => ({ key: row.check_key, status: row.status, environment: row.environment, checked_at: row.checked_at })),
     counts: {
       companies: companies.length,

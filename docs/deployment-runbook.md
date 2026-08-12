@@ -83,7 +83,7 @@ production. Before activation, the operator must have:
    discount, additional-fee, tax, alteration and cancellation cases relevant to
    that channel. Include Airbnb Resolution Center cases when they occur.
    Treat Airbnb, Booking.com, Guesty Booking Engine and every other OTA/direct
-   source as independent channels. Never copy an approved profile to a channel
+   source as independent channels. Never copy an approved unified policy to a channel
    merely because its line names or displayed total look similar.
 10. Have the named accounting and technical owners approve only policies whose
     required samples all pass, then make the immutable admin decision. Unknown
@@ -214,9 +214,11 @@ monitoring/paging receiver before production activation.
   the explicit retry endpoint revisit those entries after configuration is fixed.
   A general Guesty fetch/search outage still fails the run and keeps the prior
   successful watermark unchanged.
-- Financial profiles are independent for every exact
-  `listing × platform × source`. No Booking.com, Airbnb, other OTA/direct, or
-  Guesty Booking Engine profile is inherited by another combination.
+- Unified policies are independent for every exact
+  `company × listing × Guesty account × platform × source`. No Booking.com,
+  Airbnb, other OTA/direct, or Guesty Booking Engine policy is inherited by
+  another combination. Legacy financial profiles remain audit/sandbox-only and
+  can never authorize production issuance.
 - The production submission guard evaluates tenant-scoped readiness with
   `GET /api/readiness?company_id=<id>`. A fiscal issue in another company does
   not block this company's submissions; runtime-wide configuration remains a
@@ -244,8 +246,9 @@ Before production activation, all of the following must be recorded:
    AADE responses, MARK/UID where returned, verification, and final PDFs.
 4. Every active listing mapped to the correct company, document rule, series,
    counterpart where TPY is used, and high/low TAKK amount and category.
-5. Every observed active `listing/platform/source` covered by an approved,
-   versioned financial profile with the required passing calibration samples.
+5. Every observed active `listing/platform/source` covered by one approved,
+   versioned unified policy with the required exact passing calibration samples,
+   immutable decision and accounting/technical approvals.
 6. No unresolved reservation review items.
 7. No unresolved Guesty reconciliation inbox entries after an explicit retry.
 8. `GET /api/readiness?company_id=<id>` reports sandbox ready for each company;

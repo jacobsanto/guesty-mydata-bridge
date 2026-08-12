@@ -10,8 +10,8 @@ Multitenant εφαρμογή για ενοικιαζόμενα δωμάτια κ
 - Επαναχρησιμοποιεί το Guesty OAuth token μετά από restart μέσω κρυπτογραφημένης αποθήκευσης και PostgreSQL lock (όριο Guesty: 5 tokens/24ωρο)
 - Κρυπτογραφεί τα AADE credentials με AES-256-GCM και authenticated context ανά ΑΦΜ/πεδίο, ώστε ciphertext άλλης εταιρείας ή άλλου credential field να απορρίπτεται, με ελεγχόμενη περιστροφή κλειδιού
 - Κρατά τελευταίο reservation snapshot και δημιουργεί ΑΑ/XML μόνο στο checkout/ημερήσιο κλείσιμο, ώστε alterations να μην αφήνουν παλιές αξίες
-- Ανακτά ξανά το authoritative Guest Folio στο κλείσιμο, περιβάλλει τα invoice items με δύο ίδιες αναγνώσεις reservation/overview για να εντοπίζει alterations εν ώρα ανάγνωσης και υπολογίζει το φορολογητέο gross με εγκεκριμένο, versioned profile ανά `κατάλυμα × platform × source`
-- Μπλοκάρει χωρίς δέσμευση ΑΑ κάθε άγνωστο κανάλι, μη εγκεκριμένο profile, άγνωστη/διφορούμενη γραμμή, duplicate item ή calibration mismatch
+- Ανακτά ξανά το authoritative Guest Folio στο κλείσιμο, περιβάλλει τα invoice items με δύο ίδιες αναγνώσεις reservation/overview για να εντοπίζει alterations εν ώρα ανάγνωσης και υπολογίζει το φορολογητέο gross μόνο με εγκεκριμένη immutable unified policy ανά `εταιρεία × κατάλυμα × Guesty account × platform × source`
+- Μπλοκάρει χωρίς δέσμευση ΑΑ κάθε άγνωστο κανάλι, μη εγκεκριμένη unified policy, άγνωστη/διφορούμενη γραμμή, duplicate item ή calibration mismatch
 - Αντιστοιχεί το `listingId` με το σωστό ΑΦΜ (multitenant)
 - Υπολογίζει το **Κλιματικό Τέλος** για λειτουργική πληροφόρηση· δεν το ενσωματώνει αυθαίρετα σε 11.x, επειδή η ΑΑΔΕ ορίζει το 8.2 ως χωριστό παραστατικό
 - Παράγει ΑΠΥ (`11.2`) ή Τιμολόγιο Παροχής Υπηρεσιών (`2.1`) ανά κατάλυμα/κράτηση, με ΦΠΑ 13%. Τα ΤΑΚ έχουν ανεξάρτητη, ανά κατάλυμα, ρύθμιση και διαβιβάζονται ως `8.2`.
@@ -58,18 +58,15 @@ npm start
 
 Το δισέλιδο παράδειγμα `output/pdf/tpy-takk-layout-example.pdf` δείχνει ένα **ρητά εγκεκριμένο συμβατικό B2B παράδειγμα** ΤΠΥ 2.1 με 13% ΦΠΑ προς Airbnb Ireland UC και το ξεχωριστό ΤΑΚΚ 8.2 προς τον επισκέπτη. Δεν αποτελεί γενικό κανόνα για κρατήσεις Airbnb. Αναδημιουργείται με `npm run pdf:example`.
 
-Για κατάλυμα που έχει λογιστικά και συμβατικά εγκεκριμένη διαφορετική ροή ανά κανάλι, πρόσθεσε billing rule ανά ακριβές Guesty `platform/source`. Το `2.1/TPY` επιτρέπεται μόνο προς τον πραγματικό επιχειρηματικό λήπτη με τεκμηριωμένα στοιχεία αντισυμβαλλομένου· το γεγονός ότι ένα OTA εισέπραξε την πληρωμή δεν αρκεί. Κανόνας που ταιριάζει μόνο στο source δεν εφαρμόζεται.
-
-Ο κανόνας ΑΠΥ/ΤΠΥ είναι ανεξάρτητος από το **profile ποσών**. Για κάθε πραγματικό
-`listing/platform/source`, δημιουργείται draft profile με ρητά `include`/`exclude`
-selectors για τις γραμμές Guest Folio. Έπειτα εκτελείται calibration με πραγματικά
-Guesty reservation IDs και το αναμενόμενο φορολογητέο gross του λογιστή. Μόνο
-profile με τουλάχιστον τρία επιτυχημένα δείγματα και κάλυψη κάθε selector μπορεί
-να εγκριθεί. Broad `include` μόνο με `normalType` δεν εγκρίνεται: κάθε γραμμή που
-μπαίνει στο φορολογητέο ποσό χρειάζεται σταθερό discriminator από το πραγματικό
-Guest Folio. No-show, split/relocated και multi-listing κρατήσεις δεν γίνονται
-δεκτές ως calibration samples. Η έγκριση είναι
-immutable· αλλαγή κανόνων γίνεται με νέα έκδοση και αναστέλλει την παλιότερη.
+Για κάθε πραγματικό `company/listing/Guesty account/platform/source` δημιουργείται
+μία **unified policy**: ποσό από ρητούς `include`/`exclude` Guest Folio selectors,
+ΑΠΥ 11.2 ή ΤΠΥ 2.1, πραγματικός λήπτης, ΦΠΑ/E3, σειρά και περίοδος ισχύος. Το
+`2.1/TPY` επιτρέπεται μόνο προς τον τεκμηριωμένο επιχειρηματικό λήπτη· το ότι ένα
+OTA εισέπραξε την πληρωμή δεν αρκεί. Η policy εγκρίνεται μόνο με τρία διαφορετικά
+τελικά Welcome/myDATA δείγματα με ίδια σειρά/τύπο, MARK, PDF SHA-256 και ακριβές
+Guesty ποσό, καθώς και χωριστές accounting και technical εγκρίσεις. No-show,
+split/relocated ή multi-listing κρατήσεις δεν γίνονται δεκτές ως samples. Κάθε
+αλλαγή δημιουργεί νέα immutable version — δεν μεταβάλλει ενεργή policy.
 
 Δεν χρησιμοποιούνται αυτόματα `hostPayout`, commissions, `nightsSubtotal`,
 adjustments ή deduction flags. Το ποσό προκύπτει μόνο από το τελικό
@@ -82,7 +79,7 @@ adjustments ή deduction flags. Το ποσό προκύπτει μόνο από
 Δεν υπάρχει κοινός κανόνας ποσού για όλα τα κανάλια και δεν γίνεται αντιστοίχιση
 με βάση την ονομασία τους. Για κάθε κατάλυμα καταγράφονται τα ακριβή
 `platform/source` που επιστρέφει ο λογαριασμός Guesty και αρχικοποιούνται
-ανεξάρτητα profiles, ενδεικτικά για:
+ανεξάρτητες unified policies, ενδεικτικά για:
 
 - Airbnb: accommodation/VAT, Resolution Center και κρατήσεις/προμήθειες που
   εμφανίζονται ως χωριστές γραμμές.
@@ -90,7 +87,7 @@ adjustments ή deduction flags. Το ποσό προκύπτει μόνο από
   πραγματικό Guest Folio του συγκεκριμένου καταλύματος.
 - Guesty Booking Engine: room, VAT, discounts, coupons και processing fees,
   χωρίς δεύτερη εφαρμογή adjustment ή deduction.
-- Κάθε άλλο OTA ή direct/manual source: δικό του profile· δεν κληρονομεί τους
+- Κάθε άλλο OTA ή direct/manual source: δική του policy· δεν κληρονομεί τους
   κανόνες Airbnb ή Booking.com.
 
 Η αρχικοποίηση ολοκληρώνεται μόνο με πραγματικά δείγματα που συμφωνούν με το
@@ -157,11 +154,17 @@ rows με το μεγαλύτερο ήδη εκδομένο ΑΑ, ώστε να 
 | `GET` | `/api/connections/guesty/reconciliation-inbox?status=unresolved` | Durable inbox/DLQ για unmapped/inactive κρατήσεις και αποτυχίες κατά το retry τους |
 | `POST` | `/api/connections/guesty/reconciliation-inbox/retry` | Επανέλεγχος όλων των unresolved inbox entries μετά τη διόρθωση mapping/Guesty |
 | `POST` | `/api/companies/:id/mydata-connection/test` | Read-only myDATA credential test |
-| `GET/POST` | `/api/financial-profiles` | Κατάλογος και νέα versioned profiles ποσών |
+| `GET/POST` | `/api/financial-profiles` | Legacy sandbox/audit profiles· δεν εγκρίνουν production issuance |
 | `PATCH` | `/api/financial-profiles/:id` | Ενημέρωση μόνο draft profile |
 | `POST` | `/api/financial-profiles/:id/calibrate` | Calibration με πραγματική Guesty κράτηση |
 | `POST` | `/api/financial-profiles/:id/approve` | Έγκριση μετά τα απαιτούμενα επιτυχημένα δείγματα |
 | `POST` | `/api/financial-profiles/:id/suspend` | Άμεσο μπλοκάρισμα ενεργού profile |
+| `GET/POST` | `/api/channel-policies` | Immutable unified policy ανά ακριβές Guesty tuple |
+| `GET/POST` | `/api/takk-policies` | Immutable TAKK policy ανά κατάλυμα/περίοδο |
+| `POST` | `/api/:type-policies/:id/calibration-captures` | Capture staged Guesty snapshot και τελικό Welcome/myDATA evidence |
+| `POST` | `/api/:type-policies/:id/approvals/accounting` | Accounting approval με scoped token |
+| `POST` | `/api/:type-policies/:id/approvals/technical` | Technical approval με scoped token |
+| `POST` | `/api/:type-policies/:id/decisions` | Immutable admin decision με Idempotency-Key |
 | `GET` | `/api/financial-channels/observed` | Παρατηρημένοι συνδυασμοί listing/platform/source |
 | `GET/POST` | `/api/sandbox-signoffs` | Αμετάβλητη έγκριση verified κύριου + ΤΑΚΚ και hashes PDF |
 | `GET` | `/api/sandbox-acceptance/requirements` | Capability matrix sandbox ανά εταιρεία |
