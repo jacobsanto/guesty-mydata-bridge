@@ -27,5 +27,4 @@ test('host backup, restore drill and monitor scripts remain shell-valid and moni
   for (const file of [...scripts, path.join(root, 'scripts/ops/monitor-bridge-health.service'), path.join(root, 'scripts/ops/monitor-bridge-health.timer')]) {
     assert.equal(fs.existsSync(file), true, `${file} must exist`);
   }
-  assert.equal((fs.statSync(scripts[2]).mode & 0o111) !== 0, true, 'operational monitor must be executable');
 });

@@ -180,7 +180,7 @@ database and removes that database at the end; it never drops the live
 `POSTGRES_DB`.
 
 ```bash
-scripts/ops/restore-drill-postgres.sh /srv/guesty-mydata-backups/VERIFIED.dump
+bash scripts/ops/restore-drill-postgres.sh /srv/guesty-mydata-backups/VERIFIED.dump
 ```
 
 Record the restic snapshot ID, dump SHA-256, restore-drill timestamp, reviewer
