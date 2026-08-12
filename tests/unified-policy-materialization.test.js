@@ -13,6 +13,7 @@ process.env.GUESTY_ACCOUNT_ID = 'account-policy-test';
 const { db, initSchema } = require('../src/database');
 const { channelPolicyHash } = require('../src/services/unified-channel-policy-service');
 const { takkPolicyHash } = require('../src/services/takk-policy-service');
+const { getPolicyMatrix } = require('../src/services/policy-matrix-service');
 const { stageReservation, applyFiscalOverride, materializeDueReservations } = require('../src/services/reservation-service');
 
 let companyId;
@@ -41,7 +42,7 @@ async function seedApprovedPolicy() {
     gross_strategy: 'folio_items_sum', gross_strategy_config_json: '{}',
     line_rules_json: JSON.stringify([{ normalType: 'AF', action: 'include', allowBroad: true }]),
     tolerance_cents: 0, normalizer_version: 'guesty-v3', calculator_version: 'bridge-v1',
-    valid_from: '2026-01-01', valid_to: null, blocked_reason: null, created_by: 'test',
+    valid_from: '2026-01-01', valid_to: '2026-12-31', blocked_reason: null, created_by: 'test',
   };
   const policyHash = channelPolicyHash(base);
   const [policyId] = await db('channel_policy_versions').insert({ ...base, policy_hash: policyHash });
@@ -136,4 +137,14 @@ test('enforced unified policy blocks no-policy issue and overrides cannot change
   assert.equal(takk.gross_value, 8);
   assert.match(takk.xml_payload, /<otherTaxesPercentCategory>24<\/otherTaxesPercentCategory>/);
   assert.equal(JSON.parse(takk.source_payload).climateSnapshot.unified_takk_policy.fee_lines[0].cents, 800);
+  const matrix = await getPolicyMatrix({ asOf: '2026-07-02' });
+  const channel = matrix.channels.find((row) => row.platform_key === 'airbnb2' && row.source_key === 'airbnb2');
+  const takkRow = matrix.takk.find((row) => Number(row.id) === Number(listing.id));
+  assert.equal(channel.status, 'ready');
+  assert.equal(channel.calibration.samples, 3);
+  assert.equal(takkRow.status, 'ready');
+  assert.deepEqual(takkRow.calibration.scenarios.sort(), ['boundary', 'high', 'low']);
+  const expired = await getPolicyMatrix({ asOf: '2027-01-01' });
+  assert.equal(expired.channels.find((row) => row.platform_key === 'airbnb2').status, 'hold');
+  assert.equal(expired.takk.find((row) => Number(row.id) === Number(listing.id)).status, 'hold');
 });
