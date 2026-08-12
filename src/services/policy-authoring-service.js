@@ -358,10 +358,14 @@ async function recordApproval(type, policyId, role, notes, actorId, executor = d
 async function assertChannelEvidenceReady(policy, executor) {
   const samples = await executor('channel_policy_samples as s').join('fiscal_evidence_captures as e', 'e.id', 's.evidence_capture_id')
     .where({ 's.policy_id': policy.id, 's.policy_hash': policy.policy_hash, 's.passed': true, 's.stale': false })
-    .whereNotNull('s.historical_mark')
-    .select('e.reservation_id', 's.historical_document_type', 's.historical_series', 's.historical_primary_cents', 's.computed_primary_cents', 's.delta_cents');
+    .select(
+      'e.reservation_id', 's.historical_document_type', 's.historical_series', 's.historical_mark', 's.historical_pdf_sha256',
+      's.historical_primary_cents', 's.computed_primary_cents', 's.delta_cents',
+    );
   const exact = samples.filter((sample) => sample.historical_document_type === policy.document_type
     && sample.historical_series === policy.series
+    && /^\d{1,30}$/.test(String(sample.historical_mark || ''))
+    && /^[a-f0-9]{64}$/.test(String(sample.historical_pdf_sha256 || ''))
     && Number(sample.historical_primary_cents) === Number(sample.computed_primary_cents)
     && Number(sample.delta_cents) === 0);
   if (new Set(exact.map((sample) => String(sample.reservation_id))).size < 3) {
@@ -371,7 +375,10 @@ async function assertChannelEvidenceReady(policy, executor) {
 
 async function assertTakkEvidenceReady(policy, executor) {
   const samples = await executor('takk_calibration_samples').where({ policy_id: policy.id, passed: true }).select('*');
-  const scenarios = new Set(samples.filter((sample) => Number(sample.expected_cents) === Number(sample.computed_cents) && Number(sample.delta_cents) === 0).map((sample) => sample.scenario));
+  const scenarios = new Set(samples.filter((sample) => Number(sample.expected_cents) === Number(sample.computed_cents)
+    && Number(sample.delta_cents) === 0 && /^\d{1,30}$/.test(String(sample.historical_mark || ''))
+    && sample.historical_document_type === '8.2' && sample.historical_series === policy.series
+    && /^[a-f0-9]{64}$/.test(String(sample.historical_pdf_sha256 || ''))).map((sample) => sample.scenario));
   for (const scenario of ['low', 'high', 'boundary']) if (!scenarios.has(scenario)) throw policyError(`Approval requires an exact ${scenario} TAKK calibration sample`, 409);
 }
 

@@ -10,21 +10,37 @@ function activeOnDate(policy, date) {
     && (!policy.valid_to || String(policy.valid_to) >= date);
 }
 
-async function policyFacts(policyId, policyHash, type) {
+async function policyFacts(policy, type) {
+  const policyId = policy.id;
+  const policyHash = policy.policy_hash;
   if (type === 'channel') {
     const [samples, approvals] = await Promise.all([
       db('channel_policy_samples as s').join('fiscal_evidence_captures as e', 'e.id', 's.evidence_capture_id')
         .where({ 's.policy_id': policyId, 's.policy_hash': policyHash, 's.passed': true, 's.stale': false })
-        .whereNotNull('s.historical_mark').select('e.reservation_id'),
+        .select(
+          'e.reservation_id', 's.historical_document_type', 's.historical_series', 's.historical_mark', 's.historical_pdf_sha256',
+          's.historical_primary_cents', 's.computed_primary_cents', 's.delta_cents',
+        ),
       db('policy_approvals').where({ channel_policy_id: policyId, policy_hash: policyHash }).select('approval_role'),
     ]);
-    return { samples: unique(samples.map((row) => row.reservation_id)).length, approvals: unique(approvals.map((row) => row.approval_role)) };
+    const exact = samples.filter((sample) => sample.historical_document_type === policy.document_type
+      && sample.historical_series === policy.series && /^\d{1,30}$/.test(String(sample.historical_mark || ''))
+      && /^[a-f0-9]{64}$/.test(String(sample.historical_pdf_sha256 || ''))
+      && Number(sample.historical_primary_cents) === Number(sample.computed_primary_cents)
+      && Number(sample.delta_cents) === 0);
+    return { samples: unique(exact.map((row) => row.reservation_id)).length, approvals: unique(approvals.map((row) => row.approval_role)) };
   }
   const [samples, approvals] = await Promise.all([
-    db('takk_calibration_samples').where({ policy_id: policyId, passed: true }).select('scenario'),
+    db('takk_calibration_samples').where({ policy_id: policyId, passed: true }).select(
+      'scenario', 'expected_cents', 'computed_cents', 'delta_cents', 'historical_mark', 'historical_document_type', 'historical_series', 'historical_pdf_sha256',
+    ),
     db('policy_approvals').where({ takk_policy_id: policyId, policy_hash: policyHash }).select('approval_role'),
   ]);
-  return { scenarios: unique(samples.map((row) => row.scenario)), approvals: unique(approvals.map((row) => row.approval_role)) };
+  const exact = samples.filter((sample) => Number(sample.expected_cents) === Number(sample.computed_cents)
+    && Number(sample.delta_cents) === 0 && /^\d{1,30}$/.test(String(sample.historical_mark || ''))
+    && sample.historical_document_type === '8.2' && sample.historical_series === policy.series
+    && /^[a-f0-9]{64}$/.test(String(sample.historical_pdf_sha256 || '')));
+  return { scenarios: unique(exact.map((row) => row.scenario)), approvals: unique(approvals.map((row) => row.approval_role)) };
 }
 
 function stateForChannel(policy, facts, approved) {
@@ -67,7 +83,7 @@ async function getPolicyMatrix({ asOf = new Date().toISOString().slice(0, 10) } 
       && (!accountId || policy.guesty_account_id === accountId));
     const activePolicies = policies.filter((policy) => approvedChannels.has(Number(policy.id)) && activeOnDate(policy, asOf));
     const policy = activePolicies.length === 1 ? activePolicies[0] : (policies[0] || null);
-    const facts = policy ? await policyFacts(policy.id, policy.policy_hash, 'channel') : { samples: 0, approvals: [] };
+    const facts = policy ? await policyFacts(policy, 'channel') : { samples: 0, approvals: [] };
     const state = activePolicies.length === 1 ? stateForChannel(policy, facts, true) : {
       status: 'hold', blockers: [`Απαιτείται ακριβώς μία εγκεκριμένη policy ενεργή στις ${asOf} (${activePolicies.length})`],
     };
@@ -80,7 +96,7 @@ async function getPolicyMatrix({ asOf = new Date().toISOString().slice(0, 10) } 
     const policies = takkPolicies.filter((policy) => Number(policy.company_id) === Number(listing.company_id) && Number(policy.listing_id) === Number(listing.id));
     const activePolicies = policies.filter((policy) => approvedTakk.has(Number(policy.id)) && activeOnDate(policy, asOf));
     const policy = activePolicies.length === 1 ? activePolicies[0] : (policies[0] || null);
-    const facts = policy ? await policyFacts(policy.id, policy.policy_hash, 'takk') : { scenarios: [], approvals: [] };
+    const facts = policy ? await policyFacts(policy, 'takk') : { scenarios: [], approvals: [] };
     const state = activePolicies.length === 1 ? stateForTakk(policy, facts, true) : {
       status: 'hold', blockers: [`Απαιτείται ακριβώς μία εγκεκριμένη TAKK policy ενεργή στις ${asOf} (${activePolicies.length})`],
     };

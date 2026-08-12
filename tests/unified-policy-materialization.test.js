@@ -56,7 +56,8 @@ async function seedApprovedPolicy() {
     });
     await db('channel_policy_samples').insert({
       policy_id: policyId, evidence_capture_id: captureId, policy_hash: policyHash, evidence_sha256: payloadSha,
-      scenario: 'normal', historical_document_type: '11.2', historical_mark: `4000000000000${index + 1}`,
+      scenario: 'normal', historical_document_type: '11.2', historical_series: 'APY', historical_mark: `4000000000000${index + 1}`,
+      historical_pdf_sha256: sha(String(index + 7)),
       historical_primary_cents: 11300, historical_takk_cents: 1000, candidate_source_values_json: '{}',
       computed_primary_cents: 11300, delta_cents: 0, passed: true, stale: false,
     });
@@ -81,14 +82,15 @@ async function seedApprovedTakkPolicy() {
   };
   const policyHash = takkPolicyHash(base);
   const [policyId] = await db('takk_policy_versions').insert({ ...base, policy_hash: policyHash });
-  for (const [scenario, checkIn, checkOut, cents, seed] of [
-    ['low', '2026-01-10', '2026-01-11', 200, '4'],
-    ['high', '2026-07-10', '2026-07-11', 800, '5'],
-    ['boundary', '2026-04-01', '2026-04-02', 800, '6'],
+  for (const [scenario, checkIn, checkOut, cents, seed, mark] of [
+    ['low', '2026-01-10', '2026-01-11', 200, '4', '4000000000011'],
+    ['high', '2026-07-10', '2026-07-11', 800, '5', '4000000000012'],
+    ['boundary', '2026-04-01', '2026-04-02', 800, '6', '4000000000013'],
   ]) {
     await db('takk_calibration_samples').insert({
       policy_id: policyId, scenario, check_in: checkIn, check_out: checkOut,
       expected_cents: cents, computed_cents: cents, delta_cents: 0, passed: true, evidence_sha256: sha(seed),
+      reservation_id: `takk-${scenario}`, historical_mark: mark, historical_document_type: '8.2', historical_series: 'T-2026', historical_pdf_sha256: sha(String(Number(seed) + 7)),
     });
   }
   await db('policy_approvals').insert([

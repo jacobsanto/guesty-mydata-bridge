@@ -88,11 +88,17 @@ async function approvalsAndSamplesValid(policy, executor) {
     executor('channel_policy_samples as s')
       .join('fiscal_evidence_captures as e', 'e.id', 's.evidence_capture_id')
       .where({ 's.policy_id': policy.id, 's.policy_hash': policy.policy_hash, 's.passed': true, 's.stale': false })
-      .whereNotNull('s.historical_mark')
-      .select('e.reservation_id'),
+      .select(
+        'e.reservation_id', 's.historical_document_type', 's.historical_series', 's.historical_mark', 's.historical_pdf_sha256',
+        's.historical_primary_cents', 's.computed_primary_cents', 's.delta_cents',
+      ),
     executor('policy_approvals').where({ channel_policy_id: policy.id, policy_hash: policy.policy_hash }).select('approval_role'),
   ]);
-  const validSamples = new Set(samples.map((sample) => String(sample.reservation_id))).size;
+  const validSamples = new Set(samples.filter((sample) => sample.historical_document_type === policy.document_type
+    && sample.historical_series === policy.series && /^\d{1,30}$/.test(String(sample.historical_mark || ''))
+    && /^[a-f0-9]{64}$/.test(String(sample.historical_pdf_sha256 || ''))
+    && Number(sample.historical_primary_cents) === Number(sample.computed_primary_cents)
+    && Number(sample.delta_cents) === 0).map((sample) => String(sample.reservation_id))).size;
   const roles = new Set(approvals.map((approval) => approval.approval_role));
   if (validSamples < 3) throw policyError(`Unified channel policy ${policy.id} requires at least 3 distinct finalized calibration samples`);
   if (!roles.has('accounting') || !roles.has('technical')) {
