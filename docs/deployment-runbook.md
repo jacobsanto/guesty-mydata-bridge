@@ -88,9 +88,11 @@ production. Before activation, the operator must have:
 10. Have the named accounting and technical owners approve only policies whose
     required samples all pass, then make the immutable admin decision. Unknown
     or ambiguous lines must remain blocked; do not add catch-all include rules.
-    Replace any legacy billing rules that identify only `source` with exact
-    `platform/source` rules; readiness deliberately blocks while legacy rules
-    remain active.
+    Legacy billing rules and financial profiles are retained only for audit and
+    sandbox investigation: they can neither approve nor drive a production
+    issue. Migrate their useful observations into an exact unified policy, then
+    retire them after the historical retention period; readiness displays them
+    as migration warnings rather than treating them as fiscal evidence.
 11. Send a controlled reservation through sandbox, run daily close manually,
     verify the transmitted document through the API, review the MARK/UID and PDF,
     and obtain accountant approval.
