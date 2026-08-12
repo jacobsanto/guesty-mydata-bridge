@@ -91,6 +91,12 @@ async function nextVersion(table, where, executor) {
   return Number(row?.max_version || 0) + 1;
 }
 
+async function lockVersionScope(scope, executor) {
+  // SQLite uses a single writer. PostgreSQL needs a deterministic advisory
+  // transaction lock so simultaneous operators cannot derive the same version.
+  if (executor.client.config.client === 'pg') await executor.raw('SELECT pg_advisory_xact_lock(hashtext(?))', [scope]);
+}
+
 function channelDraftPayload(payload, actorId) {
   assertOnlyKeys(payload, new Set(['company_id', 'listing_id', 'platform_key', 'source_key', 'recipient_model', 'series', 'counterpart', 'valid_from', 'valid_to', 'line_rules']));
   const companyId = positiveId(payload.company_id, 'company_id');
@@ -124,6 +130,7 @@ async function createChannelPolicyDraft(payload, actorId, executor = db) {
   const guestyAccountId = nonBlank(process.env.GUESTY_ACCOUNT_ID, 'GUESTY_ACCOUNT_ID', 120);
   return executor.transaction(async (trx) => {
     await listingForCompany(input.companyId, input.listingId, trx);
+    await lockVersionScope(`channel:${input.companyId}:${input.listingId}:${guestyAccountId}:${input.platformKey}:${input.sourceKey}`, trx);
     const version = await nextVersion('channel_policy_versions', {
       company_id: input.companyId, listing_id: input.listingId, guesty_account_id: guestyAccountId,
       platform_key: input.platformKey, source_key: input.sourceKey,
@@ -172,6 +179,7 @@ async function createTakkPolicyDraft(payload, actorId, executor = db) {
   return executor.transaction(async (trx) => {
     const listing = await listingForCompany(input.companyId, input.listingId, trx);
     validateAccommodationClimatePair(listing.property_type, listing.climate_fee_high_category, listing.climate_fee_low_category);
+    await lockVersionScope(`takk:${input.companyId}:${input.listingId}`, trx);
     const version = await nextVersion('takk_policy_versions', { company_id: input.companyId, listing_id: input.listingId }, trx);
     const record = {
       company_id: input.companyId, listing_id: input.listingId, version, status: 'draft', property_type: listing.property_type,
