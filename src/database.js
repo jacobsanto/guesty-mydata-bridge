@@ -104,6 +104,7 @@ async function initializeSchemaObjects() {
   await ensureListingBillingRulesTable();
   await ensureListingChannelBillingRulesTable();
   await ensureFinancialProfilesTables();
+  await ensureUnifiedPolicyTables();
   await ensureReservationSnapshotsTable();
   await ensureLegacyTenantsTable();
   await ensureInvoicesTable();
@@ -416,6 +417,270 @@ async function ensureFinancialProfilesTables() {
       t.foreign('profile_id').references('financial_profiles.id').onDelete('CASCADE');
     });
     console.log('✅ Δημιουργήθηκε πίνακας: financial_calibration_samples');
+  }
+}
+
+async function ensureAppendOnlyTable(tableName, label) {
+  if (!/^[a-z0-9_]+$/.test(tableName)) throw new Error('Unsafe append-only table identifier');
+  if (db.client.config.client === 'pg') {
+    const functionName = `${tableName}_reject_mutation`;
+    await db.raw(`CREATE OR REPLACE FUNCTION "${functionName}"() RETURNS trigger AS $$
+      BEGIN
+        RAISE EXCEPTION '${label} are immutable and append-only' USING ERRCODE = '55000';
+      END;
+    $$ LANGUAGE plpgsql`);
+    await db.raw(`DO $$ BEGIN
+      IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = '${tableName}_no_update' AND tgrelid = '${tableName}'::regclass) THEN
+        CREATE TRIGGER "${tableName}_no_update" BEFORE UPDATE ON "${tableName}"
+          FOR EACH ROW EXECUTE FUNCTION "${functionName}"();
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = '${tableName}_no_delete' AND tgrelid = '${tableName}'::regclass) THEN
+        CREATE TRIGGER "${tableName}_no_delete" BEFORE DELETE ON "${tableName}"
+          FOR EACH ROW EXECUTE FUNCTION "${functionName}"();
+      END IF;
+    END $$`);
+    return;
+  }
+  await db.raw(`CREATE TRIGGER IF NOT EXISTS "${tableName}_no_update"
+    BEFORE UPDATE ON "${tableName}" BEGIN
+      SELECT RAISE(ABORT, '${label} are immutable and append-only');
+    END`);
+  await db.raw(`CREATE TRIGGER IF NOT EXISTS "${tableName}_no_delete"
+    BEFORE DELETE ON "${tableName}" BEGIN
+      SELECT RAISE(ABORT, '${label} are immutable and append-only');
+    END`);
+}
+
+async function ensureUnifiedPolicyTables() {
+  if (!await db.schema.hasTable('channel_policy_versions')) {
+    await db.schema.createTable('channel_policy_versions', (t) => {
+      t.increments('id').primary();
+      t.integer('company_id').unsigned().notNullable();
+      t.integer('listing_id').unsigned().notNullable();
+      t.string('guesty_account_id', 120).notNullable();
+      t.string('platform_key', 100).notNullable();
+      t.string('source_key', 100).notNullable();
+      t.string('currency', 3).notNullable().defaultTo('EUR');
+      t.integer('version').unsigned().notNullable();
+      t.enum('status', ['draft', 'blocked', 'accounting_review', 'technical_review', 'approved', 'suspended'])
+        .notNullable().defaultTo('draft').index();
+      t.enum('recipient_model', ['private_guest', 'approved_business_counterpart']).notNullable();
+      t.string('document_type', 4).notNullable();
+      t.string('series', 50).notNullable();
+      t.text('counterpart_json').nullable();
+      t.integer('vat_category').notNullable().defaultTo(2);
+      t.string('classification_category', 50).notNullable().defaultTo('category1_3');
+      t.string('classification_type', 50).notNullable();
+      t.enum('gross_strategy', ['folio_items_sum', 'overview_scalar_primary', 'overview_scalar_combined', 'overview_formula_primary', 'overview_formula_combined'])
+        .notNullable();
+      t.text('gross_strategy_config_json').notNullable().defaultTo('{}');
+      t.text('line_rules_json').notNullable().defaultTo('[]');
+      t.integer('tolerance_cents').notNullable().defaultTo(0);
+      t.string('normalizer_version', 40).notNullable();
+      t.string('calculator_version', 40).notNullable();
+      t.string('policy_hash', 64).notNullable();
+      t.date('valid_from').nullable();
+      t.date('valid_to').nullable();
+      t.text('blocked_reason').nullable();
+      t.string('created_by', 200).notNullable();
+      t.timestamps(true, true);
+      t.unique(['company_id', 'listing_id', 'guesty_account_id', 'platform_key', 'source_key', 'version']);
+      t.foreign('company_id').references('companies.id').onDelete('RESTRICT');
+      t.foreign('listing_id').references('listings.id').onDelete('RESTRICT');
+    });
+    console.log('✅ Δημιουργήθηκε πίνακας: channel_policy_versions');
+  }
+
+  if (!await db.schema.hasTable('fiscal_evidence_captures')) {
+    await db.schema.createTable('fiscal_evidence_captures', (t) => {
+      t.increments('id').primary();
+      t.integer('company_id').unsigned().notNullable();
+      t.integer('listing_id').unsigned().notNullable();
+      t.string('reservation_id', 120).notNullable();
+      t.string('platform_key', 100).notNullable();
+      t.string('source_key', 100).notNullable();
+      t.string('guesty_account_id', 120).notNullable();
+      t.string('currency', 3).notNullable().defaultTo('EUR');
+      t.timestamp('captured_at').notNullable().defaultTo(db.fn.now());
+      t.timestamp('folio_updated_at').nullable();
+      t.text('normalized_payload_json').notNullable();
+      t.string('payload_sha256', 64).notNullable();
+      t.integer('previous_capture_id').unsigned().nullable();
+      t.string('previous_capture_sha256', 64).nullable();
+      t.string('capture_method', 50).notNullable();
+      t.string('guesty_contract_version', 50).notNullable();
+      t.foreign('company_id').references('companies.id').onDelete('RESTRICT');
+      t.foreign('listing_id').references('listings.id').onDelete('RESTRICT');
+      t.foreign('previous_capture_id').references('fiscal_evidence_captures.id').onDelete('RESTRICT');
+      t.unique(['company_id', 'listing_id', 'reservation_id', 'payload_sha256']);
+    });
+    console.log('✅ Δημιουργήθηκε πίνακας: fiscal_evidence_captures');
+  }
+
+  if (!await db.schema.hasTable('channel_policy_samples')) {
+    await db.schema.createTable('channel_policy_samples', (t) => {
+      t.increments('id').primary();
+      t.integer('policy_id').unsigned().notNullable();
+      t.integer('evidence_capture_id').unsigned().notNullable();
+      t.string('policy_hash', 64).notNullable();
+      t.string('evidence_sha256', 64).notNullable();
+      t.string('scenario', 50).notNullable();
+      t.string('historical_document_type', 4).notNullable();
+      t.string('historical_series', 50).nullable();
+      t.string('historical_mark', 30).nullable();
+      t.string('historical_uid', 50).nullable();
+      t.string('historical_pdf_sha256', 64).nullable();
+      t.integer('historical_primary_cents').notNullable();
+      t.integer('historical_takk_cents').notNullable();
+      t.text('candidate_source_values_json').notNullable().defaultTo('{}');
+      t.integer('computed_primary_cents').notNullable();
+      t.integer('delta_cents').notNullable();
+      t.boolean('passed').notNullable();
+      t.boolean('stale').notNullable().defaultTo(false);
+      t.text('exclusion_reason').nullable();
+      t.string('accountant_reference', 200).nullable();
+      t.timestamp('created_at').notNullable().defaultTo(db.fn.now());
+      t.unique(['policy_id', 'evidence_capture_id']);
+      t.foreign('policy_id').references('channel_policy_versions.id').onDelete('RESTRICT');
+      t.foreign('evidence_capture_id').references('fiscal_evidence_captures.id').onDelete('RESTRICT');
+    });
+    console.log('✅ Δημιουργήθηκε πίνακας: channel_policy_samples');
+  }
+
+  if (!await db.schema.hasTable('takk_policy_versions')) {
+    await db.schema.createTable('takk_policy_versions', (t) => {
+      t.increments('id').primary();
+      t.integer('company_id').unsigned().notNullable();
+      t.integer('listing_id').unsigned().notNullable();
+      t.integer('version').unsigned().notNullable();
+      t.enum('status', ['draft', 'blocked', 'accounting_review', 'technical_review', 'approved', 'suspended'])
+        .notNullable().defaultTo('draft').index();
+      t.string('property_type', 50).notNullable();
+      t.string('licensed_category', 100).notNullable();
+      t.date('valid_from').notNullable();
+      t.date('valid_to').nullable();
+      t.integer('high_category').notNullable();
+      t.integer('low_category').notNullable();
+      t.integer('high_rate_cents').notNullable();
+      t.integer('low_rate_cents').notNullable();
+      t.text('season_rules_json').notNullable();
+      t.string('series', 50).notNullable();
+      t.string('calculator_version', 40).notNullable();
+      t.string('policy_hash', 64).notNullable();
+      t.text('blocked_reason').nullable();
+      t.string('created_by', 200).notNullable();
+      t.timestamps(true, true);
+      t.unique(['company_id', 'listing_id', 'version']);
+      t.foreign('company_id').references('companies.id').onDelete('RESTRICT');
+      t.foreign('listing_id').references('listings.id').onDelete('RESTRICT');
+    });
+    console.log('✅ Δημιουργήθηκε πίνακας: takk_policy_versions');
+  }
+
+  if (!await db.schema.hasTable('policy_approvals')) {
+    await db.schema.createTable('policy_approvals', (t) => {
+      t.increments('id').primary();
+      t.integer('channel_policy_id').unsigned().nullable();
+      t.integer('takk_policy_id').unsigned().nullable();
+      t.string('policy_hash', 64).notNullable();
+      t.enum('approval_role', ['accounting', 'technical']).notNullable();
+      t.string('actor_id', 200).notNullable();
+      t.text('notes').nullable();
+      t.timestamp('approved_at').notNullable().defaultTo(db.fn.now());
+      t.unique(['channel_policy_id', 'policy_hash', 'approval_role']);
+      t.unique(['takk_policy_id', 'policy_hash', 'approval_role']);
+      t.foreign('channel_policy_id').references('channel_policy_versions.id').onDelete('RESTRICT');
+      t.foreign('takk_policy_id').references('takk_policy_versions.id').onDelete('RESTRICT');
+    });
+    console.log('✅ Δημιουργήθηκε πίνακας: policy_approvals');
+  }
+
+  if (!await db.schema.hasTable('takk_calibration_samples')) {
+    await db.schema.createTable('takk_calibration_samples', (t) => {
+      t.increments('id').primary();
+      t.integer('policy_id').unsigned().notNullable();
+      t.enum('scenario', ['low', 'high', 'boundary']).notNullable();
+      t.date('check_in').notNullable();
+      t.date('check_out').notNullable();
+      t.integer('expected_cents').notNullable();
+      t.integer('computed_cents').notNullable();
+      t.integer('delta_cents').notNullable();
+      t.boolean('passed').notNullable();
+      t.string('evidence_sha256', 64).notNullable();
+      t.string('accountant_reference', 200).nullable();
+      t.timestamp('created_at').notNullable().defaultTo(db.fn.now());
+      t.unique(['policy_id', 'scenario', 'evidence_sha256']);
+      t.foreign('policy_id').references('takk_policy_versions.id').onDelete('RESTRICT');
+    });
+    console.log('✅ Δημιουργήθηκε πίνακας: takk_calibration_samples');
+  }
+
+  await ensureUnifiedPolicyIntegrityTriggers();
+
+  for (const [table, label] of [
+    ['channel_policy_versions', 'Channel policy versions'],
+    ['fiscal_evidence_captures', 'Fiscal evidence captures'],
+    ['channel_policy_samples', 'Channel policy samples'],
+    ['policy_approvals', 'Policy approvals'],
+    ['takk_policy_versions', 'TAKK policy versions'],
+    ['takk_calibration_samples', 'TAKK calibration samples'],
+  ]) await ensureAppendOnlyTable(table, label);
+}
+
+async function ensureUnifiedPolicyIntegrityTriggers() {
+  if (db.client.config.client === 'pg') {
+    await db.raw(`CREATE OR REPLACE FUNCTION unified_policy_validate_row() RETURNS trigger AS $$
+      BEGIN
+        IF TG_TABLE_NAME = 'channel_policy_versions' THEN
+          IF NOT EXISTS (SELECT 1 FROM listings l WHERE l.id = NEW.listing_id AND l.company_id = NEW.company_id) THEN
+            RAISE EXCEPTION 'Policy listing must belong to company' USING ERRCODE = '23514';
+          END IF;
+          IF (NEW.recipient_model = 'private_guest' AND (NEW.document_type <> '11.2' OR NEW.counterpart_json IS NOT NULL))
+             OR (NEW.recipient_model = 'approved_business_counterpart' AND (NEW.document_type <> '2.1' OR NEW.counterpart_json IS NULL)) THEN
+            RAISE EXCEPTION 'Recipient model and document type are inconsistent' USING ERRCODE = '23514';
+          END IF;
+        ELSIF TG_TABLE_NAME = 'fiscal_evidence_captures' THEN
+          IF NOT EXISTS (SELECT 1 FROM listings l WHERE l.id = NEW.listing_id AND l.company_id = NEW.company_id) THEN
+            RAISE EXCEPTION 'Evidence listing must belong to company' USING ERRCODE = '23514';
+          END IF;
+        ELSIF TG_TABLE_NAME = 'channel_policy_samples' THEN
+          IF NOT EXISTS (
+            SELECT 1 FROM channel_policy_versions p JOIN fiscal_evidence_captures e ON e.id = NEW.evidence_capture_id
+            WHERE p.id = NEW.policy_id AND p.policy_hash = NEW.policy_hash AND e.payload_sha256 = NEW.evidence_sha256
+              AND p.company_id = e.company_id AND p.listing_id = e.listing_id
+              AND p.guesty_account_id = e.guesty_account_id AND p.platform_key = e.platform_key
+              AND p.source_key = e.source_key AND p.currency = e.currency
+          ) THEN RAISE EXCEPTION 'Calibration evidence must match the exact policy tuple and hashes' USING ERRCODE = '23514'; END IF;
+        ELSIF TG_TABLE_NAME = 'policy_approvals' THEN
+          IF (NEW.channel_policy_id IS NULL) = (NEW.takk_policy_id IS NULL) THEN
+            RAISE EXCEPTION 'Approval must reference exactly one policy' USING ERRCODE = '23514';
+          END IF;
+          IF NEW.channel_policy_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM channel_policy_versions p WHERE p.id = NEW.channel_policy_id AND p.policy_hash = NEW.policy_hash) THEN
+            RAISE EXCEPTION 'Approval hash does not match channel policy' USING ERRCODE = '23514';
+          END IF;
+          IF NEW.takk_policy_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM takk_policy_versions p WHERE p.id = NEW.takk_policy_id AND p.policy_hash = NEW.policy_hash) THEN
+            RAISE EXCEPTION 'Approval hash does not match TAKK policy' USING ERRCODE = '23514';
+          END IF;
+        END IF;
+        RETURN NEW;
+      END;
+    $$ LANGUAGE plpgsql`);
+    for (const table of ['channel_policy_versions', 'fiscal_evidence_captures', 'channel_policy_samples', 'policy_approvals']) {
+      await db.raw(`DROP TRIGGER IF EXISTS "${table}_validate_insert" ON "${table}"`);
+      await db.raw(`CREATE TRIGGER "${table}_validate_insert" BEFORE INSERT ON "${table}" FOR EACH ROW EXECUTE FUNCTION unified_policy_validate_row()`);
+    }
+    return;
+  }
+
+  const triggers = [
+    ['channel_policy_versions_validate_company', 'channel_policy_versions', `NOT EXISTS (SELECT 1 FROM listings l WHERE l.id = NEW.listing_id AND l.company_id = NEW.company_id)`, 'Policy listing must belong to company'],
+    ['channel_policy_versions_validate_recipient', 'channel_policy_versions', `(NEW.recipient_model = 'private_guest' AND (NEW.document_type <> '11.2' OR NEW.counterpart_json IS NOT NULL)) OR (NEW.recipient_model = 'approved_business_counterpart' AND (NEW.document_type <> '2.1' OR NEW.counterpart_json IS NULL))`, 'Recipient model and document type are inconsistent'],
+    ['fiscal_evidence_captures_validate_company', 'fiscal_evidence_captures', `NOT EXISTS (SELECT 1 FROM listings l WHERE l.id = NEW.listing_id AND l.company_id = NEW.company_id)`, 'Evidence listing must belong to company'],
+    ['channel_policy_samples_validate_tuple', 'channel_policy_samples', `NOT EXISTS (SELECT 1 FROM channel_policy_versions p JOIN fiscal_evidence_captures e ON e.id = NEW.evidence_capture_id WHERE p.id = NEW.policy_id AND p.policy_hash = NEW.policy_hash AND e.payload_sha256 = NEW.evidence_sha256 AND p.company_id = e.company_id AND p.listing_id = e.listing_id AND p.guesty_account_id = e.guesty_account_id AND p.platform_key = e.platform_key AND p.source_key = e.source_key AND p.currency = e.currency)`, 'Calibration evidence must match the exact policy tuple and hashes'],
+    ['policy_approvals_validate_reference', 'policy_approvals', `(NEW.channel_policy_id IS NULL) = (NEW.takk_policy_id IS NULL) OR (NEW.channel_policy_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM channel_policy_versions p WHERE p.id = NEW.channel_policy_id AND p.policy_hash = NEW.policy_hash)) OR (NEW.takk_policy_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM takk_policy_versions p WHERE p.id = NEW.takk_policy_id AND p.policy_hash = NEW.policy_hash))`, 'Approval must reference exactly one policy with its exact hash'],
+  ];
+  for (const [name, table, predicate, message] of triggers) {
+    await db.raw(`CREATE TRIGGER IF NOT EXISTS "${name}" BEFORE INSERT ON "${table}" WHEN ${predicate} BEGIN SELECT RAISE(ABORT, '${message}'); END`);
   }
 }
 

@@ -148,8 +148,8 @@ async function run() {
   assert(xml.includes('<invoiceType>2.1</invoiceType>'), 'invoiceType 2.1 (Τιμολόγιο Παροχής)');
   assert(xml.includes('<vatCategory>2</vatCategory>'), 'vatCategory 2 (13% ΦΠΑ)');
   assert(xml.includes('<vatAmount>92.04</vatAmount>'), 'VAT 13% υπολογίζεται από Guesty gross amount');
-  assert(xml.includes('<vatNumber>IE9827384L</vatNumber>'), 'OTA counterpart περιλαμβάνεται στο XML');
-  assert(xml.includes('<icls:classificationType>E3_561_007</icls:classificationType>'), 'E3_561_007 για έσοδα υπηρεσιών OTA');
+  assert(xml.includes('<vatNumber>IE9827384L</vatNumber>'), 'ο εγκεκριμένος B2B αντισυμβαλλόμενος περιλαμβάνεται στο XML');
+  assert(xml.includes('<icls:classificationType>E3_561_007</icls:classificationType>'), 'E3_561_007 για την εγκεκριμένη B2B ροή');
   assert(!xml.includes('<feesPercentCategory>'), 'δεν ενσωματώνεται κλιματικό τέλος σε 11.x');
   assert(xml.includes('<totalGrossValue>800.00</totalGrossValue>'), 'totalGrossValue διατηρεί το Guesty gross amount');
   assert(!xml.includes('<correlatedInvoices>'), 'Guesty reservation id δεν γράφεται ως AADE MARK');
@@ -164,7 +164,15 @@ async function run() {
   } catch (error) {
     blockedMissingCounterpart = error.message.includes('invoiceCounterpart');
   }
-  assert(blockedMissingCounterpart, '2.1 μπλοκάρεται όταν λείπει ο OTA αντισυμβαλλόμενος');
+  assert(blockedMissingCounterpart, '2.1 μπλοκάρεται όταν λείπει ο πραγματικός B2B αντισυμβαλλόμενος');
+
+  const retailWithStaleCollector = generateMyDataXML({
+    ...MOCK_RESERVATION,
+    invoiceType: '11.2',
+    invoiceCounterpart: { vatNumber: 'IE9827384L', country: 'IE', name: 'Payment collector' },
+  }, { ...tenant, default_invoice_type: '11.2' }, 2);
+  assert(!retailWithStaleCollector.includes('<counterpart>'), 'η ΑΠΥ 11.2 δεν κληρονομεί στοιχεία OTA/payment collector');
+  assert(retailWithStaleCollector.includes('<invoiceType>11.2</invoiceType>'), 'η παρουσία payment collector δεν αλλάζει την ΑΠΥ σε ΤΠΥ');
 
   const configuredClimateFee = calculateClimateFeePerNight('2025-07-10', {
     property_type: 'apartment', climate_fee_high: 22.00, climate_fee_low: 6.00,
@@ -798,7 +806,7 @@ async function run() {
     sourceKey: 'airbnb2',
     invoiceCounterpart: undefined,
   }, billingContext);
-  assert(otaDocuments.primary.document.document_type === '2.1', 'OTA κράτηση χρησιμοποιεί το fallback ΤΠΥ 2.1 με αντισυμβαλλόμενο');
+  assert(otaDocuments.primary.document.document_type === '2.1', 'ρητά ρυθμισμένη B2B κράτηση χρησιμοποιεί ΤΠΥ 2.1 με αντισυμβαλλόμενο');
 
   const folioNormalized = normalizeGuestyReservation({
     _id: 'res_FOLIO001', listingId: 'lst_QUEUE_TEST', status: 'confirmed',

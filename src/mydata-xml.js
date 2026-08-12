@@ -31,8 +31,8 @@ function calculateClimateFeePerNight(checkInDate, listingConfig) {
 
 // -------------------------------------------------------------------
 // Κύρια συνάρτηση — παράγει myDATA-compliant XML (v2.0.1 schema namespace remains v1.0)
-// Managed properties issue accommodation services with VAT 13%. OTA reservations can be
-// billed as 2.1 to the merchant of record; direct reservations can be 11.2.
+// Managed properties issue accommodation services with VAT 13%. The actual
+// contractual recipient—not the OTA/payment collector—determines 11.2 vs 2.1.
 // billingContext = joined company + listing object
 // -------------------------------------------------------------------
 function generateMyDataXML(reservation, billingContext, invoiceAA) {
@@ -60,7 +60,7 @@ function generateMyDataXML(reservation, billingContext, invoiceAA) {
   void nights;
   const totalGross = grossValue;
   const invoiceType = reservation.invoiceType || billingContext.default_invoice_type;
-  const counterpart = reservation.invoiceCounterpart || (
+  const counterpart = invoiceType === '2.1' ? (reservation.invoiceCounterpart || (
     billingContext.invoice_counterpart_vat_number
       ? {
           vatNumber: billingContext.invoice_counterpart_vat_number,
@@ -69,7 +69,7 @@ function generateMyDataXML(reservation, billingContext, invoiceAA) {
           branch: billingContext.invoice_counterpart_branch,
         }
       : null
-  );
+  )) : null;
   const classificationType = invoiceType === '11.2' ? 'E3_561_003' : 'E3_561_007';
 
   if (!['11.2', '2.1'].includes(invoiceType)) {
@@ -101,7 +101,7 @@ function generateMyDataXML(reservation, billingContext, invoiceAA) {
   // ── Issuer ──────────────────────────────────────────────────────
   addIssuer(invoice, billingContext);
 
-  // ── Counterpart — required for OTA / B2B service invoices (2.1) ──
+  // ── Counterpart — required for approved B2B service invoices (2.1) ──
   if (normalizedCounterpart) {
     const counterpartNode = invoice.ele('counterpart')
       .ele('vatNumber').txt(normalizedCounterpart.vatNumber).up()
@@ -129,7 +129,7 @@ function generateMyDataXML(reservation, billingContext, invoiceAA) {
         .ele('vatCategory').txt('2').up()          // 2 = 13% ΦΠΑ
         .ele('vatAmount').txt(vatAmount.toFixed(2)).up()
         .ele('discountOption').txt('false').up()
-        // Retail/private: E3_561_003. B2B/OTA: E3_561_007.
+        // Retail/private: E3_561_003. Approved B2B route: E3_561_007.
         .ele('incomeClassification')
           .ele('icls:classificationType').txt(classificationType).up()
           .ele('icls:classificationCategory').txt('category1_3').up()
