@@ -92,7 +92,7 @@ Do not expose the Render PostgreSQL public endpoint unless it is temporarily
 required for a controlled maintenance task. The Blueprint connects over the
 private Render network.
 
-## VPS deployment with Docker Compose
+## Hetzner Cloud deployment with Docker Compose
 
 Prerequisites are Docker Engine with the Compose plugin, a TLS reverse proxy,
 DNS, firewall access limited to ports 80/443, and encrypted off-host backups.
@@ -118,6 +118,57 @@ replica avoids duplicated scheduler work and migration races during startup.
 The Compose template explicitly declares `DB_PRIVATE_NETWORK=true` because its
 PostgreSQL port is not published outside the private Docker bridge. Managed or
 remote PostgreSQL must instead use `DB_SSL=true` with certificate verification.
+
+### Encrypted off-site backups and restore drill
+
+The repository supplies host-operated scripts under `scripts/ops/`. They make a
+PostgreSQL custom-format dump, verify it with `pg_restore --list`, encrypt and
+copy it to an off-site [restic](https://restic.net/) repository, and apply
+retention there. The application container never receives the restic password.
+
+On the Hetzner host, install Docker Compose, `restic` and PostgreSQL client
+tools (`pg_restore`). Create a dedicated non-login `guesty-ops` account, a
+root-owned `/etc/guesty-mydata/backup.env` (mode `600`), and a separate restic
+password file (mode `600`). The service account needs access to the Docker
+socket only through the carefully reviewed local operations policy.
+
+`/etc/guesty-mydata/backup.env` contains only deployment values, never fiscal
+documents or AADE credentials:
+
+```bash
+POSTGRES_DB=guesty_mydata
+POSTGRES_USER=guesty_backup
+RESTIC_REPOSITORY=s3:https://<encrypted-offsite-bucket>/guesty-mydata
+RESTIC_PASSWORD_FILE=/etc/guesty-mydata/restic-password
+GUESTY_BRIDGE_BACKUP_DIR=/srv/guesty-mydata-backups
+GUESTY_BRIDGE_BACKUP_RETENTION_DAYS=35
+```
+
+Initialize the empty restic repository once under controlled access, then copy
+the two systemd unit files and enable the timer:
+
+```bash
+sudo install -m 644 scripts/ops/backup-postgres.service /etc/systemd/system/
+sudo install -m 644 scripts/ops/backup-postgres.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now backup-postgres.timer
+sudo systemctl list-timers backup-postgres.timer
+sudo systemctl start backup-postgres.service
+```
+
+Run a restore drill at least monthly and after every schema/encryption-key
+change. Fetch a chosen verified dump from restic to an absolute, protected host
+path, then run the drill. It restores only into a timestamped temporary
+database and removes that database at the end; it never drops the live
+`POSTGRES_DB`.
+
+```bash
+scripts/ops/restore-drill-postgres.sh /srv/guesty-mydata-backups/VERIFIED.dump
+```
+
+Record the restic snapshot ID, dump SHA-256, restore-drill timestamp, reviewer
+and result in the operations register. An absent or failed drill is a production
+readiness failure.
 
 ## Runtime safety model
 
@@ -293,8 +344,9 @@ be assumed during production planning:
 - The scheduler runs inside the single web process with one global timezone and
   close time. There is no external durable scheduler, per-company timezone, or
   supported multi-replica leader election.
-- The Compose file supplies a local PostgreSQL volume but no automated backup,
-  off-site copy, retention enforcement, restore drill, or backup-age alert.
+- The supplied systemd/restic backup workflow still requires host installation,
+  a configured encrypted off-site repository, a protected password file and an
+  external alert when a timer run or restore drill is overdue.
 - Schema initialization is performed by the application migration command/startup
   code; there is no independently versioned rollback migration chain.
 - Logging is console-based. There is no bundled metrics/tracing/alerting stack or
