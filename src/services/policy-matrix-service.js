@@ -1,6 +1,7 @@
 'use strict';
 
 const { db } = require('../database');
+const { approvedPolicyIds } = require('./policy-decision-service');
 
 function unique(values) { return [...new Set(values.filter(Boolean).map(String))]; }
 
@@ -26,20 +27,20 @@ async function policyFacts(policyId, policyHash, type) {
   return { scenarios: unique(samples.map((row) => row.scenario)), approvals: unique(approvals.map((row) => row.approval_role)) };
 }
 
-function stateForChannel(policy, facts) {
+function stateForChannel(policy, facts, approved) {
   if (!policy) return { status: 'hold', blockers: ['Δεν υπάρχει unified policy για το ακριβές Guesty tuple'] };
   const blockers = [];
-  if (policy.status !== 'approved') blockers.push(`Policy v${policy.version} είναι ${policy.status}`);
+  if (!approved) blockers.push(`Policy v${policy.version} δεν έχει ενεργή immutable approval decision`);
   if (facts.samples < 3) blockers.push(`Απαιτούνται 3 οριστικοποιημένα δείγματα (${facts.samples}/3)`);
   if (!facts.approvals.includes('accounting')) blockers.push('Λείπει λογιστική έγκριση');
   if (!facts.approvals.includes('technical')) blockers.push('Λείπει τεχνική έγκριση');
   return { status: blockers.length ? (facts.samples ? 'review' : 'calibrating') : 'ready', blockers };
 }
 
-function stateForTakk(policy, facts) {
+function stateForTakk(policy, facts, approved) {
   if (!policy) return { status: 'hold', blockers: ['Δεν υπάρχει ενεργή TAKK policy για το κατάλυμα'] };
   const blockers = [];
-  if (policy.status !== 'approved') blockers.push(`TAKK v${policy.version} είναι ${policy.status}`);
+  if (!approved) blockers.push(`TAKK v${policy.version} δεν έχει ενεργή immutable approval decision`);
   for (const scenario of ['low', 'high', 'boundary']) if (!facts.scenarios.includes(scenario)) blockers.push(`Λείπει ${scenario} calibration`);
   if (!facts.approvals.includes('accounting')) blockers.push('Λείπει λογιστική έγκριση');
   if (!facts.approvals.includes('technical')) blockers.push('Λείπει τεχνική έγκριση');
@@ -58,14 +59,16 @@ async function getPolicyMatrix({ asOf = new Date().toISOString().slice(0, 10) } 
     db('takk_policy_versions').select('*').orderBy('version', 'desc'),
   ]);
   const accountId = String(process.env.GUESTY_ACCOUNT_ID || '').trim() || null;
+  const approvedChannels = await approvedPolicyIds(channelPolicies, 'channel');
+  const approvedTakk = await approvedPolicyIds(takkPolicies, 'takk');
   const channels = await Promise.all(observed.map(async (item) => {
     const policies = channelPolicies.filter((policy) => Number(policy.company_id) === Number(item.company_id)
       && Number(policy.listing_id) === Number(item.listing_id) && policy.platform_key === item.platform_key && policy.source_key === item.source_key
       && (!accountId || policy.guesty_account_id === accountId));
-    const activePolicies = policies.filter((policy) => policy.status === 'approved' && activeOnDate(policy, asOf));
+    const activePolicies = policies.filter((policy) => approvedChannels.has(Number(policy.id)) && activeOnDate(policy, asOf));
     const policy = activePolicies.length === 1 ? activePolicies[0] : (policies[0] || null);
     const facts = policy ? await policyFacts(policy.id, policy.policy_hash, 'channel') : { samples: 0, approvals: [] };
-    const state = activePolicies.length === 1 ? stateForChannel(policy, facts) : {
+    const state = activePolicies.length === 1 ? stateForChannel(policy, facts, true) : {
       status: 'hold', blockers: [`Απαιτείται ακριβώς μία εγκεκριμένη policy ενεργή στις ${asOf} (${activePolicies.length})`],
     };
     return { ...item, guesty_account_id: policy?.guesty_account_id || accountId, policy: policy && {
@@ -75,10 +78,10 @@ async function getPolicyMatrix({ asOf = new Date().toISOString().slice(0, 10) } 
   }));
   const takk = await Promise.all(listings.map(async (listing) => {
     const policies = takkPolicies.filter((policy) => Number(policy.company_id) === Number(listing.company_id) && Number(policy.listing_id) === Number(listing.id));
-    const activePolicies = policies.filter((policy) => policy.status === 'approved' && activeOnDate(policy, asOf));
+    const activePolicies = policies.filter((policy) => approvedTakk.has(Number(policy.id)) && activeOnDate(policy, asOf));
     const policy = activePolicies.length === 1 ? activePolicies[0] : (policies[0] || null);
     const facts = policy ? await policyFacts(policy.id, policy.policy_hash, 'takk') : { scenarios: [], approvals: [] };
-    const state = activePolicies.length === 1 ? stateForTakk(policy, facts) : {
+    const state = activePolicies.length === 1 ? stateForTakk(policy, facts, true) : {
       status: 'hold', blockers: [`Απαιτείται ακριβώς μία εγκεκριμένη TAKK policy ενεργή στις ${asOf} (${activePolicies.length})`],
     };
     return { ...listing, policy: policy && {

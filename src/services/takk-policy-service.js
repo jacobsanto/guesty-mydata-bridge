@@ -3,6 +3,7 @@
 const crypto = require('crypto');
 const { db } = require('../database');
 const { normalizeSeries } = require('../validation/fiscal-fields');
+const { approvedPolicyIds, assertPolicyDecisionApproved } = require('./policy-decision-service');
 
 function policyError(message, status = 409, code = 'TAKK_POLICY_BLOCKED') {
   return Object.assign(new Error(message), { status, code });
@@ -62,11 +63,14 @@ function activeForStay(policy, dates) {
 
 async function resolveApprovedTakkPolicy({ reservation, billingContext, executor = db, lock = false }) {
   const dates = stayDates(reservation.checkIn, reservation.nights);
-  let query = executor('takk_policy_versions').where({ company_id: billingContext.company_id, listing_id: billingContext.listing_id, status: 'approved' }).orderBy('version', 'desc');
+  let query = executor('takk_policy_versions').where({ company_id: billingContext.company_id, listing_id: billingContext.listing_id }).orderBy('version', 'desc');
   if (lock && executor.client.config.client === 'pg') query = query.forUpdate();
-  const candidates = (await query).filter((policy) => activeForStay(policy, dates));
+  const policies = (await query).filter((policy) => activeForStay(policy, dates));
+  const approved = await approvedPolicyIds(policies, 'takk', executor);
+  const candidates = policies.filter((policy) => approved.has(Number(policy.id)));
   if (candidates.length !== 1) throw policyError(`Expected exactly one approved TAKK policy covering every stay night; found ${candidates.length}`);
   const policy = { ...candidates[0], seasonRules: normalizeSeasonRule(parseJson(candidates[0].season_rules_json, 'season_rules_json')) };
+  await assertPolicyDecisionApproved(policy, 'takk', executor, { lock });
   if (takkPolicyHash(policy) !== policy.policy_hash) throw policyError('TAKK policy hash does not match its fiscal configuration', 409, 'TAKK_POLICY_HASH_MISMATCH');
   const samples = await executor('takk_calibration_samples').where({ policy_id: policy.id, passed: true }).select('scenario');
   const scenarios = new Set(samples.map((sample) => sample.scenario));

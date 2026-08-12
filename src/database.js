@@ -607,6 +607,24 @@ async function ensureUnifiedPolicyTables() {
     await ensureColumn('policy_approvals', 'takk_policy_id', (t) => t.integer('takk_policy_id').unsigned().nullable());
   }
 
+  if (!await db.schema.hasTable('policy_decision_events')) {
+    await db.schema.createTable('policy_decision_events', (t) => {
+      t.increments('id').primary();
+      t.integer('channel_policy_id').unsigned().nullable();
+      t.integer('takk_policy_id').unsigned().nullable();
+      t.string('policy_hash', 64).notNullable();
+      t.enum('decision', ['approved', 'suspended', 'blocked']).notNullable();
+      t.string('actor_id', 200).notNullable();
+      t.text('reason').nullable();
+      t.timestamp('decided_at').notNullable().defaultTo(db.fn.now());
+      t.unique(['channel_policy_id', 'policy_hash', 'decision', 'decided_at']);
+      t.unique(['takk_policy_id', 'policy_hash', 'decision', 'decided_at']);
+      t.foreign('channel_policy_id').references('channel_policy_versions.id').onDelete('RESTRICT');
+      t.foreign('takk_policy_id').references('takk_policy_versions.id').onDelete('RESTRICT');
+    });
+    console.log('✅ Δημιουργήθηκε πίνακας: policy_decision_events');
+  }
+
   if (!await db.schema.hasTable('takk_calibration_samples')) {
     await db.schema.createTable('takk_calibration_samples', (t) => {
       t.increments('id').primary();
@@ -634,6 +652,7 @@ async function ensureUnifiedPolicyTables() {
     ['fiscal_evidence_captures', 'Fiscal evidence captures'],
     ['channel_policy_samples', 'Channel policy samples'],
     ['policy_approvals', 'Policy approvals'],
+    ['policy_decision_events', 'Policy decision events'],
     ['takk_policy_versions', 'TAKK policy versions'],
     ['takk_calibration_samples', 'TAKK calibration samples'],
   ]) await ensureAppendOnlyTable(table, label);
@@ -663,7 +682,7 @@ async function ensureUnifiedPolicyIntegrityTriggers() {
               AND p.guesty_account_id = e.guesty_account_id AND p.platform_key = e.platform_key
               AND p.source_key = e.source_key AND p.currency = e.currency
           ) THEN RAISE EXCEPTION 'Calibration evidence must match the exact policy tuple and hashes' USING ERRCODE = '23514'; END IF;
-        ELSIF TG_TABLE_NAME = 'policy_approvals' THEN
+        ELSIF TG_TABLE_NAME IN ('policy_approvals', 'policy_decision_events') THEN
           IF (NEW.channel_policy_id IS NULL) = (NEW.takk_policy_id IS NULL) THEN
             RAISE EXCEPTION 'Approval must reference exactly one policy' USING ERRCODE = '23514';
           END IF;
@@ -677,7 +696,7 @@ async function ensureUnifiedPolicyIntegrityTriggers() {
         RETURN NEW;
       END;
     $$ LANGUAGE plpgsql`);
-    for (const table of ['channel_policy_versions', 'fiscal_evidence_captures', 'channel_policy_samples', 'policy_approvals']) {
+    for (const table of ['channel_policy_versions', 'fiscal_evidence_captures', 'channel_policy_samples', 'policy_approvals', 'policy_decision_events']) {
       await db.raw(`DROP TRIGGER IF EXISTS "${table}_validate_insert" ON "${table}"`);
       await db.raw(`CREATE TRIGGER "${table}_validate_insert" BEFORE INSERT ON "${table}" FOR EACH ROW EXECUTE FUNCTION unified_policy_validate_row()`);
     }
@@ -690,6 +709,7 @@ async function ensureUnifiedPolicyIntegrityTriggers() {
     ['fiscal_evidence_captures_validate_company', 'fiscal_evidence_captures', `NOT EXISTS (SELECT 1 FROM listings l WHERE l.id = NEW.listing_id AND l.company_id = NEW.company_id)`, 'Evidence listing must belong to company'],
     ['channel_policy_samples_validate_tuple', 'channel_policy_samples', `NOT EXISTS (SELECT 1 FROM channel_policy_versions p JOIN fiscal_evidence_captures e ON e.id = NEW.evidence_capture_id WHERE p.id = NEW.policy_id AND p.policy_hash = NEW.policy_hash AND e.payload_sha256 = NEW.evidence_sha256 AND p.company_id = e.company_id AND p.listing_id = e.listing_id AND p.guesty_account_id = e.guesty_account_id AND p.platform_key = e.platform_key AND p.source_key = e.source_key AND p.currency = e.currency)`, 'Calibration evidence must match the exact policy tuple and hashes'],
     ['policy_approvals_validate_reference', 'policy_approvals', `(NEW.channel_policy_id IS NULL) = (NEW.takk_policy_id IS NULL) OR (NEW.channel_policy_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM channel_policy_versions p WHERE p.id = NEW.channel_policy_id AND p.policy_hash = NEW.policy_hash)) OR (NEW.takk_policy_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM takk_policy_versions p WHERE p.id = NEW.takk_policy_id AND p.policy_hash = NEW.policy_hash))`, 'Approval must reference exactly one policy with its exact hash'],
+    ['policy_decision_events_validate_reference', 'policy_decision_events', `(NEW.channel_policy_id IS NULL) = (NEW.takk_policy_id IS NULL) OR (NEW.channel_policy_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM channel_policy_versions p WHERE p.id = NEW.channel_policy_id AND p.policy_hash = NEW.policy_hash)) OR (NEW.takk_policy_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM takk_policy_versions p WHERE p.id = NEW.takk_policy_id AND p.policy_hash = NEW.policy_hash))`, 'Decision must reference exactly one policy with its exact hash'],
   ];
   for (const [name, table, predicate, message] of triggers) {
     await db.raw(`CREATE TRIGGER IF NOT EXISTS "${name}" BEFORE INSERT ON "${table}" WHEN ${predicate} BEGIN SELECT RAISE(ABORT, '${message}'); END`);

@@ -7,6 +7,7 @@ const { normalizeAndValidateGreekVat, normalizeCounterpart, normalizeSeries, val
 const { getAcceptanceMatrices } = require('./sandbox-acceptance-service');
 const { takkPolicyHash } = require('./takk-policy-service');
 const { channelPolicyHash } = require('./unified-channel-policy-service');
+const { approvedPolicyIds } = require('./policy-decision-service');
 
 function issue(code, message, scope = 'runtime') {
   return { code, message, scope };
@@ -104,6 +105,10 @@ async function getReadiness({ companyId = null } = {}) {
     listIntegrationChecks(scopedCompanyId === null ? undefined : { companyId: scopedCompanyId }),
   ]);
   const checks = allChecks;
+  const [approvedChannelPolicyIds, approvedTakkPolicyIds] = await Promise.all([
+    approvedPolicyIds(channelPolicies, 'channel'),
+    approvedPolicyIds(takkPolicies, 'takk'),
+  ]);
   const acceptance = await getAcceptanceMatrices(companies);
   const issues = [];
   const freshAfter = Date.now() - 24 * 60 * 60 * 1000;
@@ -168,13 +173,13 @@ async function getReadiness({ companyId = null } = {}) {
     if (counterpartError) issues.push(issue('default_tpy_counterpart', `${listing.listing_id_guesty}: ${counterpartError}`, scope));
 
     const activeTakk = takkPolicies.filter((policy) => Number(policy.listing_id) === Number(listing.id)
-      && policy.status === 'approved' && String(policy.valid_from) <= today && (!policy.valid_to || String(policy.valid_to) >= today));
+      && approvedTakkPolicyIds.has(Number(policy.id)) && String(policy.valid_from) <= today && (!policy.valid_to || String(policy.valid_to) >= today));
     if (activeTakk.length !== 1) {
       issues.push(issue('takk_policy_missing', `${listing.listing_id_guesty}: απαιτείται ακριβώς μία εγκεκριμένη TAKK policy για την τρέχουσα περίοδο`, scope));
     }
   }
 
-  for (const policy of takkPolicies.filter((row) => row.status === 'approved')) {
+  for (const policy of takkPolicies.filter((row) => approvedTakkPolicyIds.has(Number(row.id)))) {
     const scope = `takk-policy:${policy.id}`;
     try {
       if (takkPolicyHash(policy) !== policy.policy_hash) throw new Error('policy hash does not match configuration');
@@ -237,7 +242,7 @@ async function getReadiness({ companyId = null } = {}) {
       issues.push(issue('financial_profile_missing', `${channel.listing_id_guesty}: λείπει εγκεκριμένο profile ποσών για ${channel.platform_key} / ${channel.source_key}`, scope));
     }
     const channelPoliciesForTuple = channelPolicies.filter((policy) => Number(policy.listing_id) === Number(channel.listing_id)
-      && policy.status === 'approved' && policy.platform_key === channel.platform_key && policy.source_key === channel.source_key
+      && approvedChannelPolicyIds.has(Number(policy.id)) && policy.platform_key === channel.platform_key && policy.source_key === channel.source_key
       && String(policy.guesty_account_id) === String(process.env.GUESTY_ACCOUNT_ID || '')
       && String(policy.currency || 'EUR') === 'EUR'
       && (!policy.valid_from || String(policy.valid_from) <= today) && (!policy.valid_to || String(policy.valid_to) >= today));

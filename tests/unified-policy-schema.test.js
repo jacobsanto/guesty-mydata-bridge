@@ -110,6 +110,17 @@ test('fiscal evidence and approvals are append-only', async () => {
     db('policy_approvals').where({ id: approvalId }).update({ actor_id: 'changed' }),
     /immutable and append-only/,
   );
+  const [decisionId] = await db('policy_decision_events').insert({
+    channel_policy_id: channelPolicyId,
+    policy_hash: 'a'.repeat(64),
+    decision: 'approved',
+    actor_id: 'policy-authority:test',
+    reason: 'Fixture approval decision',
+  });
+  await assert.rejects(
+    db('policy_decision_events').where({ id: decisionId }).update({ decision: 'suspended' }),
+    /immutable and append-only/,
+  );
 });
 
 test('cross-tenant, cross-tuple and wrong-hash evidence fail closed', async () => {
@@ -145,6 +156,15 @@ test('cross-tenant, cross-tuple and wrong-hash evidence fail closed', async () =
       channel_policy_id: channelPolicyId,
       policy_hash: 'f'.repeat(64),
       approval_role: 'technical', actor_id: 'engineer:test',
+    }),
+    /exactly one policy with its exact hash/,
+  );
+  await assert.rejects(
+    db('policy_decision_events').insert({
+      channel_policy_id: channelPolicyId,
+      policy_hash: 'f'.repeat(64),
+      decision: 'approved',
+      actor_id: 'policy-authority:test',
     }),
     /exactly one policy with its exact hash/,
   );

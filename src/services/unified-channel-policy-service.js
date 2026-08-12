@@ -5,6 +5,7 @@ const { db } = require('../database');
 const { normalizeCounterpart, normalizeSeries } = require('../validation/fiscal-fields');
 const { evaluateFolio, normalizeChannelKey, validateLineRules } = require('./financial-rule-engine');
 const { assertSingleStayFiscalFolio } = require('./financial-profile-service');
+const { approvedPolicyIds, assertPolicyDecisionApproved } = require('./policy-decision-service');
 
 function policyError(message, status = 409, code = 'UNIFIED_CHANNEL_POLICY_BLOCKED') {
   return Object.assign(new Error(message), { status, code });
@@ -100,15 +101,17 @@ async function resolveApprovedUnifiedChannelPolicy({ reservation, billingContext
   if (currency !== 'EUR') throw policyError(`Guesty reservation currency ${currency} is not supported for unified policy issuance`);
   let query = executor('channel_policy_versions').where({
     company_id: billingContext.company_id, listing_id: billingContext.listing_id,
-    guesty_account_id: requiredGuestyAccountId(reservation, guestyAccountId), platform_key: platformKey, source_key: sourceKey,
-    currency, status: 'approved',
+    guesty_account_id: requiredGuestyAccountId(reservation, guestyAccountId), platform_key: platformKey, source_key: sourceKey, currency,
   }).orderBy('version', 'desc');
   if (lock && executor.client.config.client === 'pg') query = query.forUpdate();
-  const candidates = (await query).filter((candidate) => activeOnDate(candidate, issueDate));
+  const policies = (await query).filter((candidate) => activeOnDate(candidate, issueDate));
+  const approved = await approvedPolicyIds(policies, 'channel', executor);
+  const candidates = policies.filter((candidate) => approved.has(Number(candidate.id)));
   if (candidates.length !== 1) {
     throw policyError(`Expected exactly one approved unified policy for ${platformKey} / ${sourceKey}; found ${candidates.length}`);
   }
   const policy = hydratePolicy(candidates[0]);
+  await assertPolicyDecisionApproved(policy, 'channel', executor, { lock });
   if (channelPolicyHash(policy) !== policy.policy_hash) throw policyError('Unified policy hash does not match its fiscal configuration', 409, 'UNIFIED_CHANNEL_POLICY_HASH_MISMATCH');
   if (policy.gross_strategy !== 'folio_items_sum') throw policyError(`Unsupported unified gross strategy ${policy.gross_strategy}`);
   try { policy.line_rules = validateLineRules(policy.line_rules); } catch (error) { throw policyError(`Unified policy line rules are invalid: ${error.message}`); }

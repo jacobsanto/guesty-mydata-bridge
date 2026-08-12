@@ -90,6 +90,9 @@ async function insertReadyTakkPolicy(company, listing) {
     { takk_policy_id: policyId, policy_hash: policy.policy_hash, approval_role: 'accounting', actor_id: 'accountant:test' },
     { takk_policy_id: policyId, policy_hash: policy.policy_hash, approval_role: 'technical', actor_id: 'engineer:test' },
   ]);
+  await db('policy_decision_events').insert({
+    takk_policy_id: policyId, policy_hash: policy.policy_hash, decision: 'approved', actor_id: 'policy-authority:test', reason: 'fixture approval',
+  });
 }
 
 test.before(async () => {

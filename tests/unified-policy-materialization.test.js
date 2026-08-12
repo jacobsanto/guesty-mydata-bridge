@@ -65,6 +65,9 @@ async function seedApprovedPolicy() {
     { channel_policy_id: policyId, policy_hash: policyHash, approval_role: 'accounting', actor_id: 'accountant:test' },
     { channel_policy_id: policyId, policy_hash: policyHash, approval_role: 'technical', actor_id: 'engineer:test' },
   ]);
+  await db('policy_decision_events').insert({
+    channel_policy_id: policyId, policy_hash: policyHash, decision: 'approved', actor_id: 'policy-authority:test', reason: 'fixture approval',
+  });
   return { policyId, policyHash };
 }
 
@@ -92,6 +95,9 @@ async function seedApprovedTakkPolicy() {
     { takk_policy_id: policyId, policy_hash: policyHash, approval_role: 'accounting', actor_id: 'accountant:test' },
     { takk_policy_id: policyId, policy_hash: policyHash, approval_role: 'technical', actor_id: 'engineer:test' },
   ]);
+  await db('policy_decision_events').insert({
+    takk_policy_id: policyId, policy_hash: policyHash, decision: 'approved', actor_id: 'policy-authority:test', reason: 'fixture approval',
+  });
   return { policyId, policyHash };
 }
 
