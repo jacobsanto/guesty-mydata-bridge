@@ -114,6 +114,7 @@ test('fiscal evidence and approvals are append-only', async () => {
     channel_policy_id: channelPolicyId,
     policy_hash: 'a'.repeat(64),
     decision: 'approved',
+    idempotency_key: 'fixture-schema-decision',
     actor_id: 'policy-authority:test',
     reason: 'Fixture approval decision',
   });
@@ -164,6 +165,7 @@ test('cross-tenant, cross-tuple and wrong-hash evidence fail closed', async () =
       channel_policy_id: channelPolicyId,
       policy_hash: 'f'.repeat(64),
       decision: 'approved',
+      idempotency_key: 'fixture-schema-decision-wrong-hash',
       actor_id: 'policy-authority:test',
     }),
     /exactly one policy with its exact hash/,

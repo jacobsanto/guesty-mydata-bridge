@@ -104,7 +104,11 @@ function validateRuntimeConfig(env = process.env) {
   }
 
   if (env.NODE_ENV === 'production') {
-    for (const name of ['ADMIN_API_TOKEN', 'DATA_ENCRYPTION_KEY', 'GUESTY_WEBHOOK_SECRET', 'GUESTY_CLIENT_ID', 'GUESTY_CLIENT_SECRET', 'GUESTY_ACCOUNT_ID']) required(name);
+    for (const name of [
+      'ADMIN_API_TOKEN', 'POLICY_ACCOUNTING_APPROVER_TOKEN', 'POLICY_ACCOUNTING_ACTOR',
+      'POLICY_TECHNICAL_APPROVER_TOKEN', 'POLICY_TECHNICAL_ACTOR', 'DATA_ENCRYPTION_KEY',
+      'GUESTY_WEBHOOK_SECRET', 'GUESTY_CLIENT_ID', 'GUESTY_CLIENT_SECRET', 'GUESTY_ACCOUNT_ID',
+    ]) required(name);
     if ((env.DB_CLIENT || 'better-sqlite3') !== 'pg') errors.push('DB_CLIENT=pg is required in production');
     if (!env.DATABASE_URL) {
       for (const name of ['DB_HOST', 'DB_NAME', 'DB_USER', 'DB_PASSWORD']) required(name);
@@ -120,6 +124,11 @@ function validateRuntimeConfig(env = process.env) {
       if (previousKey.length === 32 && key.length === 32 && previousKey.equals(key)) errors.push('DATA_ENCRYPTION_KEY_PREVIOUS must differ from DATA_ENCRYPTION_KEY');
     }
     if (String(env.ADMIN_API_TOKEN || '').length < 32) errors.push('ADMIN_API_TOKEN must contain at least 32 characters in production');
+    for (const name of ['POLICY_ACCOUNTING_APPROVER_TOKEN', 'POLICY_TECHNICAL_APPROVER_TOKEN']) {
+      if (String(env[name] || '').length < 32) errors.push(`${name} must contain at least 32 characters in production`);
+    }
+    const approvalTokens = [env.ADMIN_API_TOKEN, env.POLICY_ACCOUNTING_APPROVER_TOKEN, env.POLICY_TECHNICAL_APPROVER_TOKEN].filter(Boolean);
+    if (new Set(approvalTokens).size !== approvalTokens.length) errors.push('ADMIN and policy approver tokens must be distinct in production');
     if (env.ALLOW_INSECURE_DEV === 'true') errors.push('ALLOW_INSECURE_DEV must not be enabled in production');
   }
 

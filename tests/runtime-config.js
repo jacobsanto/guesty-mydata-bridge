@@ -32,18 +32,24 @@ assert.throws(() => validateRuntimeConfig({ NODE_ENV: 'production', DB_CLIENT: '
 assert.throws(() => validateRuntimeConfig({
   NODE_ENV: 'production', DB_CLIENT: 'pg', DATABASE_URL: 'postgres://db/app', DB_SSL: 'false',
   ADMIN_API_TOKEN: 'x'.repeat(32), DATA_ENCRYPTION_KEY: Buffer.alloc(32).toString('base64'),
+  POLICY_ACCOUNTING_APPROVER_TOKEN: 'a'.repeat(32), POLICY_ACCOUNTING_ACTOR: 'accountant:test',
+  POLICY_TECHNICAL_APPROVER_TOKEN: 't'.repeat(32), POLICY_TECHNICAL_ACTOR: 'engineer:test',
   GUESTY_WEBHOOK_SECRET: 'x', GUESTY_CLIENT_ID: 'x', GUESTY_CLIENT_SECRET: 'x',
 }), /Verified PostgreSQL TLS is required/);
 
 assert.strictEqual(validateRuntimeConfig({
   NODE_ENV: 'production', DB_CLIENT: 'pg', DATABASE_URL: 'postgres://db/app', DB_SSL: 'verify-full',
   ADMIN_API_TOKEN: 'x'.repeat(32), DATA_ENCRYPTION_KEY: Buffer.alloc(32).toString('base64'),
+  POLICY_ACCOUNTING_APPROVER_TOKEN: 'a'.repeat(32), POLICY_ACCOUNTING_ACTOR: 'accountant:test',
+  POLICY_TECHNICAL_APPROVER_TOKEN: 't'.repeat(32), POLICY_TECHNICAL_ACTOR: 'engineer:test',
   GUESTY_WEBHOOK_SECRET: 'x', GUESTY_CLIENT_ID: 'x', GUESTY_CLIENT_SECRET: 'x', GUESTY_ACCOUNT_ID: 'account-x',
 }), true);
 
 assert.throws(() => validateRuntimeConfig({
   NODE_ENV: 'production', DB_CLIENT: 'pg', DATABASE_URL: 'postgres://db/app', DB_SSL: 'verify-full',
   ADMIN_API_TOKEN: 'x'.repeat(32), DATA_ENCRYPTION_KEY: Buffer.alloc(32).toString('base64'),
+  POLICY_ACCOUNTING_APPROVER_TOKEN: 'a'.repeat(32), POLICY_ACCOUNTING_ACTOR: 'accountant:test',
+  POLICY_TECHNICAL_APPROVER_TOKEN: 't'.repeat(32), POLICY_TECHNICAL_ACTOR: 'engineer:test',
   DATA_ENCRYPTION_KEY_PREVIOUS: Buffer.alloc(32).toString('base64'),
   GUESTY_WEBHOOK_SECRET: 'x', GUESTY_CLIENT_ID: 'x', GUESTY_CLIENT_SECRET: 'x', GUESTY_ACCOUNT_ID: 'account-x',
 }), /must differ/);

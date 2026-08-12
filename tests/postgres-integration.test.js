@@ -112,7 +112,7 @@ if (process.env.POSTGRES_INTEGRATION_TEST !== 'true') {
       { takk_policy_id: policy.id, policy_hash: policy.policy_hash, approval_role: 'technical', actor_id: 'engineer:test' },
     ]);
     await db('policy_decision_events').insert({
-      takk_policy_id: policy.id, policy_hash: policy.policy_hash, decision: 'approved', actor_id: 'policy-authority:test', reason: 'fixture approval',
+      takk_policy_id: policy.id, policy_hash: policy.policy_hash, decision: 'approved', idempotency_key: `fixture-pg-takk-${policy.id}`, actor_id: 'policy-authority:test', reason: 'fixture approval',
     });
   }
 

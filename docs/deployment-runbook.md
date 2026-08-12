@@ -10,6 +10,11 @@ Keep secrets in the platform secret manager or in an uncommitted `.env` file.
 Never put them in Git, a ticket, chat, image, log, or database backup note.
 
 - `ADMIN_API_TOKEN`: a unique high-entropy bearer token for the admin API.
+- `POLICY_ACCOUNTING_APPROVER_TOKEN` and `POLICY_TECHNICAL_APPROVER_TOKEN`:
+  two separate high-entropy credentials, each bound to a named actor through
+  `POLICY_ACCOUNTING_ACTOR` and `POLICY_TECHNICAL_ACTOR`. They must differ from
+  each other and from the admin token. A policy cannot become production-ready
+  without both immutable approvals.
 - `DATA_ENCRYPTION_KEY`: exactly 32 random bytes, base64 encoded.
 - `GUESTY_CLIENT_ID`, `GUESTY_CLIENT_SECRET`, `GUESTY_WEBHOOK_SECRET`, and the
   stable `GUESTY_ACCOUNT_ID` from the connected Guesty account.
@@ -26,7 +31,8 @@ openssl rand -base64 48
 openssl rand -base64 32
 ```
 
-The first value can be used for `ADMIN_API_TOKEN`; the second is the
+Use separate generated values for the admin, accounting-approval and
+technical-approval tokens; the second command produces the
 `DATA_ENCRYPTION_KEY`.
 
 ## External production prerequisites
@@ -67,16 +73,21 @@ production. Before activation, the operator must have:
    `https://<render-host>/api/webhook/guesty-reservation`
 
 9. Stage representative Guesty reservations for every observed
-   `listing/platform/source`. Create a draft financial profile for each exact
-   combination, classify every Guest Folio line explicitly, and calibrate it
-   against accountant-confirmed taxable gross amounts. Cover at least the normal,
+   `listing/platform/source`. Create a draft unified policy for each exact
+   combination, classify every Guest Folio line explicitly, and capture three
+   final Welcome/myDATA samples with their actual MARK, PDF SHA-256, document
+   type, series and taxable gross. The bridge recomputes each amount from the
+   immutable staged Guesty folio and permits approval only at exact zero-cent
+   difference. Create a separate TAKK policy and capture an exact low, high and
+   seasonal-boundary 8.2 example. Cover at least the normal,
    discount, additional-fee, tax, alteration and cancellation cases relevant to
    that channel. Include Airbnb Resolution Center cases when they occur.
    Treat Airbnb, Booking.com, Guesty Booking Engine and every other OTA/direct
    source as independent channels. Never copy an approved profile to a channel
    merely because its line names or displayed total look similar.
-10. Approve only profiles whose required samples all pass. Unknown or ambiguous
-    lines must remain blocked; do not add catch-all include rules.
+10. Have the named accounting and technical owners approve only policies whose
+    required samples all pass, then make the immutable admin decision. Unknown
+    or ambiguous lines must remain blocked; do not add catch-all include rules.
     Replace any legacy billing rules that identify only `source` with exact
     `platform/source` rules; readiness deliberately blocks while legacy rules
     remain active.

@@ -89,6 +89,9 @@ app.get('/health', async (_req, res) => {
 // Guesty authenticates with its own Svix/HMAC signature and must remain outside
 // the admin bearer middleware.
 app.use('/api', guestyWebhook);
+// Policy approval uses deliberately scoped accounting/technical credentials.
+// It must remain outside the broad admin middleware below.
+app.use('/api', policiesRoutes);
 app.use('/api', adminAuth, companiesRoutes);
 app.use('/api', adminAuth, listingsRoutes);
 app.use('/api', adminAuth, invoicesRoutes);
@@ -100,7 +103,6 @@ app.use('/api', adminAuth, reservationsRoutes);
 app.use('/api', adminAuth, financialProfilesRoutes);
 app.use('/api', adminAuth, sandboxSignoffsRoutes);
 app.use('/api', adminAuth, sandboxAcceptanceRoutes);
-app.use('/api', adminAuth, policiesRoutes);
 
 // -------------------------------------------------------------------
 // Global error handler

@@ -614,6 +614,7 @@ async function ensureUnifiedPolicyTables() {
       t.integer('takk_policy_id').unsigned().nullable();
       t.string('policy_hash', 64).notNullable();
       t.enum('decision', ['approved', 'suspended', 'blocked']).notNullable();
+      t.string('idempotency_key', 100).notNullable().unique();
       t.string('actor_id', 200).notNullable();
       t.text('reason').nullable();
       t.timestamp('decided_at').notNullable().defaultTo(db.fn.now());
@@ -623,6 +624,10 @@ async function ensureUnifiedPolicyTables() {
       t.foreign('takk_policy_id').references('takk_policy_versions.id').onDelete('RESTRICT');
     });
     console.log('✅ Δημιουργήθηκε πίνακας: policy_decision_events');
+  }
+  else {
+    await ensureColumn('policy_decision_events', 'idempotency_key', (t) => t.string('idempotency_key', 100).nullable());
+    await ensureUniqueIndex('policy_decision_events', 'policy_decision_events_idempotency_uq', ['idempotency_key']);
   }
 
   if (!await db.schema.hasTable('takk_calibration_samples')) {
@@ -637,12 +642,23 @@ async function ensureUnifiedPolicyTables() {
       t.integer('delta_cents').notNullable();
       t.boolean('passed').notNullable();
       t.string('evidence_sha256', 64).notNullable();
+      t.string('reservation_id', 120).nullable();
+      t.string('historical_mark', 30).nullable();
+      t.string('historical_document_type', 4).nullable();
+      t.string('historical_series', 50).nullable();
+      t.string('historical_pdf_sha256', 64).nullable();
       t.string('accountant_reference', 200).nullable();
       t.timestamp('created_at').notNullable().defaultTo(db.fn.now());
       t.unique(['policy_id', 'scenario', 'evidence_sha256']);
       t.foreign('policy_id').references('takk_policy_versions.id').onDelete('RESTRICT');
     });
     console.log('✅ Δημιουργήθηκε πίνακας: takk_calibration_samples');
+  } else {
+    await ensureColumn('takk_calibration_samples', 'reservation_id', (t) => t.string('reservation_id', 120).nullable());
+    await ensureColumn('takk_calibration_samples', 'historical_mark', (t) => t.string('historical_mark', 30).nullable());
+    await ensureColumn('takk_calibration_samples', 'historical_document_type', (t) => t.string('historical_document_type', 4).nullable());
+    await ensureColumn('takk_calibration_samples', 'historical_series', (t) => t.string('historical_series', 50).nullable());
+    await ensureColumn('takk_calibration_samples', 'historical_pdf_sha256', (t) => t.string('historical_pdf_sha256', 64).nullable());
   }
 
   await ensureUnifiedPolicyIntegrityTriggers();
