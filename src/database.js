@@ -1,33 +1,17 @@
 'use strict';
 
 require('dotenv').config();
+const crypto = require('crypto');
 const knex = require('knex');
-const path = require('path');
+const { insertedId } = require('./database-utils');
+const { encryptSecret, reencryptSecret, isEncrypted, companySecretContext } = require('./security/credentials');
+const { databaseConfig } = require('./config/runtime');
 
 // -------------------------------------------------------------------
 // Knex config — SQLite τώρα, PostgreSQL με 1 αλλαγή στο DB_CLIENT
 // Για PostgreSQL: DB_CLIENT=pg, DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD
 // -------------------------------------------------------------------
-const db = knex({
-  client: process.env.DB_CLIENT || 'better-sqlite3',
-  connection: process.env.DB_CLIENT === 'pg'
-    ? {
-        host: process.env.DB_HOST || 'localhost',
-        port: parseInt(process.env.DB_PORT || '5432', 10),
-        database: process.env.DB_NAME || 'guesty_mydata',
-        user: process.env.DB_USER,
-        password: process.env.DB_PASSWORD,
-      }
-    : {
-        filename: path.resolve(
-          process.env.DB_PATH || path.join(__dirname, '..', 'data', 'bridge.db')
-        ),
-      },
-  useNullAsDefault: true,
-  pool: process.env.DB_CLIENT === 'pg'
-    ? { min: 2, max: 10 }
-    : { min: 1, max: 1 },
-});
+const db = knex(databaseConfig());
 
 // -------------------------------------------------------------------
 // Helpers
@@ -44,18 +28,756 @@ async function ensureColumn(tableName, columnName, builder) {
   }
 }
 
+async function ensureUniqueIndex(tableName, indexName, columns) {
+  const identifiers = [tableName, indexName, ...columns];
+  if (!identifiers.every((value) => /^[a-z0-9_]+$/.test(value))) {
+    throw new Error('Unsafe database identifier while ensuring a unique index');
+  }
+  const duplicate = await db(tableName)
+    .select(columns)
+    .count({ duplicate_count: '*' })
+    .groupBy(columns)
+    .havingRaw('COUNT(*) > 1')
+    .first();
+  if (duplicate) {
+    throw new Error(`Cannot create ${indexName}: duplicate fiscal identity rows must be resolved first`);
+  }
+  const quotedColumns = columns.map((column) => `"${column}"`).join(', ');
+  await db.raw(`CREATE UNIQUE INDEX IF NOT EXISTS "${indexName}" ON "${tableName}" (${quotedColumns})`);
+}
+
+async function reconcileDocumentSequences() {
+  const maxima = await db('fiscal_documents')
+    .select('company_id', 'document_type', 'series')
+    .max({ last_number: 'aa' })
+    .groupBy('company_id', 'document_type', 'series');
+  for (const row of maxima) {
+    const identity = {
+      company_id: row.company_id,
+      document_type: row.document_type,
+      series: row.series,
+    };
+    const lastNumber = Number(row.last_number);
+    await db('document_sequences').insert({ ...identity, last_number: lastNumber })
+      .onConflict(['company_id', 'document_type', 'series']).ignore();
+    await db('document_sequences').where(identity).where('last_number', '<', lastNumber).update({
+      last_number: lastNumber,
+      updated_at: db.fn.now(),
+    });
+  }
+}
+
 // -------------------------------------------------------------------
 // Schema — normalized model
 // companies: 1 row per legal entity / ΑΦΜ
 // listings: 1 row per Guesty listing, mapped to company
 // invoices: invoice transmission history
 // -------------------------------------------------------------------
+let schemaInitPromise = null;
+
 async function initSchema() {
+  if (schemaInitPromise) return schemaInitPromise;
+  schemaInitPromise = runSchemaInitialization();
+  try {
+    return await schemaInitPromise;
+  } finally {
+    schemaInitPromise = null;
+  }
+}
+
+async function runSchemaInitialization() {
+  if (db.client.config.client !== 'pg') return initializeSchemaObjects();
+  const connection = await db.client.acquireConnection();
+  try {
+    await db.raw('SELECT pg_advisory_lock(?)', [1732584194]).connection(connection);
+    return await initializeSchemaObjects();
+  } finally {
+    try { await db.raw('SELECT pg_advisory_unlock(?)', [1732584194]).connection(connection); } finally {
+      await db.client.releaseConnection(connection);
+    }
+  }
+}
+
+async function initializeSchemaObjects() {
   await ensureCompaniesTable();
   await ensureListingsTable();
+  await ensureListingBillingRulesTable();
+  await ensureListingChannelBillingRulesTable();
+  await ensureFinancialProfilesTables();
+  await ensureUnifiedPolicyTables();
+  await ensureReservationSnapshotsTable();
   await ensureLegacyTenantsTable();
   await ensureInvoicesTable();
+  await ensureFiscalDocumentsTable();
+  await ensureFiscalPdfArtifactsTable();
+  await ensureCancellationResolutionEventsTable();
+  await ensureDocumentSequencesTable();
+  await ensureDailyCloseTables();
+  await ensureIntegrationChecksTable();
+  await ensureAadeCredentialState();
+  await ensureIntegrationTokensTable();
+  await ensureSandboxSignoffsTable();
+  await ensureSandboxAcceptanceTables();
+  await ensureSyncCursorsTable();
+  await ensureGuestyReconciliationInboxTable();
+  await ensureUniqueIndex(
+    'fiscal_documents',
+    'fiscal_documents_company_type_series_aa_uq',
+    ['company_id', 'document_type', 'series', 'aa'],
+  );
+  await ensureUniqueIndex(
+    'document_sequences',
+    'document_sequences_company_type_series_uq',
+    ['company_id', 'document_type', 'series'],
+  );
+  await ensureUniqueIndex(
+    'daily_close_runs',
+    'daily_close_runs_company_date_uq',
+    ['company_id', 'business_date'],
+  );
+  // An upgraded database can already contain documents while its sequence
+  // table is absent or behind. Reconcile to the highest issued AA before any
+  // worker is allowed to materialize another fiscal document.
+  await reconcileDocumentSequences();
   await migrateLegacyTenantsToNormalizedModel();
+  await migrateCredentialsToEncryptedStorage();
+}
+
+async function ensureSyncCursorsTable() {
+  if (await db.schema.hasTable('sync_cursors')) return;
+  await db.schema.createTable('sync_cursors', (t) => {
+    t.string('provider', 40).notNullable();
+    t.string('cursor_key', 80).notNullable();
+    t.text('cursor_value').notNullable();
+    t.timestamps(true, true);
+    t.primary(['provider', 'cursor_key']);
+  });
+  console.log('✅ Δημιουργήθηκε πίνακας: sync_cursors');
+}
+
+async function ensureGuestyReconciliationInboxTable() {
+  if (await db.schema.hasTable('guesty_reconciliation_inbox')) return;
+  await db.schema.createTable('guesty_reconciliation_inbox', (t) => {
+    t.increments('id').primary();
+    t.string('reservation_id', 120).notNullable().unique();
+    t.string('listing_id', 120).nullable().index();
+    t.string('status', 20).notNullable().defaultTo('unresolved').index();
+    t.string('reason', 40).notNullable();
+    t.integer('attempts').notNullable().defaultTo(1);
+    t.text('last_error').nullable();
+    t.timestamp('first_seen_at').notNullable().defaultTo(db.fn.now());
+    t.timestamp('last_seen_at').notNullable().defaultTo(db.fn.now());
+    t.timestamp('resolved_at').nullable();
+    t.timestamps(true, true);
+  });
+  console.log('✅ Δημιουργήθηκε πίνακας: guesty_reconciliation_inbox');
+}
+
+async function ensureCancellationResolutionEventsTable() {
+  if (await db.schema.hasTable('cancellation_resolution_events')) return;
+  await db.schema.createTable('cancellation_resolution_events', (t) => {
+    t.increments('id').primary();
+    t.string('idempotency_key', 100).notNullable().unique();
+    t.integer('document_id').unsigned().notNullable();
+    t.integer('company_id').unsigned().notNullable();
+    t.string('decision', 30).notNullable();
+    t.string('from_status', 20).notNullable();
+    t.string('to_status', 20).notNullable();
+    t.string('invoice_mark', 30).notNullable();
+    t.text('prior_cancellation_error').nullable();
+    t.boolean('prior_retryable').notNullable();
+    t.boolean('prior_uncertain').notNullable();
+    t.timestamp('prior_attempt_at').nullable();
+    t.text('reason').notNullable();
+    t.string('resolved_by', 200).notNullable();
+    t.string('admin_key_fingerprint', 64).notNullable();
+    t.string('payload_hash', 64).notNullable();
+    t.timestamp('created_at').notNullable().defaultTo(db.fn.now());
+    t.foreign('document_id').references('fiscal_documents.id').onDelete('RESTRICT');
+    t.foreign('company_id').references('companies.id').onDelete('RESTRICT');
+  });
+  console.log('✅ Δημιουργήθηκε πίνακας: cancellation_resolution_events');
+}
+
+async function ensureSandboxSignoffsTable() {
+  if (await db.schema.hasTable('sandbox_signoffs')) {
+    await ensureColumn('sandbox_signoffs', 'issuer_vat', (t) => t.string('issuer_vat', 9).nullable());
+    await ensureColumn('sandbox_signoffs', 'credential_binding_sha256', (t) => t.string('credential_binding_sha256', 64).nullable());
+    await ensureColumn('sandbox_signoffs', 'primary_xml_sha256', (t) => t.string('primary_xml_sha256', 64).nullable());
+    await ensureColumn('sandbox_signoffs', 'takk_xml_sha256', (t) => t.string('takk_xml_sha256', 64).nullable());
+    await ensureColumn('sandbox_signoffs', 'primary_response_sha256', (t) => t.string('primary_response_sha256', 64).nullable());
+    await ensureColumn('sandbox_signoffs', 'takk_response_sha256', (t) => t.string('takk_response_sha256', 64).nullable());
+    await ensureColumn('sandbox_signoffs', 'primary_uid_sha256', (t) => t.string('primary_uid_sha256', 64).nullable());
+    await ensureColumn('sandbox_signoffs', 'takk_uid_sha256', (t) => t.string('takk_uid_sha256', 64).nullable());
+    return;
+  }
+  await db.schema.createTable('sandbox_signoffs', (t) => {
+    t.increments('id').primary();
+    t.integer('company_id').unsigned().notNullable();
+    t.string('reservation_id', 120).notNullable();
+    t.string('issuer_vat', 9).notNullable();
+    t.string('credential_binding_sha256', 64).notNullable();
+    t.integer('primary_document_id').unsigned().notNullable();
+    t.integer('takk_document_id').unsigned().notNullable();
+    t.string('primary_mark', 30).notNullable();
+    t.string('takk_mark', 30).notNullable();
+    t.string('primary_pdf_sha256', 64).notNullable();
+    t.string('takk_pdf_sha256', 64).notNullable();
+    t.string('primary_xml_sha256', 64).notNullable();
+    t.string('takk_xml_sha256', 64).notNullable();
+    t.string('primary_response_sha256', 64).notNullable();
+    t.string('takk_response_sha256', 64).notNullable();
+    t.string('primary_uid_sha256', 64).nullable();
+    t.string('takk_uid_sha256', 64).nullable();
+    t.string('approved_by', 200).notNullable();
+    t.text('approval_notes').nullable();
+    t.timestamp('approved_at').notNullable().defaultTo(db.fn.now());
+    t.timestamps(true, true);
+    t.unique(['company_id', 'reservation_id']);
+    t.unique(['primary_document_id']);
+    t.unique(['takk_document_id']);
+    t.foreign('company_id').references('companies.id').onDelete('RESTRICT');
+    t.foreign('primary_document_id').references('fiscal_documents.id').onDelete('RESTRICT');
+    t.foreign('takk_document_id').references('fiscal_documents.id').onDelete('RESTRICT');
+  });
+  console.log('✅ Δημιουργήθηκε πίνακας: sandbox_signoffs');
+}
+
+async function ensureSandboxAcceptanceTables() {
+  if (!await db.schema.hasTable('sandbox_acceptance_runs')) {
+    await db.schema.createTable('sandbox_acceptance_runs', (t) => {
+      t.increments('id').primary();
+      t.integer('company_id').unsigned().notNullable();
+      t.string('issuer_vat', 9).notNullable();
+      t.string('credential_binding_sha256', 64).notNullable();
+      t.string('contract_version', 80).notNullable();
+      t.string('approved_by', 200).notNullable();
+      t.text('approval_notes').nullable();
+      t.timestamp('approved_at').notNullable().defaultTo(db.fn.now());
+      t.timestamps(true, true);
+      t.foreign('company_id').references('companies.id').onDelete('RESTRICT');
+    });
+    console.log('✅ Δημιουργήθηκε πίνακας: sandbox_acceptance_runs');
+  }
+
+  if (!await db.schema.hasTable('sandbox_acceptance_artifacts')) {
+    await db.schema.createTable('sandbox_acceptance_artifacts', (t) => {
+      t.increments('id').primary();
+      t.integer('run_id').unsigned().notNullable();
+      t.string('capability', 40).notNullable();
+      t.integer('document_id').unsigned().notNullable();
+      t.integer('paired_document_id').unsigned().nullable();
+      t.integer('related_document_id').unsigned().nullable();
+      t.string('document_type', 10).notNullable();
+      t.string('reservation_id', 120).notNullable();
+      t.string('invoice_mark', 30).notNullable();
+      t.string('paired_mark', 30).nullable();
+      t.string('cancellation_mark', 30).nullable();
+      t.text('evidence_json').notNullable();
+      t.timestamps(true, true);
+      t.unique(['run_id', 'capability']);
+      t.foreign('run_id').references('sandbox_acceptance_runs.id').onDelete('RESTRICT');
+      t.foreign('document_id').references('fiscal_documents.id').onDelete('RESTRICT');
+      t.foreign('paired_document_id').references('fiscal_documents.id').onDelete('RESTRICT');
+      t.foreign('related_document_id').references('fiscal_documents.id').onDelete('RESTRICT');
+    });
+    console.log('✅ Δημιουργήθηκε πίνακας: sandbox_acceptance_artifacts');
+  }
+}
+
+async function ensureIntegrationChecksTable() {
+  if (await db.schema.hasTable('integration_checks')) return;
+  await db.schema.createTable('integration_checks', (t) => {
+    t.increments('id').primary();
+    t.string('check_key', 120).notNullable().unique();
+    t.string('status', 20).notNullable();
+    t.string('environment', 30).nullable();
+    t.text('message').nullable();
+    t.timestamp('checked_at').notNullable().defaultTo(db.fn.now());
+    t.timestamps(true, true);
+  });
+  console.log('✅ Δημιουργήθηκε πίνακας: integration_checks');
+}
+
+async function ensureIntegrationTokensTable() {
+  if (await db.schema.hasTable('integration_tokens')) return;
+  await db.schema.createTable('integration_tokens', (t) => {
+    t.string('provider', 40).primary();
+    t.string('credential_fingerprint', 64).notNullable();
+    t.text('encrypted_access_token').notNullable();
+    t.timestamp('expires_at').notNullable();
+    t.timestamps(true, true);
+  });
+  console.log('✅ Δημιουργήθηκε πίνακας: integration_tokens');
+}
+
+async function ensureReservationSnapshotsTable() {
+  if (await db.schema.hasTable('reservation_snapshots')) {
+    await ensureColumn('reservation_snapshots', 'invoice_type_override', (t) => t.string('invoice_type_override', 4).nullable());
+    await ensureColumn('reservation_snapshots', 'invoice_series_override', (t) => t.string('invoice_series_override', 50).nullable());
+    await ensureColumn('reservation_snapshots', 'counterpart_vat_override', (t) => t.string('counterpart_vat_override', 30).nullable());
+    await ensureColumn('reservation_snapshots', 'counterpart_country_override', (t) => t.string('counterpart_country_override', 2).nullable());
+    await ensureColumn('reservation_snapshots', 'counterpart_name_override', (t) => t.string('counterpart_name_override', 200).nullable());
+    await ensureColumn('reservation_snapshots', 'counterpart_branch_override', (t) => t.integer('counterpart_branch_override').nullable());
+    await ensureColumn('reservation_snapshots', 'fiscal_revision', (t) => t.integer('fiscal_revision').notNullable().defaultTo(0));
+    await ensureColumn('reservation_snapshots', 'review_resolution', (t) => t.text('review_resolution').nullable());
+    await ensureColumn('reservation_snapshots', 'reviewed_at', (t) => t.timestamp('reviewed_at').nullable());
+    await ensureColumn('reservation_snapshots', 'platform_key', (t) => t.string('platform_key', 100).nullable());
+    await ensureColumn('reservation_snapshots', 'source_key', (t) => t.string('source_key', 100).nullable());
+    await ensureColumn('reservation_snapshots', 'financial_status', (t) => t.string('financial_status', 30).notNullable().defaultTo('pending'));
+    await ensureColumn('reservation_snapshots', 'financial_profile_id', (t) => t.integer('financial_profile_id').unsigned().nullable());
+    await ensureColumn('reservation_snapshots', 'financial_profile_version', (t) => t.integer('financial_profile_version').unsigned().nullable());
+    await ensureColumn('reservation_snapshots', 'financial_profile_hash', (t) => t.string('financial_profile_hash', 64).nullable());
+    await ensureColumn('reservation_snapshots', 'financial_evidence', (t) => t.text('financial_evidence').nullable());
+    await ensureColumn('reservation_snapshots', 'financial_error', (t) => t.text('financial_error').nullable());
+    await ensureColumn('reservation_snapshots', 'generation', (t) => t.integer('generation').notNullable().defaultTo(1));
+    return;
+  }
+  await db.schema.createTable('reservation_snapshots', (t) => {
+    t.increments('id').primary();
+    t.string('reservation_id', 120).notNullable().unique();
+    t.integer('company_id').unsigned().notNullable();
+    t.integer('listing_id').unsigned().notNullable();
+    t.string('listing_id_guesty', 120).notNullable();
+    t.string('status', 40).nullable();
+    t.string('source', 100).nullable();
+    t.date('check_in').notNullable();
+    t.date('check_out').notNullable().index();
+    t.string('payload_hash', 64).notNullable();
+    t.text('normalized_payload').notNullable();
+    t.string('invoice_type_override', 4).nullable();
+    t.string('invoice_series_override', 50).nullable();
+    t.string('counterpart_vat_override', 30).nullable();
+    t.string('counterpart_country_override', 2).nullable();
+    t.string('counterpart_name_override', 200).nullable();
+    t.integer('counterpart_branch_override').nullable();
+    t.integer('fiscal_revision').notNullable().defaultTo(0);
+    t.text('review_resolution').nullable();
+    t.timestamp('reviewed_at').nullable();
+    t.string('platform_key', 100).nullable();
+    t.string('source_key', 100).nullable();
+    t.string('financial_status', 30).notNullable().defaultTo('pending');
+    t.integer('financial_profile_id').unsigned().nullable();
+    t.integer('financial_profile_version').unsigned().nullable();
+    t.string('financial_profile_hash', 64).nullable();
+    t.text('financial_evidence').nullable();
+    t.text('financial_error').nullable();
+    t.integer('generation').notNullable().defaultTo(1);
+    t.timestamp('materialized_at').nullable();
+    t.boolean('requires_review').notNullable().defaultTo(false);
+    t.text('last_error').nullable();
+    t.timestamps(true, true);
+    t.foreign('company_id').references('companies.id').onDelete('RESTRICT');
+    t.foreign('listing_id').references('listings.id').onDelete('RESTRICT');
+  });
+  console.log('✅ Δημιουργήθηκε πίνακας: reservation_snapshots');
+}
+
+async function ensureFinancialProfilesTables() {
+  if (!await db.schema.hasTable('financial_profiles')) {
+    await db.schema.createTable('financial_profiles', (t) => {
+      t.increments('id').primary();
+      t.integer('listing_id').unsigned().notNullable();
+      t.string('platform_key', 100).notNullable();
+      t.string('source_key', 100).notNullable();
+      t.integer('version').unsigned().notNullable();
+      t.enum('status', ['draft', 'approved', 'suspended']).notNullable().defaultTo('draft').index();
+      t.string('currency', 3).notNullable().defaultTo('EUR');
+      t.enum('strategy', ['folio_rules', 'reservation_total']).notNullable();
+      t.text('line_rules').notNullable().defaultTo('[]');
+      t.decimal('tolerance', 12, 2).notNullable().defaultTo(0);
+      t.integer('minimum_samples').unsigned().notNullable().defaultTo(3);
+      t.string('config_hash', 64).notNullable();
+      t.string('approved_by', 200).nullable();
+      t.text('approval_notes').nullable();
+      t.timestamp('approved_at').nullable();
+      t.timestamps(true, true);
+      t.unique(['listing_id', 'platform_key', 'source_key', 'version']);
+      t.foreign('listing_id').references('listings.id').onDelete('CASCADE');
+    });
+    console.log('✅ Δημιουργήθηκε πίνακας: financial_profiles');
+  }
+
+  if (!await db.schema.hasTable('financial_calibration_samples')) {
+    await db.schema.createTable('financial_calibration_samples', (t) => {
+      t.increments('id').primary();
+      t.integer('profile_id').unsigned().notNullable();
+      t.string('reservation_id', 120).notNullable();
+      t.decimal('expected_amount', 12, 2).notNullable();
+      t.decimal('computed_amount', 12, 2).notNullable();
+      t.decimal('delta_amount', 12, 2).notNullable();
+      t.boolean('passed').notNullable();
+      t.string('channel_key', 100).notNullable();
+      t.string('currency', 3).notNullable();
+      t.text('line_evidence').notNullable().defaultTo('[]');
+      t.string('payload_hash', 64).notNullable();
+      t.timestamp('captured_at').notNullable().defaultTo(db.fn.now());
+      t.timestamps(true, true);
+      t.unique(['profile_id', 'reservation_id']);
+      t.foreign('profile_id').references('financial_profiles.id').onDelete('CASCADE');
+    });
+    console.log('✅ Δημιουργήθηκε πίνακας: financial_calibration_samples');
+  }
+}
+
+async function ensureAppendOnlyTable(tableName, label) {
+  if (!/^[a-z0-9_]+$/.test(tableName)) throw new Error('Unsafe append-only table identifier');
+  if (db.client.config.client === 'pg') {
+    const functionName = `${tableName}_reject_mutation`;
+    await db.raw(`CREATE OR REPLACE FUNCTION "${functionName}"() RETURNS trigger AS $$
+      BEGIN
+        RAISE EXCEPTION '${label} are immutable and append-only' USING ERRCODE = '55000';
+      END;
+    $$ LANGUAGE plpgsql`);
+    await db.raw(`DO $$ BEGIN
+      IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = '${tableName}_no_update' AND tgrelid = '${tableName}'::regclass) THEN
+        CREATE TRIGGER "${tableName}_no_update" BEFORE UPDATE ON "${tableName}"
+          FOR EACH ROW EXECUTE FUNCTION "${functionName}"();
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = '${tableName}_no_delete' AND tgrelid = '${tableName}'::regclass) THEN
+        CREATE TRIGGER "${tableName}_no_delete" BEFORE DELETE ON "${tableName}"
+          FOR EACH ROW EXECUTE FUNCTION "${functionName}"();
+      END IF;
+    END $$`);
+    return;
+  }
+  await db.raw(`CREATE TRIGGER IF NOT EXISTS "${tableName}_no_update"
+    BEFORE UPDATE ON "${tableName}" BEGIN
+      SELECT RAISE(ABORT, '${label} are immutable and append-only');
+    END`);
+  await db.raw(`CREATE TRIGGER IF NOT EXISTS "${tableName}_no_delete"
+    BEFORE DELETE ON "${tableName}" BEGIN
+      SELECT RAISE(ABORT, '${label} are immutable and append-only');
+    END`);
+}
+
+async function ensureUnifiedPolicyTables() {
+  if (!await db.schema.hasTable('channel_policy_versions')) {
+    await db.schema.createTable('channel_policy_versions', (t) => {
+      t.increments('id').primary();
+      t.integer('company_id').unsigned().notNullable();
+      t.integer('listing_id').unsigned().notNullable();
+      t.string('guesty_account_id', 120).notNullable();
+      t.string('platform_key', 100).notNullable();
+      t.string('source_key', 100).notNullable();
+      t.string('currency', 3).notNullable().defaultTo('EUR');
+      t.integer('version').unsigned().notNullable();
+      t.enum('status', ['draft', 'blocked', 'accounting_review', 'technical_review', 'approved', 'suspended'])
+        .notNullable().defaultTo('draft').index();
+      t.enum('recipient_model', ['private_guest', 'approved_business_counterpart']).notNullable();
+      t.string('document_type', 4).notNullable();
+      t.string('series', 50).notNullable();
+      t.text('counterpart_json').nullable();
+      t.integer('vat_category').notNullable().defaultTo(2);
+      t.string('classification_category', 50).notNullable().defaultTo('category1_3');
+      t.string('classification_type', 50).notNullable();
+      t.enum('gross_strategy', ['folio_items_sum', 'overview_scalar_primary', 'overview_scalar_combined', 'overview_formula_primary', 'overview_formula_combined'])
+        .notNullable();
+      t.text('gross_strategy_config_json').notNullable().defaultTo('{}');
+      t.text('line_rules_json').notNullable().defaultTo('[]');
+      t.integer('tolerance_cents').notNullable().defaultTo(0);
+      t.string('normalizer_version', 40).notNullable();
+      t.string('calculator_version', 40).notNullable();
+      t.string('policy_hash', 64).notNullable();
+      t.date('valid_from').nullable();
+      t.date('valid_to').nullable();
+      t.text('blocked_reason').nullable();
+      t.string('created_by', 200).notNullable();
+      t.timestamps(true, true);
+      t.unique(['company_id', 'listing_id', 'guesty_account_id', 'platform_key', 'source_key', 'version']);
+      t.foreign('company_id').references('companies.id').onDelete('RESTRICT');
+      t.foreign('listing_id').references('listings.id').onDelete('RESTRICT');
+    });
+    console.log('✅ Δημιουργήθηκε πίνακας: channel_policy_versions');
+  } else {
+    await ensureColumn('channel_policy_versions', 'currency', (t) => t.string('currency', 3).notNullable().defaultTo('EUR'));
+  }
+
+  if (!await db.schema.hasTable('fiscal_evidence_captures')) {
+    await db.schema.createTable('fiscal_evidence_captures', (t) => {
+      t.increments('id').primary();
+      t.integer('company_id').unsigned().notNullable();
+      t.integer('listing_id').unsigned().notNullable();
+      t.string('reservation_id', 120).notNullable();
+      t.string('platform_key', 100).notNullable();
+      t.string('source_key', 100).notNullable();
+      t.string('guesty_account_id', 120).notNullable();
+      t.string('currency', 3).notNullable().defaultTo('EUR');
+      t.timestamp('captured_at').notNullable().defaultTo(db.fn.now());
+      t.timestamp('folio_updated_at').nullable();
+      t.text('normalized_payload_json').notNullable();
+      t.string('payload_sha256', 64).notNullable();
+      t.integer('previous_capture_id').unsigned().nullable();
+      t.string('previous_capture_sha256', 64).nullable();
+      t.string('capture_method', 50).notNullable();
+      t.string('guesty_contract_version', 50).notNullable();
+      t.foreign('company_id').references('companies.id').onDelete('RESTRICT');
+      t.foreign('listing_id').references('listings.id').onDelete('RESTRICT');
+      t.foreign('previous_capture_id').references('fiscal_evidence_captures.id').onDelete('RESTRICT');
+      t.unique(['company_id', 'listing_id', 'reservation_id', 'payload_sha256']);
+    });
+    console.log('✅ Δημιουργήθηκε πίνακας: fiscal_evidence_captures');
+  } else {
+    await ensureColumn('fiscal_evidence_captures', 'guesty_account_id', (t) => t.string('guesty_account_id', 120).notNullable().defaultTo('legacy-unbound'));
+    await ensureColumn('fiscal_evidence_captures', 'currency', (t) => t.string('currency', 3).notNullable().defaultTo('EUR'));
+    await ensureColumn('fiscal_evidence_captures', 'previous_capture_id', (t) => t.integer('previous_capture_id').unsigned().nullable());
+  }
+
+  if (!await db.schema.hasTable('channel_policy_samples')) {
+    await db.schema.createTable('channel_policy_samples', (t) => {
+      t.increments('id').primary();
+      t.integer('policy_id').unsigned().notNullable();
+      t.integer('evidence_capture_id').unsigned().notNullable();
+      t.string('policy_hash', 64).notNullable();
+      t.string('evidence_sha256', 64).notNullable();
+      t.string('scenario', 50).notNullable();
+      t.string('historical_document_type', 4).notNullable();
+      t.string('historical_series', 50).nullable();
+      t.string('historical_mark', 30).nullable();
+      t.string('historical_uid', 50).nullable();
+      t.string('historical_pdf_sha256', 64).nullable();
+      t.integer('historical_primary_cents').notNullable();
+      t.integer('historical_takk_cents').notNullable();
+      t.text('candidate_source_values_json').notNullable().defaultTo('{}');
+      t.integer('computed_primary_cents').notNullable();
+      t.integer('delta_cents').notNullable();
+      t.boolean('passed').notNullable();
+      t.boolean('stale').notNullable().defaultTo(false);
+      t.text('exclusion_reason').nullable();
+      t.string('accountant_reference', 200).nullable();
+      t.timestamp('created_at').notNullable().defaultTo(db.fn.now());
+      t.unique(['policy_id', 'evidence_capture_id']);
+      t.foreign('policy_id').references('channel_policy_versions.id').onDelete('RESTRICT');
+      t.foreign('evidence_capture_id').references('fiscal_evidence_captures.id').onDelete('RESTRICT');
+    });
+    console.log('✅ Δημιουργήθηκε πίνακας: channel_policy_samples');
+  } else {
+    await ensureColumn('channel_policy_samples', 'policy_hash', (t) => t.string('policy_hash', 64).nullable());
+    await ensureColumn('channel_policy_samples', 'evidence_sha256', (t) => t.string('evidence_sha256', 64).nullable());
+  }
+
+  if (!await db.schema.hasTable('takk_policy_versions')) {
+    await db.schema.createTable('takk_policy_versions', (t) => {
+      t.increments('id').primary();
+      t.integer('company_id').unsigned().notNullable();
+      t.integer('listing_id').unsigned().notNullable();
+      t.integer('version').unsigned().notNullable();
+      t.enum('status', ['draft', 'blocked', 'accounting_review', 'technical_review', 'approved', 'suspended'])
+        .notNullable().defaultTo('draft').index();
+      t.string('property_type', 50).notNullable();
+      t.string('licensed_category', 100).notNullable();
+      t.date('valid_from').notNullable();
+      t.date('valid_to').nullable();
+      t.integer('high_category').notNullable();
+      t.integer('low_category').notNullable();
+      t.integer('high_rate_cents').notNullable();
+      t.integer('low_rate_cents').notNullable();
+      t.text('season_rules_json').notNullable();
+      t.string('series', 50).notNullable();
+      t.string('calculator_version', 40).notNullable();
+      t.string('policy_hash', 64).notNullable();
+      t.text('blocked_reason').nullable();
+      t.string('created_by', 200).notNullable();
+      t.timestamps(true, true);
+      t.unique(['company_id', 'listing_id', 'version']);
+      t.foreign('company_id').references('companies.id').onDelete('RESTRICT');
+      t.foreign('listing_id').references('listings.id').onDelete('RESTRICT');
+    });
+    console.log('✅ Δημιουργήθηκε πίνακας: takk_policy_versions');
+  }
+
+  if (!await db.schema.hasTable('policy_approvals')) {
+    await db.schema.createTable('policy_approvals', (t) => {
+      t.increments('id').primary();
+      t.integer('channel_policy_id').unsigned().nullable();
+      t.integer('takk_policy_id').unsigned().nullable();
+      t.string('policy_hash', 64).notNullable();
+      t.enum('approval_role', ['accounting', 'technical']).notNullable();
+      t.string('actor_id', 200).notNullable();
+      t.text('notes').nullable();
+      t.timestamp('approved_at').notNullable().defaultTo(db.fn.now());
+      t.unique(['channel_policy_id', 'policy_hash', 'approval_role']);
+      t.unique(['takk_policy_id', 'policy_hash', 'approval_role']);
+      t.foreign('channel_policy_id').references('channel_policy_versions.id').onDelete('RESTRICT');
+      t.foreign('takk_policy_id').references('takk_policy_versions.id').onDelete('RESTRICT');
+    });
+    console.log('✅ Δημιουργήθηκε πίνακας: policy_approvals');
+  } else {
+    await ensureColumn('policy_approvals', 'channel_policy_id', (t) => t.integer('channel_policy_id').unsigned().nullable());
+    await ensureColumn('policy_approvals', 'takk_policy_id', (t) => t.integer('takk_policy_id').unsigned().nullable());
+  }
+
+  if (!await db.schema.hasTable('policy_decision_events')) {
+    await db.schema.createTable('policy_decision_events', (t) => {
+      t.increments('id').primary();
+      t.integer('channel_policy_id').unsigned().nullable();
+      t.integer('takk_policy_id').unsigned().nullable();
+      t.string('policy_hash', 64).notNullable();
+      t.enum('decision', ['approved', 'suspended', 'blocked']).notNullable();
+      t.string('idempotency_key', 100).notNullable().unique();
+      t.string('actor_id', 200).notNullable();
+      t.text('reason').nullable();
+      t.timestamp('decided_at').notNullable().defaultTo(db.fn.now());
+      t.unique(['channel_policy_id', 'policy_hash', 'decision', 'decided_at']);
+      t.unique(['takk_policy_id', 'policy_hash', 'decision', 'decided_at']);
+      t.foreign('channel_policy_id').references('channel_policy_versions.id').onDelete('RESTRICT');
+      t.foreign('takk_policy_id').references('takk_policy_versions.id').onDelete('RESTRICT');
+    });
+    console.log('✅ Δημιουργήθηκε πίνακας: policy_decision_events');
+  }
+  else {
+    await ensureColumn('policy_decision_events', 'idempotency_key', (t) => t.string('idempotency_key', 100).nullable());
+    await ensureUniqueIndex('policy_decision_events', 'policy_decision_events_idempotency_uq', ['idempotency_key']);
+  }
+
+  if (!await db.schema.hasTable('takk_calibration_samples')) {
+    await db.schema.createTable('takk_calibration_samples', (t) => {
+      t.increments('id').primary();
+      t.integer('policy_id').unsigned().notNullable();
+      t.enum('scenario', ['low', 'high', 'boundary']).notNullable();
+      t.date('check_in').notNullable();
+      t.date('check_out').notNullable();
+      t.integer('expected_cents').notNullable();
+      t.integer('computed_cents').notNullable();
+      t.integer('delta_cents').notNullable();
+      t.boolean('passed').notNullable();
+      t.string('evidence_sha256', 64).notNullable();
+      t.string('reservation_id', 120).nullable();
+      t.string('historical_mark', 30).nullable();
+      t.string('historical_document_type', 4).nullable();
+      t.string('historical_series', 50).nullable();
+      t.string('historical_pdf_sha256', 64).nullable();
+      t.string('accountant_reference', 200).nullable();
+      t.timestamp('created_at').notNullable().defaultTo(db.fn.now());
+      t.unique(['policy_id', 'scenario', 'evidence_sha256']);
+      t.foreign('policy_id').references('takk_policy_versions.id').onDelete('RESTRICT');
+    });
+    console.log('✅ Δημιουργήθηκε πίνακας: takk_calibration_samples');
+  } else {
+    await ensureColumn('takk_calibration_samples', 'reservation_id', (t) => t.string('reservation_id', 120).nullable());
+    await ensureColumn('takk_calibration_samples', 'historical_mark', (t) => t.string('historical_mark', 30).nullable());
+    await ensureColumn('takk_calibration_samples', 'historical_document_type', (t) => t.string('historical_document_type', 4).nullable());
+    await ensureColumn('takk_calibration_samples', 'historical_series', (t) => t.string('historical_series', 50).nullable());
+    await ensureColumn('takk_calibration_samples', 'historical_pdf_sha256', (t) => t.string('historical_pdf_sha256', 64).nullable());
+  }
+
+  await ensureUnifiedPolicyIntegrityTriggers();
+
+  for (const [table, label] of [
+    ['channel_policy_versions', 'Channel policy versions'],
+    ['fiscal_evidence_captures', 'Fiscal evidence captures'],
+    ['channel_policy_samples', 'Channel policy samples'],
+    ['policy_approvals', 'Policy approvals'],
+    ['policy_decision_events', 'Policy decision events'],
+    ['takk_policy_versions', 'TAKK policy versions'],
+    ['takk_calibration_samples', 'TAKK calibration samples'],
+  ]) await ensureAppendOnlyTable(table, label);
+}
+
+async function ensureUnifiedPolicyIntegrityTriggers() {
+  if (db.client.config.client === 'pg') {
+    await db.raw(`CREATE OR REPLACE FUNCTION unified_policy_validate_row() RETURNS trigger AS $$
+      BEGIN
+        IF TG_TABLE_NAME = 'channel_policy_versions' THEN
+          IF NOT EXISTS (SELECT 1 FROM listings l WHERE l.id = NEW.listing_id AND l.company_id = NEW.company_id) THEN
+            RAISE EXCEPTION 'Policy listing must belong to company' USING ERRCODE = '23514';
+          END IF;
+          IF (NEW.recipient_model = 'private_guest' AND (NEW.document_type <> '11.2' OR NEW.counterpart_json IS NOT NULL))
+             OR (NEW.recipient_model = 'approved_business_counterpart' AND (NEW.document_type <> '2.1' OR NEW.counterpart_json IS NULL)) THEN
+            RAISE EXCEPTION 'Recipient model and document type are inconsistent' USING ERRCODE = '23514';
+          END IF;
+        ELSIF TG_TABLE_NAME = 'fiscal_evidence_captures' THEN
+          IF NOT EXISTS (SELECT 1 FROM listings l WHERE l.id = NEW.listing_id AND l.company_id = NEW.company_id) THEN
+            RAISE EXCEPTION 'Evidence listing must belong to company' USING ERRCODE = '23514';
+          END IF;
+        ELSIF TG_TABLE_NAME = 'channel_policy_samples' THEN
+          IF NOT EXISTS (
+            SELECT 1 FROM channel_policy_versions p JOIN fiscal_evidence_captures e ON e.id = NEW.evidence_capture_id
+            WHERE p.id = NEW.policy_id AND p.policy_hash = NEW.policy_hash AND e.payload_sha256 = NEW.evidence_sha256
+              AND p.company_id = e.company_id AND p.listing_id = e.listing_id
+              AND p.guesty_account_id = e.guesty_account_id AND p.platform_key = e.platform_key
+              AND p.source_key = e.source_key AND p.currency = e.currency
+          ) THEN RAISE EXCEPTION 'Calibration evidence must match the exact policy tuple and hashes' USING ERRCODE = '23514'; END IF;
+        ELSIF TG_TABLE_NAME IN ('policy_approvals', 'policy_decision_events') THEN
+          IF (NEW.channel_policy_id IS NULL) = (NEW.takk_policy_id IS NULL) THEN
+            RAISE EXCEPTION 'Approval must reference exactly one policy' USING ERRCODE = '23514';
+          END IF;
+          IF NEW.channel_policy_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM channel_policy_versions p WHERE p.id = NEW.channel_policy_id AND p.policy_hash = NEW.policy_hash) THEN
+            RAISE EXCEPTION 'Approval hash does not match channel policy' USING ERRCODE = '23514';
+          END IF;
+          IF NEW.takk_policy_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM takk_policy_versions p WHERE p.id = NEW.takk_policy_id AND p.policy_hash = NEW.policy_hash) THEN
+            RAISE EXCEPTION 'Approval hash does not match TAKK policy' USING ERRCODE = '23514';
+          END IF;
+        END IF;
+        RETURN NEW;
+      END;
+    $$ LANGUAGE plpgsql`);
+    for (const table of ['channel_policy_versions', 'fiscal_evidence_captures', 'channel_policy_samples', 'policy_approvals', 'policy_decision_events']) {
+      await db.raw(`DROP TRIGGER IF EXISTS "${table}_validate_insert" ON "${table}"`);
+      await db.raw(`CREATE TRIGGER "${table}_validate_insert" BEFORE INSERT ON "${table}" FOR EACH ROW EXECUTE FUNCTION unified_policy_validate_row()`);
+    }
+    return;
+  }
+
+  const triggers = [
+    ['channel_policy_versions_validate_company', 'channel_policy_versions', `NOT EXISTS (SELECT 1 FROM listings l WHERE l.id = NEW.listing_id AND l.company_id = NEW.company_id)`, 'Policy listing must belong to company'],
+    ['channel_policy_versions_validate_recipient', 'channel_policy_versions', `(NEW.recipient_model = 'private_guest' AND (NEW.document_type <> '11.2' OR NEW.counterpart_json IS NOT NULL)) OR (NEW.recipient_model = 'approved_business_counterpart' AND (NEW.document_type <> '2.1' OR NEW.counterpart_json IS NULL))`, 'Recipient model and document type are inconsistent'],
+    ['fiscal_evidence_captures_validate_company', 'fiscal_evidence_captures', `NOT EXISTS (SELECT 1 FROM listings l WHERE l.id = NEW.listing_id AND l.company_id = NEW.company_id)`, 'Evidence listing must belong to company'],
+    ['channel_policy_samples_validate_tuple', 'channel_policy_samples', `NOT EXISTS (SELECT 1 FROM channel_policy_versions p JOIN fiscal_evidence_captures e ON e.id = NEW.evidence_capture_id WHERE p.id = NEW.policy_id AND p.policy_hash = NEW.policy_hash AND e.payload_sha256 = NEW.evidence_sha256 AND p.company_id = e.company_id AND p.listing_id = e.listing_id AND p.guesty_account_id = e.guesty_account_id AND p.platform_key = e.platform_key AND p.source_key = e.source_key AND p.currency = e.currency)`, 'Calibration evidence must match the exact policy tuple and hashes'],
+    ['policy_approvals_validate_reference', 'policy_approvals', `(NEW.channel_policy_id IS NULL) = (NEW.takk_policy_id IS NULL) OR (NEW.channel_policy_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM channel_policy_versions p WHERE p.id = NEW.channel_policy_id AND p.policy_hash = NEW.policy_hash)) OR (NEW.takk_policy_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM takk_policy_versions p WHERE p.id = NEW.takk_policy_id AND p.policy_hash = NEW.policy_hash))`, 'Approval must reference exactly one policy with its exact hash'],
+    ['policy_decision_events_validate_reference', 'policy_decision_events', `(NEW.channel_policy_id IS NULL) = (NEW.takk_policy_id IS NULL) OR (NEW.channel_policy_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM channel_policy_versions p WHERE p.id = NEW.channel_policy_id AND p.policy_hash = NEW.policy_hash)) OR (NEW.takk_policy_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM takk_policy_versions p WHERE p.id = NEW.takk_policy_id AND p.policy_hash = NEW.policy_hash))`, 'Decision must reference exactly one policy with its exact hash'],
+  ];
+  for (const [name, table, predicate, message] of triggers) {
+    await db.raw(`CREATE TRIGGER IF NOT EXISTS "${name}" BEFORE INSERT ON "${table}" WHEN ${predicate} BEGIN SELECT RAISE(ABORT, '${message}'); END`);
+  }
+}
+
+async function ensureListingBillingRulesTable() {
+  if (await db.schema.hasTable('listing_billing_rules')) {
+    await ensureColumn('listing_billing_rules', 'series', (t) => t.string('series', 50).nullable());
+    await ensureColumn('listing_billing_rules', 'counterpart_branch', (t) => t.integer('counterpart_branch').notNullable().defaultTo(0));
+    return;
+  }
+  await db.schema.createTable('listing_billing_rules', (t) => {
+    t.increments('id').primary();
+    t.integer('listing_id').unsigned().notNullable();
+    t.string('guesty_source', 100).notNullable();
+    t.string('invoice_type', 4).notNullable();
+    t.string('series', 50).nullable();
+    t.string('counterpart_vat_number', 30).nullable();
+    t.string('counterpart_country', 2).nullable();
+    t.string('counterpart_name', 200).nullable();
+    t.integer('counterpart_branch').notNullable().defaultTo(0);
+    t.boolean('active').notNullable().defaultTo(true);
+    t.timestamps(true, true);
+    t.unique(['listing_id', 'guesty_source']);
+    t.foreign('listing_id').references('listings.id').onDelete('CASCADE');
+  });
+  console.log('✅ Δημιουργήθηκε πίνακας: listing_billing_rules');
+}
+
+async function ensureListingChannelBillingRulesTable() {
+  if (await db.schema.hasTable('listing_channel_billing_rules')) {
+    await ensureColumn('listing_channel_billing_rules', 'counterpart_branch', (t) => t.integer('counterpart_branch').notNullable().defaultTo(0));
+    return;
+  }
+  await db.schema.createTable('listing_channel_billing_rules', (t) => {
+    t.increments('id').primary();
+    t.integer('listing_id').unsigned().notNullable();
+    t.string('guesty_platform', 100).notNullable();
+    t.string('guesty_source', 100).notNullable();
+    t.string('invoice_type', 4).notNullable();
+    t.string('series', 50).nullable();
+    t.string('counterpart_vat_number', 30).nullable();
+    t.string('counterpart_country', 2).nullable();
+    t.string('counterpart_name', 200).nullable();
+    t.integer('counterpart_branch').notNullable().defaultTo(0);
+    t.boolean('active').notNullable().defaultTo(true);
+    t.timestamps(true, true);
+    t.unique(['listing_id', 'guesty_platform', 'guesty_source']);
+    t.foreign('listing_id').references('listings.id').onDelete('CASCADE');
+  });
+  console.log('✅ Δημιουργήθηκε πίνακας: listing_channel_billing_rules');
 }
 
 async function ensureCompaniesTable() {
@@ -65,14 +787,76 @@ async function ensureCompaniesTable() {
       t.increments('id').primary();
       t.string('company_name').notNullable();
       t.string('vat_number', 9).notNullable().unique();
-      t.string('aade_user_id').notNullable();
-      t.string('aade_subscription_key').notNullable();
+      t.string('aade_user_id').nullable();
+      t.string('aade_subscription_key').nullable();
+      t.string('aade_credential_status', 20).notNullable().defaultTo('pending').index();
+      t.timestamp('aade_credentials_verified_at').nullable();
       t.string('invoice_series').notNullable().defaultTo('A');
       t.integer('invoice_counter').notNullable().defaultTo(0);
+      t.string('pdf_brand_name', 200).nullable();
+      t.string('pdf_activity', 200).nullable();
+      t.string('pdf_address', 300).nullable();
+      t.string('pdf_tax_office', 100).nullable();
+      t.string('pdf_phone', 50).nullable();
+      t.string('pdf_email', 200).nullable();
       t.boolean('active').notNullable().defaultTo(true);
       t.timestamps(true, true);
     });
     console.log('✅ Δημιουργήθηκε πίνακας: companies');
+    return;
+  }
+
+  await ensureColumn('companies', 'pdf_brand_name', (t) => t.string('pdf_brand_name', 200).nullable());
+  await ensureColumn('companies', 'pdf_activity', (t) => t.string('pdf_activity', 200).nullable());
+  await ensureColumn('companies', 'pdf_address', (t) => t.string('pdf_address', 300).nullable());
+  await ensureColumn('companies', 'pdf_tax_office', (t) => t.string('pdf_tax_office', 100).nullable());
+  await ensureColumn('companies', 'pdf_phone', (t) => t.string('pdf_phone', 50).nullable());
+  await ensureColumn('companies', 'pdf_email', (t) => t.string('pdf_email', 200).nullable());
+  await ensureColumn('companies', 'aade_credential_status', (t) => t.string('aade_credential_status', 20).notNullable().defaultTo('pending').index());
+  await ensureColumn('companies', 'aade_credentials_verified_at', (t) => t.timestamp('aade_credentials_verified_at').nullable());
+  // Guesty-only onboarding must be able to persist a company before AADE
+  // credentials are available. Knex rebuilds the SQLite table as needed and
+  // emits ALTER COLUMN for PostgreSQL.
+  const companyColumns = await db('companies').columnInfo();
+  if (companyColumns.aade_user_id?.nullable === false
+      || companyColumns.aade_subscription_key?.nullable === false) {
+    await db.schema.alterTable('companies', (t) => {
+      t.string('aade_user_id').nullable().alter();
+      t.string('aade_subscription_key').nullable().alter();
+    });
+  }
+}
+
+async function ensureAadeCredentialState() {
+  if (!await db.schema.hasTable('companies')) return;
+  const companies = await db('companies').select(
+    'id', 'aade_user_id', 'aade_subscription_key',
+    'aade_credential_status', 'aade_credentials_verified_at',
+  );
+  for (const company of companies) {
+    const configured = Boolean(company.aade_user_id && company.aade_subscription_key);
+    if (!configured) {
+      if (company.aade_credential_status !== 'pending' || company.aade_credentials_verified_at) {
+        await db('companies').where({ id: company.id }).update({
+          aade_credential_status: 'pending',
+          aade_credentials_verified_at: null,
+        });
+      }
+      continue;
+    }
+    if (company.aade_credential_status === 'verified') continue;
+    const sandboxCheck = await db('integration_checks').where({
+      check_key: `mydata:${company.id}:sandbox`,
+      status: 'success',
+      environment: 'sandbox',
+    }).first('checked_at');
+    await db('companies').where({ id: company.id }).update(sandboxCheck ? {
+      aade_credential_status: 'verified',
+      aade_credentials_verified_at: sandboxCheck.checked_at,
+    } : {
+      aade_credential_status: 'configured',
+      aade_credentials_verified_at: null,
+    });
   }
 }
 
@@ -84,12 +868,38 @@ async function ensureListingsTable() {
       t.integer('company_id').unsigned().notNullable();
       t.string('listing_id_guesty').notNullable().unique();
       t.enum('property_type', ['villa', 'apartment']).notNullable().defaultTo('apartment');
+      t.string('default_invoice_type', 4).notNullable().defaultTo('11.2');
+      t.string('invoice_counterpart_vat_number', 30).nullable();
+      t.string('invoice_counterpart_country', 2).nullable();
+      t.string('invoice_counterpart_name', 200).nullable();
+      t.integer('invoice_counterpart_branch').notNullable().defaultTo(0);
+      t.decimal('climate_fee_high', 10, 2).nullable();
+      t.decimal('climate_fee_low', 10, 2).nullable();
+      t.integer('climate_fee_high_category').nullable();
+      t.integer('climate_fee_low_category').nullable();
+      t.string('climate_fee_series', 50).notNullable().defaultTo('TAKK');
+      t.integer('payment_method_type').notNullable().defaultTo(1);
+      t.string('payment_method_info', 200).nullable();
       t.boolean('active').notNullable().defaultTo(true);
       t.timestamps(true, true);
       t.foreign('company_id').references('companies.id').onDelete('CASCADE');
     });
     console.log('✅ Δημιουργήθηκε πίνακας: listings');
+    return;
   }
+
+  await ensureColumn('listings', 'default_invoice_type', (t) => t.string('default_invoice_type', 4).notNullable().defaultTo('11.2'));
+  await ensureColumn('listings', 'invoice_counterpart_vat_number', (t) => t.string('invoice_counterpart_vat_number', 30).nullable());
+  await ensureColumn('listings', 'invoice_counterpart_country', (t) => t.string('invoice_counterpart_country', 2).nullable());
+  await ensureColumn('listings', 'invoice_counterpart_name', (t) => t.string('invoice_counterpart_name', 200).nullable());
+  await ensureColumn('listings', 'invoice_counterpart_branch', (t) => t.integer('invoice_counterpart_branch').notNullable().defaultTo(0));
+  await ensureColumn('listings', 'climate_fee_high', (t) => t.decimal('climate_fee_high', 10, 2).nullable());
+  await ensureColumn('listings', 'climate_fee_low', (t) => t.decimal('climate_fee_low', 10, 2).nullable());
+  await ensureColumn('listings', 'climate_fee_high_category', (t) => t.integer('climate_fee_high_category').nullable());
+  await ensureColumn('listings', 'climate_fee_low_category', (t) => t.integer('climate_fee_low_category').nullable());
+  await ensureColumn('listings', 'climate_fee_series', (t) => t.string('climate_fee_series', 50).notNullable().defaultTo('TAKK'));
+  await ensureColumn('listings', 'payment_method_type', (t) => t.integer('payment_method_type').notNullable().defaultTo(1));
+  await ensureColumn('listings', 'payment_method_info', (t) => t.string('payment_method_info', 200).nullable());
 }
 
 // Προσωρινά το κρατάμε για backward compatibility / migration μόνο.
@@ -146,6 +956,235 @@ async function ensureInvoicesTable() {
   await ensureColumn('invoices', 'listing_id', (t) => t.integer('listing_id').unsigned().nullable());
 }
 
+async function ensureFiscalDocumentsTable() {
+  const exists = await db.schema.hasTable('fiscal_documents');
+  if (exists) {
+    await ensureColumn('fiscal_documents', 'cancellation_mark', (t) => t.string('cancellation_mark', 30).nullable());
+    await ensureColumn('fiscal_documents', 'cancelled_at', (t) => t.timestamp('cancelled_at').nullable());
+    await ensureColumn('fiscal_documents', 'cancellation_status', (t) => t.string('cancellation_status', 20).notNullable().defaultTo('none'));
+    await ensureColumn('fiscal_documents', 'cancellation_error', (t) => t.text('cancellation_error').nullable());
+    await ensureColumn('fiscal_documents', 'cancellation_attempt_at', (t) => t.timestamp('cancellation_attempt_at').nullable());
+    await ensureColumn('fiscal_documents', 'verification_status', (t) => t.string('verification_status', 20).notNullable().defaultTo('pending'));
+    await ensureColumn('fiscal_documents', 'verified_at', (t) => t.timestamp('verified_at').nullable());
+    await ensureColumn('fiscal_documents', 'verification_error', (t) => t.text('verification_error').nullable());
+    await ensureColumn('fiscal_documents', 'retryable', (t) => t.boolean('retryable').notNullable().defaultTo(true));
+    await ensureColumn('fiscal_documents', 'transmission_uncertain', (t) => t.boolean('transmission_uncertain').notNullable().defaultTo(false));
+    await ensureColumn('fiscal_documents', 'transmission_token', (t) => t.string('transmission_token', 64).nullable());
+    await ensureColumn('fiscal_documents', 'mydata_environment', (t) => t.string('mydata_environment', 20).nullable());
+    // Legacy NULL rows are deliberately not inferred as production. They must
+    // be cancelled or explicitly rematerialized by an operator.
+    await ensureColumn('fiscal_documents', 'target_environment', (t) => t.string('target_environment', 20).nullable());
+    await ensureColumn('fiscal_documents', 'cancellation_retryable', (t) => t.boolean('cancellation_retryable').notNullable().defaultTo(true));
+    await ensureColumn('fiscal_documents', 'cancellation_uncertain', (t) => t.boolean('cancellation_uncertain').notNullable().defaultTo(false));
+    await ensureColumn('fiscal_documents', 'cancellation_token', (t) => t.string('cancellation_token', 64).nullable());
+    await ensureColumn('fiscal_documents', 'cancellation_response', (t) => t.text('cancellation_response').nullable());
+    await ensureColumn('fiscal_documents', 'cancellation_verification_response', (t) => t.text('cancellation_verification_response').nullable());
+    await ensureColumn('fiscal_documents', 'cancellation_verification_status', (t) => t.string('cancellation_verification_status', 20).notNullable().defaultTo('pending'));
+    await ensureColumn('fiscal_documents', 'cancellation_verified_at', (t) => t.timestamp('cancellation_verified_at').nullable());
+    return;
+  }
+
+  await db.schema.createTable('fiscal_documents', (t) => {
+    t.increments('id').primary();
+    t.string('document_key', 200).notNullable().unique();
+    t.integer('company_id').unsigned().notNullable();
+    t.integer('listing_id').unsigned().notNullable();
+    t.string('reservation_id', 120).notNullable().index();
+    t.string('document_kind', 30).notNullable();
+    t.string('document_type', 10).notNullable();
+    t.string('series', 50).notNullable();
+    t.integer('aa').notNullable();
+    t.date('issue_date').notNullable().index();
+    t.integer('related_document_id').unsigned().nullable();
+    t.string('correlated_mark', 30).nullable();
+    t.decimal('net_value', 12, 2).notNullable().defaultTo(0);
+    t.decimal('vat_amount', 12, 2).notNullable().defaultTo(0);
+    t.decimal('other_taxes_amount', 12, 2).notNullable().defaultTo(0);
+    t.decimal('gross_value', 12, 2).notNullable().defaultTo(0);
+    t.enum('status', ['pending', 'transmitting', 'sent', 'failed', 'cancelled']).notNullable().defaultTo('pending').index();
+    t.text('xml_payload').notNullable();
+    t.text('source_payload').nullable();
+    t.string('mydata_mark', 30).nullable();
+    t.string('mydata_uid', 50).nullable();
+    t.text('mydata_qr_url').nullable();
+    t.string('cancellation_mark', 30).nullable();
+    t.timestamp('cancelled_at').nullable();
+    t.string('cancellation_status', 20).notNullable().defaultTo('none');
+    t.text('cancellation_error').nullable();
+    t.timestamp('cancellation_attempt_at').nullable();
+    t.boolean('cancellation_retryable').notNullable().defaultTo(true);
+    t.boolean('cancellation_uncertain').notNullable().defaultTo(false);
+    t.string('cancellation_token', 64).nullable();
+    t.text('cancellation_response').nullable();
+    t.text('cancellation_verification_response').nullable();
+    t.string('cancellation_verification_status', 20).notNullable().defaultTo('pending');
+    t.timestamp('cancellation_verified_at').nullable();
+    t.string('verification_status', 20).notNullable().defaultTo('pending');
+    t.timestamp('verified_at').nullable();
+    t.text('verification_error').nullable();
+    t.text('mydata_response').nullable();
+    t.string('mydata_environment', 20).nullable();
+    t.string('target_environment', 20).notNullable();
+    t.text('error_message').nullable();
+    t.integer('attempt_count').notNullable().defaultTo(0);
+    t.boolean('retryable').notNullable().defaultTo(true);
+    t.boolean('transmission_uncertain').notNullable().defaultTo(false);
+    t.string('transmission_token', 64).nullable();
+    t.timestamp('last_attempt_at').nullable();
+    t.timestamp('sent_at').nullable();
+    t.timestamps(true, true);
+    t.unique(['company_id', 'document_type', 'series', 'aa'], 'fiscal_documents_company_type_series_aa_uq');
+    t.foreign('company_id').references('companies.id').onDelete('RESTRICT');
+    t.foreign('listing_id').references('listings.id').onDelete('RESTRICT');
+    t.foreign('related_document_id').references('fiscal_documents.id').onDelete('RESTRICT');
+  });
+  console.log('✅ Δημιουργήθηκε πίνακας: fiscal_documents');
+}
+
+async function ensureFiscalPdfArtifactsTable() {
+  if (!await db.schema.hasTable('fiscal_pdf_artifacts')) {
+    await db.schema.createTable('fiscal_pdf_artifacts', (t) => {
+      t.increments('id').primary();
+      t.integer('document_id').unsigned().notNullable().unique();
+      t.integer('company_id').unsigned().notNullable().index();
+      t.string('mydata_mark', 30).notNullable();
+      t.string('mydata_uid', 50).nullable();
+      t.string('pdf_sha256', 64).notNullable();
+      t.binary('pdf_bytes').notNullable();
+      t.text('render_snapshot').notNullable();
+      t.string('render_snapshot_sha256', 64).notNullable();
+      t.string('render_version', 30).notNullable().defaultTo('fiscal-pdf-v1');
+      t.timestamp('archived_at').notNullable().defaultTo(db.fn.now());
+      t.foreign('document_id').references('fiscal_documents.id').onDelete('RESTRICT');
+      t.foreign('company_id').references('companies.id').onDelete('RESTRICT');
+    });
+    console.log('✅ Δημιουργήθηκε πίνακας: fiscal_pdf_artifacts');
+  } else {
+    await ensureColumn('fiscal_pdf_artifacts', 'render_snapshot_sha256', (t) => t.string('render_snapshot_sha256', 64).nullable());
+  }
+
+  const unhashed = await db('fiscal_pdf_artifacts').whereNull('render_snapshot_sha256').select('id', 'render_snapshot');
+  for (const artifact of unhashed) {
+    const digest = crypto.createHash('sha256').update(String(artifact.render_snapshot)).digest('hex');
+    await db('fiscal_pdf_artifacts').where({ id: artifact.id }).update({ render_snapshot_sha256: digest });
+  }
+
+  if (db.client.config.client === 'pg') {
+    await db.raw(`
+      CREATE OR REPLACE FUNCTION reject_fiscal_pdf_artifact_mutation()
+      RETURNS trigger AS $archive_guard$
+      BEGIN
+        RAISE EXCEPTION 'Fiscal PDF artifacts are immutable and append-only' USING ERRCODE = '55000';
+      END;
+      $archive_guard$ LANGUAGE plpgsql
+    `);
+    await db.raw(`
+      CREATE OR REPLACE FUNCTION validate_fiscal_pdf_artifact_insert()
+      RETURNS trigger AS $archive_validation$
+      BEGIN
+        IF NEW.render_snapshot_sha256 IS NULL OR length(NEW.render_snapshot_sha256) <> 64 THEN
+          RAISE EXCEPTION 'Fiscal PDF artifact render snapshot checksum is required' USING ERRCODE = '23514';
+        END IF;
+        RETURN NEW;
+      END;
+      $archive_validation$ LANGUAGE plpgsql
+    `);
+    await db.raw(`
+      DO $archive_triggers$
+      BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'fiscal_pdf_artifacts_no_update' AND tgrelid = 'fiscal_pdf_artifacts'::regclass) THEN
+          CREATE TRIGGER fiscal_pdf_artifacts_no_update BEFORE UPDATE ON fiscal_pdf_artifacts
+          FOR EACH ROW EXECUTE FUNCTION reject_fiscal_pdf_artifact_mutation();
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'fiscal_pdf_artifacts_no_delete' AND tgrelid = 'fiscal_pdf_artifacts'::regclass) THEN
+          CREATE TRIGGER fiscal_pdf_artifacts_no_delete BEFORE DELETE ON fiscal_pdf_artifacts
+          FOR EACH ROW EXECUTE FUNCTION reject_fiscal_pdf_artifact_mutation();
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'fiscal_pdf_artifacts_validate_insert' AND tgrelid = 'fiscal_pdf_artifacts'::regclass) THEN
+          CREATE TRIGGER fiscal_pdf_artifacts_validate_insert BEFORE INSERT ON fiscal_pdf_artifacts
+          FOR EACH ROW EXECUTE FUNCTION validate_fiscal_pdf_artifact_insert();
+        END IF;
+      END;
+      $archive_triggers$
+    `);
+  } else {
+    await db.raw(`CREATE TRIGGER IF NOT EXISTS fiscal_pdf_artifacts_no_update
+      BEFORE UPDATE ON fiscal_pdf_artifacts BEGIN
+        SELECT RAISE(ABORT, 'Fiscal PDF artifacts are immutable and append-only');
+      END`);
+    await db.raw(`CREATE TRIGGER IF NOT EXISTS fiscal_pdf_artifacts_no_delete
+      BEFORE DELETE ON fiscal_pdf_artifacts BEGIN
+        SELECT RAISE(ABORT, 'Fiscal PDF artifacts are immutable and append-only');
+      END`);
+    await db.raw(`CREATE TRIGGER IF NOT EXISTS fiscal_pdf_artifacts_validate_insert
+      BEFORE INSERT ON fiscal_pdf_artifacts
+      WHEN NEW.render_snapshot_sha256 IS NULL OR length(NEW.render_snapshot_sha256) <> 64 BEGIN
+        SELECT RAISE(ABORT, 'Fiscal PDF artifact render snapshot checksum is required');
+      END`);
+  }
+}
+
+async function ensureDocumentSequencesTable() {
+  const exists = await db.schema.hasTable('document_sequences');
+  if (exists) return;
+
+  await db.schema.createTable('document_sequences', (t) => {
+    t.increments('id').primary();
+    t.integer('company_id').unsigned().notNullable();
+    t.string('document_type', 10).notNullable();
+    t.string('series', 50).notNullable();
+    t.integer('last_number').notNullable().defaultTo(0);
+    t.timestamps(true, true);
+    t.unique(['company_id', 'document_type', 'series'], 'document_sequences_company_type_series_uq');
+    t.foreign('company_id').references('companies.id').onDelete('CASCADE');
+  });
+  console.log('✅ Δημιουργήθηκε πίνακας: document_sequences');
+}
+
+async function ensureDailyCloseTables() {
+  if (!await db.schema.hasTable('daily_close_runs')) {
+    await db.schema.createTable('daily_close_runs', (t) => {
+      t.increments('id').primary();
+      t.integer('company_id').unsigned().notNullable();
+      t.date('business_date').notNullable();
+      t.enum('status', ['running', 'completed', 'partial', 'failed']).notNullable().defaultTo('running');
+      t.integer('document_count').notNullable().defaultTo(0);
+      t.integer('sent_count').notNullable().defaultTo(0);
+      t.integer('failed_count').notNullable().defaultTo(0);
+      t.integer('materialization_failure_count').notNullable().defaultTo(0);
+      t.timestamp('started_at').notNullable().defaultTo(db.fn.now());
+      t.timestamp('completed_at').nullable();
+      t.string('lease_token', 64).nullable();
+      t.timestamp('lease_expires_at').nullable();
+      t.bigInteger('lease_expires_at_ms').nullable();
+      t.timestamps(true, true);
+      t.unique(['company_id', 'business_date'], 'daily_close_runs_company_date_uq');
+      t.foreign('company_id').references('companies.id').onDelete('RESTRICT');
+    });
+    console.log('✅ Δημιουργήθηκε πίνακας: daily_close_runs');
+  } else {
+    await ensureColumn('daily_close_runs', 'lease_token', (t) => t.string('lease_token', 64).nullable());
+    await ensureColumn('daily_close_runs', 'lease_expires_at', (t) => t.timestamp('lease_expires_at').nullable());
+    await ensureColumn('daily_close_runs', 'lease_expires_at_ms', (t) => t.bigInteger('lease_expires_at_ms').nullable());
+    await ensureColumn('daily_close_runs', 'materialization_failure_count', (t) => t.integer('materialization_failure_count').notNullable().defaultTo(0));
+  }
+
+  if (!await db.schema.hasTable('daily_close_items')) {
+    await db.schema.createTable('daily_close_items', (t) => {
+      t.increments('id').primary();
+      t.integer('run_id').unsigned().notNullable();
+      t.integer('document_id').unsigned().notNullable();
+      t.string('result', 20).notNullable();
+      t.text('message').nullable();
+      t.timestamps(true, true);
+      t.unique(['run_id', 'document_id']);
+      t.foreign('run_id').references('daily_close_runs.id').onDelete('CASCADE');
+      t.foreign('document_id').references('fiscal_documents.id').onDelete('RESTRICT');
+    });
+    console.log('✅ Δημιουργήθηκε πίνακας: daily_close_items');
+  }
+}
+
 // -------------------------------------------------------------------
 // Legacy migration: tenants -> companies + listings
 // Safe to run multiple times.
@@ -163,15 +1202,15 @@ async function migrateLegacyTenantsToNormalizedModel() {
       .first();
 
     if (!company) {
-      const [companyId] = await db('companies').insert({
+      const companyId = insertedId(await db('companies').insert({
         company_name: tenant.company_name,
         vat_number: tenant.vat_number,
-        aade_user_id: tenant.aade_user_id,
-        aade_subscription_key: tenant.aade_subscription_key,
+        aade_user_id: encryptSecret(tenant.aade_user_id, companySecretContext(tenant, 'aade_user_id')),
+        aade_subscription_key: encryptSecret(tenant.aade_subscription_key, companySecretContext(tenant, 'aade_subscription_key')),
         invoice_series: tenant.invoice_series || 'A',
         invoice_counter: tenant.invoice_counter || 0,
         active: tenant.active,
-      });
+      }).returning('id'));
       company = await db('companies').where({ id: companyId }).first();
       console.log(`✅ Migrated company ${tenant.vat_number} από legacy tenants`);
     }
@@ -188,6 +1227,36 @@ async function migrateLegacyTenantsToNormalizedModel() {
         active: tenant.active,
       });
       console.log(`✅ Migrated listing ${tenant.listing_id_guesty} από legacy tenants`);
+    }
+  }
+}
+
+async function migrateCredentialsToEncryptedStorage() {
+  for (const table of ['companies', 'tenants']) {
+    const rows = await db(table).select('id', 'vat_number', 'aade_user_id', 'aade_subscription_key');
+    for (const row of rows) {
+      const updates = {};
+      const contextFor = (field) => table === 'companies' ? companySecretContext(row, field) : null;
+      if (row.aade_user_id) {
+        const context = contextFor('aade_user_id');
+        const encrypted = isEncrypted(row.aade_user_id) ? reencryptSecret(row.aade_user_id, context) : encryptSecret(row.aade_user_id, context);
+        if (encrypted !== row.aade_user_id) updates.aade_user_id = encrypted;
+      }
+      if (row.aade_subscription_key) {
+        const context = contextFor('aade_subscription_key');
+        const encrypted = isEncrypted(row.aade_subscription_key) ? reencryptSecret(row.aade_subscription_key, context) : encryptSecret(row.aade_subscription_key, context);
+        if (encrypted !== row.aade_subscription_key) updates.aade_subscription_key = encrypted;
+      }
+      if (Object.keys(updates).length) await db(table).where({ id: row.id }).update(updates);
+    }
+  }
+  if (await db.schema.hasTable('integration_tokens')) {
+    const tokens = await db('integration_tokens').select('provider', 'encrypted_access_token');
+    for (const token of tokens) {
+      const encrypted = reencryptSecret(token.encrypted_access_token, `integration-token:${token.provider}`);
+      if (encrypted !== token.encrypted_access_token) {
+        await db('integration_tokens').where({ provider: token.provider }).update({ encrypted_access_token: encrypted, updated_at: db.fn.now() });
+      }
     }
   }
 }
@@ -250,7 +1319,7 @@ async function findInvoiceByReservationId(reservationId) {
 }
 
 async function createInvoiceRecord(data) {
-  const [id] = await db('invoices').insert(data);
+  const id = insertedId(await db('invoices').insert(data).returning('id'));
   return id;
 }
 

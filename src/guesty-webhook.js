@@ -4,20 +4,20 @@ const express = require('express');
 const crypto = require('crypto');
 const router = express.Router();
 
-const {
-  findInvoiceByReservationId,
-  createInvoiceRecord,
-  updateInvoiceRecord,
-} = require('./database');
-const { incrementCompanyInvoiceCounter } = require('./repositories/companies');
 const { getCompanyAndListingByGuestyListingId } = require('./repositories/listings');
-const { generateMyDataXML, calculateClimateFeePerNight } = require('./mydata-xml');
-const { sendToMyData } = require('./mydata-client');
+const { stageReservation } = require('./services/reservation-service');
+const { normalizeGuestyReservation } = require('./guesty/normalizer');
+const { fetchReservation } = require('./guesty/client');
+const {
+  claimGuestyWebhookEvent,
+  completeGuestyWebhookEvent,
+  releaseGuestyWebhookEvent,
+} = require('./repositories/integration-checks');
 
 // -------------------------------------------------------------------
 // Κατάσταση κράτησης που οδηγεί σε τιμολόγηση
 // -------------------------------------------------------------------
-const BILLABLE_STATUSES = new Set(['confirmed', 'checked_out']);
+const RELEVANT_STATUSES = new Set(['confirmed', 'checked_out', 'cancelled', 'canceled']);
 
 // -------------------------------------------------------------------
 // HMAC-SHA256 Signature Validation (Guesty Pro)
@@ -29,19 +29,42 @@ function verifyGuestySignature(req) {
 
   // Αν δεν έχει οριστεί secret, skip validation μόνο σε development
   if (!secret) {
-    if (process.env.NODE_ENV === 'production') {
-      throw new Error('GUESTY_WEBHOOK_SECRET δεν έχει οριστεί σε production');
+    const explicitlyInsecureDevelopment = process.env.NODE_ENV !== 'production'
+      && process.env.ALLOW_INSECURE_DEV === 'true';
+    if (explicitlyInsecureDevelopment) {
+      console.warn('⚠️  Guesty signature validation disabled by ALLOW_INSECURE_DEV (dev only)');
+      return true;
     }
-    console.warn('⚠️  GUESTY_WEBHOOK_SECRET δεν έχει οριστεί — παράλειψη signature validation (dev only)');
-    return true;
+    throw new Error('GUESTY_WEBHOOK_SECRET δεν έχει οριστεί');
   }
 
-  const signature = req.headers['x-guesty-signature'];
-  if (!signature) return false;
-
-  // Χρειαζόμαστε raw body για το HMAC — βλ. server.js setup
+  // Χρειαζόμαστε raw body για το HMAC — βλ. server.js setup.
   const rawBody = req.rawBody;
   if (!rawBody) return false;
+
+  // Current Guesty webhooks use Svix signing.
+  const svixId = req.headers['svix-id'];
+  const svixTimestamp = req.headers['svix-timestamp'];
+  const svixSignature = req.headers['svix-signature'];
+  if (svixId && svixTimestamp && svixSignature) {
+    if (!/^\d+$/.test(String(svixTimestamp))) return false;
+    const timestampSeconds = Number(svixTimestamp);
+    if (!Number.isSafeInteger(timestampSeconds) || Math.abs(Date.now() / 1000 - timestampSeconds) > 300) return false;
+    const key = Buffer.from(secret.startsWith('whsec_') ? secret.slice(6) : secret, 'base64');
+    const expected = crypto.createHmac('sha256', key)
+      .update(`${svixId}.${svixTimestamp}.${rawBody}`)
+      .digest('base64');
+    const candidates = String(svixSignature).split(' ').map((entry) => entry.split(',')[1]).filter(Boolean);
+    return candidates.some((candidate) => {
+      const actual = Buffer.from(candidate);
+      const wanted = Buffer.from(expected);
+      return actual.length === wanted.length && crypto.timingSafeEqual(actual, wanted);
+    });
+  }
+
+  // Backward compatibility for legacy Guesty webhook subscriptions.
+  const signature = req.headers['x-guesty-signature'];
+  if (!signature) return false;
 
   const expected = 'sha256=' + crypto
     .createHmac('sha256', secret)
@@ -49,10 +72,9 @@ function verifyGuestySignature(req) {
     .digest('hex');
 
   // Constant-time σύγκριση για αποφυγή timing attacks
-  return crypto.timingSafeEqual(
-    Buffer.from(signature),
-    Buffer.from(expected)
-  );
+  const actualBuffer = Buffer.from(signature);
+  const expectedBuffer = Buffer.from(expected);
+  return actualBuffer.length === expectedBuffer.length && crypto.timingSafeEqual(actualBuffer, expectedBuffer);
 }
 
 // -------------------------------------------------------------------
@@ -69,32 +91,44 @@ router.post('/webhook/guesty-reservation', async (req, res) => {
     return res.status(500).json({ error: err.message });
   }
 
-  const reservation = req.body;
-
-  // 2. Βασική επικύρωση payload
-  if (!reservation?.reservationId || !reservation?.listingId) {
-    return res.status(400).json({ error: 'Missing reservationId or listingId' });
+  let reservation;
+  try {
+    reservation = normalizeGuestyReservation(req.body);
+    const cancellationRequiresAuthoritativeRefresh = ['cancelled', 'canceled'].includes(reservation.status);
+    const incompleteFiscalPayload = !reservation.financials?.totalGross || !reservation.status;
+    if (cancellationRequiresAuthoritativeRefresh || incompleteFiscalPayload) {
+      if (!process.env.GUESTY_CLIENT_ID || !process.env.GUESTY_CLIENT_SECRET) {
+        throw new Error('Guesty credentials are required for authoritative reservation enrichment');
+      }
+      const full = await fetchReservation(reservation.reservationId);
+      reservation = normalizeGuestyReservation(full);
+    }
+  } catch (error) {
+    const reservationId = req.body?.reservation?._id
+      || req.body?.reservation?.reservationId
+      || req.body?.reservation?.id
+      || req.body?._id
+      || req.body?.reservationId
+      || req.body?.id;
+    if (!reservationId || !process.env.GUESTY_CLIENT_ID || !process.env.GUESTY_CLIENT_SECRET) {
+      return res.status(422).json({ error: `Invalid Guesty reservation payload: ${error.message}` });
+    }
+    try {
+      reservation = normalizeGuestyReservation(await fetchReservation(reservationId));
+    } catch (fetchError) {
+      return res.status(502).json({ error: `Guesty reservation enrichment failed: ${fetchError.message}` });
+    }
   }
 
+  // 2. Βασική επικύρωση payload
   // 3. Έλεγχος status
-  if (!BILLABLE_STATUSES.has(reservation.status)) {
+  if (!RELEVANT_STATUSES.has(reservation.status)) {
     return res.status(200).json({
       message: `Ignored: status "${reservation.status}" is not billable`,
     });
   }
 
-  // 4. Idempotency check — αν έχει ήδη τιμολογηθεί, επιστρέφουμε το υπάρχον MARK
-  const existing = await findInvoiceByReservationId(reservation.reservationId);
-  if (existing) {
-    console.log(`ℹ️  Duplicate webhook για κράτηση ${reservation.reservationId} — επιστροφή υπάρχοντος MARK`);
-    return res.status(200).json({
-      message: 'Already processed',
-      mark: existing.mydata_mark,
-      status: existing.status,
-    });
-  }
-
-  // 5. Εύρεση company + listing βάσει Guesty listing_id
+  // 4. Εύρεση company + listing βάσει Guesty listing_id
   const companyListing = await getCompanyAndListingByGuestyListingId(reservation.listingId);
   if (!companyListing) {
     console.error(`💥 Δεν βρέθηκε company/listing mapping για listing: ${reservation.listingId}`);
@@ -109,74 +143,36 @@ router.post('/webhook/guesty-reservation', async (req, res) => {
     });
   }
 
-  // 6. Αύξηση invoice counter στο company επίπεδο
-  const invoiceAA = await incrementCompanyInvoiceCounter(companyListing.company_id);
-
-  // 7. Δημιουργία XML
-  let xmlPayload;
-  try {
-    xmlPayload = generateMyDataXML(reservation, companyListing, invoiceAA);
-  } catch (err) {
-    console.error('❌ Αποτυχία δημιουργίας XML:', err.message);
-    return res.status(422).json({ error: 'XML generation failed: ' + err.message });
+  // Claim only after payload/mapping validation. This prevents concurrent or
+  // repeated delivery from staging the same signed event more than once while
+  // still allowing Guesty to retry configuration/enrichment failures.
+  const eventIdentity = req.headers['svix-id']
+    ? `svix:${req.headers['svix-id']}`
+    : `legacy:${crypto.createHash('sha256').update(req.rawBody || '').digest('hex')}`;
+  if (!await claimGuestyWebhookEvent(eventIdentity)) {
+    return res.status(200).json({ message: 'Duplicate webhook ignored' });
   }
 
-  // 8. Αποθήκευση εγγραφής με status=pending (πριν την αποστολή)
-  const netValue = parseFloat(reservation.financials?.totalGross || 0);
-  const nights = reservation.nights || 0;
-  const climateFee = parseFloat(
-    calculateClimateFeePerNight(reservation.checkIn, companyListing.property_type) * nights
-  );
-
-  const invoiceId = await createInvoiceRecord({
-    company_id: companyListing.company_id,
-    listing_id: companyListing.listing_id,
-    reservation_id: reservation.reservationId,
-    listing_id_guesty: reservation.listingId,
-    vat_number: companyListing.vat_number,
-    invoice_series: companyListing.invoice_series,
-    invoice_aa: invoiceAA,
-    net_value: netValue,
-    climate_fee: climateFee,
-    total_gross: netValue + climateFee,
-    status: 'pending',
-    xml_payload: xmlPayload,
-  });
-
-  // 9. Αποστολή στην ΑΑΔΕ
+  // 5. Αποθήκευση του τελευταίου snapshot. Τα παραστατικά δημιουργούνται στο
+  // ημερήσιο κλείσιμο από τα πιο πρόσφατα οικονομικά στοιχεία της Guesty.
   try {
-    const myDataResponse = await sendToMyData(xmlPayload, companyListing);
-
-    await updateInvoiceRecord(invoiceId, {
-      status: 'sent',
-      mydata_mark: myDataResponse.mark,
-      mydata_uid: myDataResponse.uid || null,
-      sent_at: new Date().toISOString(),
-    });
-
-    console.log(`✅ ΑΦΜ: ${companyListing.vat_number} | Κράτηση: ${reservation.reservationId} | MARK: ${myDataResponse.mark}`);
-
-    return res.status(200).json({
-      message: 'Invoice processed successfully',
-      mark: myDataResponse.mark,
-      invoice_aa: invoiceAA,
-      series: companyListing.invoice_series,
+    const snapshot = await stageReservation(reservation, companyListing);
+    await completeGuestyWebhookEvent(eventIdentity);
+    return res.status(202).json({
+      message: 'Reservation staged for daily close',
       company_id: companyListing.company_id,
       listing_id: companyListing.listing_id,
+      reservation_id: snapshot.reservation_id,
+      status: snapshot.status,
+      materialized: Boolean(snapshot.materialized_at),
+      requires_review: Boolean(snapshot.requires_review),
     });
-
   } catch (err) {
-    await updateInvoiceRecord(invoiceId, {
-      status: 'failed',
-      error_message: err.message,
-    });
-
-    console.error(`❌ myDATA αποτυχία για κράτηση ${reservation.reservationId}:`, err.message);
-    return res.status(502).json({
-      error: 'myDATA submission failed',
-      detail: err.message,
-    });
+    await releaseGuestyWebhookEvent(eventIdentity);
+    console.error('❌ Αποτυχία προετοιμασίας παραστατικών:', err.message);
+    return res.status(422).json({ error: 'Fiscal document preparation failed: ' + err.message });
   }
 });
 
 module.exports = router;
+module.exports.verifyGuestySignature = verifyGuestySignature;

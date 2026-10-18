@@ -1,6 +1,7 @@
 'use strict';
 
 const { db } = require('../database');
+const { insertedId } = require('../database-utils');
 
 async function listCompanies() {
   return db('companies').select('*').orderBy('company_name', 'asc');
@@ -15,7 +16,7 @@ async function getCompanyByVatNumber(vatNumber) {
 }
 
 async function createCompany(data) {
-  const [id] = await db('companies').insert(data);
+  const id = insertedId(await db('companies').insert(data).returning('id'));
   return getCompanyById(id);
 }
 

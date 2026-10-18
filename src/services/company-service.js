@@ -7,13 +7,17 @@ const {
   createCompany,
   updateCompany,
 } = require('../repositories/companies');
+const { encryptSecret, decryptCompanySecret, companySecretContext } = require('../security/credentials');
+const { deleteIntegrationChecks } = require('../repositories/integration-checks');
+const { hasValidGreekVatChecksum, normalizeGreekVat } = require('../validation/fiscal-fields');
+const { db } = require('../database');
 
 function sanitizeVatNumber(value) {
-  return String(value || '').replace(/\D/g, '');
+  return normalizeGreekVat(value);
 }
 
 function validateVatNumber(vatNumber) {
-  return /^\d{9}$/.test(vatNumber);
+  return hasValidGreekVatChecksum(vatNumber);
 }
 
 function redactSubscriptionKey(key) {
@@ -30,12 +34,22 @@ function serializeCompany(company, { includeSecrets = false } = {}) {
     id: company.id,
     company_name: company.company_name,
     vat_number: company.vat_number,
-    aade_user_id: company.aade_user_id,
+    aade_user_id: redactSubscriptionKey(company.aade_user_id),
     aade_subscription_key: includeSecrets
-      ? company.aade_subscription_key
+      ? undefined
       : redactSubscriptionKey(company.aade_subscription_key),
+    aade_credential_status: company.aade_credential_status || (
+      company.aade_user_id && company.aade_subscription_key ? 'configured' : 'pending'
+    ),
+    aade_credentials_verified_at: company.aade_credentials_verified_at || null,
     invoice_series: company.invoice_series,
     invoice_counter: company.invoice_counter,
+    pdf_brand_name: company.pdf_brand_name,
+    pdf_activity: company.pdf_activity,
+    pdf_address: company.pdf_address,
+    pdf_tax_office: company.pdf_tax_office,
+    pdf_phone: company.pdf_phone,
+    pdf_email: company.pdf_email,
     active: company.active,
     created_at: company.created_at,
     updated_at: company.updated_at,
@@ -50,13 +64,12 @@ function validateCreatePayload(payload) {
     errors.push('company_name is required');
   }
   if (!validateVatNumber(vatNumber)) {
-    errors.push('vat_number must be exactly 9 digits');
+    errors.push('vat_number must be a valid 9-digit Greek VAT number');
   }
-  if (!payload.aade_user_id || !String(payload.aade_user_id).trim()) {
-    errors.push('aade_user_id is required');
-  }
-  if (!payload.aade_subscription_key || !String(payload.aade_subscription_key).trim()) {
-    errors.push('aade_subscription_key is required');
+  const aadeUserId = String(payload.aade_user_id || '').trim();
+  const aadeSubscriptionKey = String(payload.aade_subscription_key || '').trim();
+  if (Boolean(aadeUserId) !== Boolean(aadeSubscriptionKey)) {
+    errors.push('aade_user_id and aade_subscription_key must be supplied together');
   }
   if (payload.invoice_series && String(payload.invoice_series).trim().length > 20) {
     errors.push('invoice_series must be <= 20 chars');
@@ -67,9 +80,15 @@ function validateCreatePayload(payload) {
     normalized: {
       company_name: String(payload.company_name || '').trim(),
       vat_number: vatNumber,
-      aade_user_id: String(payload.aade_user_id || '').trim(),
-      aade_subscription_key: String(payload.aade_subscription_key || '').trim(),
+      aade_user_id: aadeUserId || null,
+      aade_subscription_key: aadeSubscriptionKey || null,
       invoice_series: String(payload.invoice_series || 'A').trim() || 'A',
+      pdf_brand_name: String(payload.pdf_brand_name || '').trim() || null,
+      pdf_activity: String(payload.pdf_activity || '').trim() || null,
+      pdf_address: String(payload.pdf_address || '').trim() || null,
+      pdf_tax_office: String(payload.pdf_tax_office || '').trim() || null,
+      pdf_phone: String(payload.pdf_phone || '').trim() || null,
+      pdf_email: String(payload.pdf_email || '').trim() || null,
       active: payload.active === undefined ? true : Boolean(payload.active),
     },
   };
@@ -90,7 +109,7 @@ function validateUpdatePayload(payload) {
   if ('vat_number' in payload) {
     const vatNumber = sanitizeVatNumber(payload.vat_number);
     if (!validateVatNumber(vatNumber)) {
-      errors.push('vat_number must be exactly 9 digits');
+      errors.push('vat_number must be a valid 9-digit Greek VAT number');
     } else {
       normalized.vat_number = vatNumber;
     }
@@ -127,6 +146,21 @@ function validateUpdatePayload(payload) {
     normalized.active = Boolean(payload.active);
   }
 
+  const profileLimits = {
+    pdf_brand_name: 200,
+    pdf_activity: 200,
+    pdf_address: 300,
+    pdf_tax_office: 100,
+    pdf_phone: 50,
+    pdf_email: 200,
+  };
+  for (const [field, maxLength] of Object.entries(profileLimits)) {
+    if (!(field in payload)) continue;
+    const value = String(payload[field] || '').trim();
+    if (value.length > maxLength) errors.push(`${field} must be <= ${maxLength} chars`);
+    else normalized[field] = value || null;
+  }
+
   return { errors, normalized };
 }
 
@@ -160,7 +194,13 @@ async function handleCreateCompany(payload) {
     throw error;
   }
 
-  const company = await createCompany(normalized);
+  const company = await createCompany({
+    ...normalized,
+    aade_user_id: encryptSecret(normalized.aade_user_id, companySecretContext(normalized, 'aade_user_id')),
+    aade_subscription_key: encryptSecret(normalized.aade_subscription_key, companySecretContext(normalized, 'aade_subscription_key')),
+    aade_credential_status: normalized.aade_user_id ? 'configured' : 'pending',
+    aade_credentials_verified_at: null,
+  });
   return serializeCompany(company);
 }
 
@@ -180,6 +220,12 @@ async function handleUpdateCompany(id, payload) {
   }
 
   if (normalized.vat_number && normalized.vat_number !== existing.vat_number) {
+    const fiscalHistory = await db('fiscal_documents').where({ company_id: existing.id }).first('id');
+    if (fiscalHistory) {
+      const error = new Error('Company VAT cannot change after fiscal document history exists; create a new company tenant instead');
+      error.status = 409;
+      throw error;
+    }
     const vatConflict = await getCompanyByVatNumber(normalized.vat_number);
     if (vatConflict && vatConflict.id !== existing.id) {
       const error = new Error(`Company with VAT ${normalized.vat_number} already exists`);
@@ -188,7 +234,32 @@ async function handleUpdateCompany(id, payload) {
     }
   }
 
-  const updated = await updateCompany(id, normalized);
+  const credentials = {};
+  const targetCompany = { ...existing, vat_number: normalized.vat_number || existing.vat_number };
+  const suppliedCredentialFields = ['aade_user_id', 'aade_subscription_key'].filter((field) => normalized[field]);
+  if (suppliedCredentialFields.length > 0 && suppliedCredentialFields.length < 2
+      && !(existing.aade_user_id && existing.aade_subscription_key)) {
+    const error = new Error('aade_user_id and aade_subscription_key must be supplied together when credentials are pending');
+    error.status = 400;
+    throw error;
+  }
+  for (const field of ['aade_user_id', 'aade_subscription_key']) {
+    if (normalized[field]) {
+      credentials[field] = encryptSecret(normalized[field], companySecretContext(targetCompany, field));
+    } else if (targetCompany.vat_number !== existing.vat_number) {
+      credentials[field] = encryptSecret(decryptCompanySecret(existing, field), companySecretContext(targetCompany, field));
+    }
+  }
+  const credentialIdentityChanged = Object.keys(credentials).length > 0;
+  const updated = await updateCompany(id, {
+    ...normalized,
+    ...credentials,
+    ...(credentialIdentityChanged ? {
+      aade_credential_status: 'configured',
+      aade_credentials_verified_at: null,
+    } : {}),
+  });
+  if (credentialIdentityChanged) await deleteIntegrationChecks(`mydata:${id}:`);
   return serializeCompany(updated);
 }
 
